@@ -91,36 +91,19 @@ class CNMF(object):
         """
         Constructor of CNMF objects
 
-        Please pass most or all params in as a Params object, using the params keyword. Most of the other
-        arguments are legacy and may be removed in some (likely distant) future update.
-
-        If you use the params argument, most of the other arguments will be ignored.
-        These arguments are exceptions: dview, skip_refinement, remove_very_bad_comps, Ain, Cin, b_in, f_in
+        Below are arguments that are independent of the Params object, and which should be used with this
+        constructor; passing other arguments is an older API and may be removed in some (likely distant) future update
 
         Args:
             n_processes: int
                number of processes used (if in parallel this controls memory usage)
 
-            k: int
-               number of neurons expected per FOV (or per patch if patches_pars is None)
-
-            gSig: tuple
-                expected half size of neurons
-
-            gSiz: tuple
-                half-size of bounding box for each neuron (computed from gSig is None)
-
-            merge_thresh: float
-                merging threshold, max correlation allowed
-
-            p: int
-                order of the autoregressive process used to estimate deconvolution
-
             dview: Direct View object
                 for parallelization purposes when using ipyparallel
 
             Ain: np.ndarray
-                if known, it is the initial estimate of spatial filters. Array must be of type `bool` in 'F' order of shape: [n_pixels, n_components].
+                if known, it is the initial estimate of spatial filters.
+                Array must be of type `bool` in 'F' order of shape: [n_pixels, n_components].
                 Used to build estimates
 
             Cin - Used to build estimates
@@ -129,185 +112,13 @@ class CNMF(object):
 
             f_in - Used to build estimates
 
-            do_merge: boolean
-                Whether to merge components in refinement
-
-            ssub: int
-                downsampling factor in space
-
-            tsub: int
-                downsampling factor in time
-
-            p_ssub: int
-                downsampling factor in space for patches
-
-            p_tsub: int
-                downsampling factor in time for patches
-
-            method_init: str
-               can be greedy_roi or sparse_nmf
-
-            alpha_snmf: float
-                weight of the sparsity regularization
-
-            rf:int
-                half-size of the patches in pixels. rf=25, patches are 50x50
-
-            stride: int
-                amount of overlap between the patches in pixels
-
-            memory_fact: float
-                unitless number accounting how much memory should be used. You will
-                need to try different values to find a workable value. The default is OK for a 16 GB system
-
-            gnb: int
-                number of global background components
-
-            nb_patch: int
-                number of background components per patch
-
-            only_init_patch: boolean
-                only run initialization on patches
-
-            only_init_patch (not documented)
-
-            method_deconvolution = 'oasis' or 'cvxpy'
-                method used for deconvolution. Suggested 'oasis' see
-                Friedrich J, Zhou P, Paninski L. Fast Online Deconvolution of Calcium Imaging Data.
-                PLoS Comput Biol. 2017; 13(3):e1005423.
-
-            n_pixels_per_process: int
-                Number of pixels to be processed in parallel per core (no patch mode). Decrease if memory problems
-
-            block_size_temp: int
-                Number of pixels to be used to perform residual computation in blocks. Decrease if memory problems
-
-            num_blocks_per_run_spat: int
-                In case of memory problems you can reduce this number, reducing the number of blocks processed in parallel during residual computing
-
-            num_blocks_per_run_temp: int
-                In case of memory problems you can reduce this number, reducing the number of blocks processed in parallel during residual computing
-
-            check_nan: boolean
-                Check if file contains NaNs (costly for very large files so could be turned off)
-
             skip_refinement: boolean
                 If true it only performs one iteration of update spatial update temporal instead of two
 
-            normalize_init: boolean
-                Differences in intensities in the FOV can cause troubles in the initialization when patches are not used.
-                This compensates by normalizing pixels by median intensity
-
-            options_local_NMF: dict
-                experimental, not to be used
-
-            minibatch_shape (not documented)
-
-            minibatch_suff_strat (not documented)
-
-            update_num_comps (not documented)
-
-            rval_thr (not documented)
-
-            thresh_fitness_delta (not documented)
-
-            thresh_fitness_raw (not documented)
-
-            thresh_overlap (not documented)
-
-            max_comp_update_shape:
-                threshold number of components after which selective updating starts (using the parameter num_times_comp_updated)
-
-            num_times_comp_updated:
-                number of times each component is updated. In inf components are updated at every initbatch time steps
-
-            batch_update_suff_stat (not documented)
-
-            s_min (not documented)
-
             remove_very_bad_comps: boolean
                 Whether to remove components with very low values of component quality directly on the patch.
-                This might create some minor imprecisions.
-                However benefits can be considerable if done because if many components (>2000) are created
-                and joined together, operation that causes a bottleneck
-
-            border_pix: int
-                number of pixels to not consider in the borders
-
-            low_rank_background: boolean
-                Ff True the background is approximated with gnb components. If false every patch keeps its background (overlaps are randomly assigned to one spatial component only)
-                In the False case all the nonzero elements of the background components are updated using hals (to be used with one background per patch)
-
-            update_background_components: boolean
-                whether to update the background components during the spatial phase
-
-            rolling_sum (not documented)
-
-            rolling_length (not documented)
-
-            min_corr: float
-                minimal correlation peak for 1-photon imaging initialization
-
-            min_pnr: float
-                minimal peak to noise ratio for 1-photon imaging initialization
-
-            ring_size_factor: float
-                Ratio between the ring radius and neuron diameters
-
-            center_psf (not documented)
-
-            use_dense (not documented)
-
-            deconv_flag : bool, optional
-                If True, deconvolution is also performed using OASIS
-
-            simultaneously : bool, optional
-                If true, demix and denoise/deconvolve simultaneously. Slower but can be more accurate.
-
-            n_refit : int, optional
-                Number of pools (cf. oasis.pyx) prior to the last one that are refitted when
-                simultaneously demixing and denoising/deconvolving
-
-            del_duplicates: bool
-                whether to delete the duplicated created in initialization
-
-            N_samples_exceptionality : int, optional
-                Number of consecutives intervals to be considered when testing new neuron candidates
-
-            max_num_added : int, optional
-                maximum number of components to be added at each step in OnACID
-
-            min_num_trial : int, optional
-                minimum numbers of attempts to include a new components in OnACID
-
-            thresh_CNN_noisy: float
-                threshold on the per patch CNN classifier for online algorithm
-
-            fr: int
-                frame rate
-
-            decay_time (not documented)
-
-            min_SNR (not documented)
-
-            ssub_B: int, optional
-                downsampling factor for 1-photon imaging background computation
-
-            init_iter: int, optional
-                number of iterations for 1-photon imaging initialization
-
-            sniper_mode: boolean (undocumented)
-
-            use_peak_max: boolean (undocumented)
-
-            test_both: boolean (undocumented)
-
-            expected_comps: int
-                number of expected components (try to exceed the expected)
-
-            params: optional, CNMFParams object
-                If you have an object with all the params you want ready, you can pass it in rather than initialise in pieces as above
-
+                This might create some minor imprecisions, but can be important for performance because of bottlenecks
+                caused by handling many components (we have seen over 2000) that will need to be processed.
         """
 
         self.dview = dview
