@@ -1035,7 +1035,7 @@ class OnACID(object):
                                         (0.001, 100-0.005))
         return self
 
-    def save(self,filename):
+    def save(self, filename:str):
         """save object in hdf5 file format
 
         Args:
