@@ -6,17 +6,17 @@ import logging
 import numpy as np
 import os
 import peakutils
-import tensorflow as tf
 import scipy
 from scipy.sparse import csc_matrix
 from scipy.stats import norm
+import torch
 from typing import Any, Union
 import warnings
 
 import caiman
 from caiman.paths import caiman_datadir
+from caiman.pytorch_model_arch import PyTorchCNN
 import caiman.utils.stats
-import caiman.utils.utils
 
 try:
     cv2.setNumThreads(0)
@@ -268,45 +268,22 @@ def evaluate_components_CNN(A,
         then this code will try not to use a GPU. Otherwise it will use one if it finds it.
     """
     logger = logging.getLogger("caiman")
-
-    # TODO: Find a less ugly way to do this
     if not isGPU and 'CAIMAN_ALLOW_GPU' not in os.environ:
         print("GPU run not requested, disabling use of GPUs")
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-    try:
-        os.environ["KERAS_BACKEND"] = "tensorflow"
-        from tensorflow.keras.models import model_from_json
-        use_keras = True
-        logger.info('Using Keras')
-    except (ModuleNotFoundError):
-        use_keras = False
-        logger.info('Using Tensorflow')
+
+    logger.info('Using Torch')
 
     if loaded_model is None:
-        if use_keras:
-            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".json")):
-                model_file = os.path.join(caiman_datadir(), model_name + ".json")
-                model_weights = os.path.join(caiman_datadir(), model_name + ".h5")
-            elif os.path.isfile(model_name + ".json"):
-                model_file = model_name + ".json"
-                model_weights = model_name + ".h5"
-            else:
-                raise FileNotFoundError(f"File for requested model {model_name} not found")
-            with open(model_file, 'r') as json_file:
-                print(f"USING MODEL (keras API): {model_file}")
-                loaded_model_json = json_file.read()
-
-            loaded_model = model_from_json(loaded_model_json)
-            loaded_model.load_weights(model_name + '.h5')
+        if os.path.isfile(os.path.join(caiman_datadir(), 'model', 'pytorch-models', model_name + ".pt")):
+            model_file = os.path.join(caiman_datadir(), 'model', 'pytorch-models', model_name + ".pt")
+        elif os.path.isfile(model_name + ".pt"):
+            model_file = model_name + ".pt"
         else:
-            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".h5.pb")):
-                model_file = os.path.join(caiman_datadir(), model_name + ".h5.pb")
-            elif os.path.isfile(model_name + ".h5.pb"):
-                model_file = model_name + ".h5.pb"
-            else:
-                raise FileNotFoundError(f"File for requested model {model_name} not found")
-            print(f"USING MODEL (tensorflow API): {model_file}")
-            loaded_model = caiman.utils.utils.load_graph(model_file)
+            raise FileNotFoundError(f"File for requested model {model_name} not found")
+        print(f"USING MODEL (torch API): {model_file}")
+        loaded_model = PyTorchCNN()
+        loaded_model.load_state_dict(torch.load(model_file))
 
         logger.debug("Loaded model from disk")
 
@@ -320,14 +297,13 @@ def evaluate_components_CNN(A,
                                               half_crop[1]:com[1] + half_crop[1]] for mm, com in zip(A.tocsc().T, coms)
     ]
     final_crops = np.array([cv2.resize(im / np.linalg.norm(im), (patch_size, patch_size)) for im in crop_imgs])
-    if use_keras:
-        predictions = loaded_model.predict(final_crops[:, :, :, np.newaxis], batch_size=32, verbose=1)
-    else:
-        tf_in = loaded_model.get_tensor_by_name('prefix/conv2d_20_input:0')
-        tf_out = loaded_model.get_tensor_by_name('prefix/output_node0:0')
-        with tf.Session(graph=loaded_model) as sess:
-            predictions = sess.run(tf_out, feed_dict={tf_in: final_crops[:, :, :, np.newaxis]})
-            sess.close()
+    
+    final_crops = torch.tensor(final_crops, dtype=torch.float32)
+    final_crops = torch.reshape(final_crops, (-1, final_crops.shape[-1], 
+                    final_crops.shape[1], final_crops.shape[2])) 
+    
+    with torch.no_grad():
+        predictions = loaded_model(final_crops[:, np.newaxis, :, :])
 
     return predictions, final_crops
 
