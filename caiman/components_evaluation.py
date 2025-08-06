@@ -299,13 +299,13 @@ def evaluate_components_CNN(A,
     final_crops = np.array([cv2.resize(im / np.linalg.norm(im), (patch_size, patch_size)) for im in crop_imgs])
     
     final_crops = torch.tensor(final_crops, dtype=torch.float32)
-    final_crops = torch.reshape(final_crops, (-1, final_crops.shape[-1], 
-                    final_crops.shape[1], final_crops.shape[2])) 
+    final_crops = final_crops.unsqueeze(1)
     
     with torch.no_grad():
-        predictions = loaded_model(final_crops[:, np.newaxis, :, :])
+        predictions = loaded_model(final_crops)
 
-    return predictions, final_crops
+    predictions_numpy = predictions.cpu().numpy()
+    return predictions_numpy, final_crops
 
 def evaluate_components(Y: np.ndarray,
                         traces: np.ndarray,

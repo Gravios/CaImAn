@@ -27,6 +27,7 @@ from scipy.stats import norm
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import normalize
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 from time import time
 
 import caiman
@@ -122,9 +123,35 @@ class OnACID(object):
             # change things for code/notebooks that've worked for a long time; we should save such changes for a major rewrite
             # (if someone takes a particular interest in that).
 
+    def __str__(self):
+        ret = f"Caiman OnACID Object. subfields:{list(self.__dict__.keys()) }"
+        if hasattr(self.estimates, 'A') and self.estimates.A is not None:
+            ret += f" A.shape={self.estimates.A.shape}"
+        if hasattr(self.estimates, 'b') and self.estimates.b is not None:
+            ret += f" b.shape={self.estimates.b.shape}"
+        if hasattr(self.estimates, 'C') and self.estimates.C is not None:
+            ret += f" C.shape={self.estimates.C.shape}"
+        return ret
+    
+    def __repr__(self):
+        ret = f"Caiman OnACID Object"
+        if hasattr(self.estimates, 'A') and self.estimates.A is not None:
+            ret += f" A.shape={self.estimates.A.shape}"
+        if hasattr(self.estimates, 'b') and self.estimates.b is not None and len(self.estimates.b.shape) > 1:
+            ret += f" bg components={self.estimates.b.shape[1]}"
+        if hasattr(self.estimates, 'C') and self.estimates.C is not None:
+            ret += f" C.shape={self.estimates.C.shape}"
+        ret += " Use str() for more details"
+        return ret
+
+    def __getitem__(self, idx):
+        return getattr(self, idx)
+    # We want subscripting to be read-only so we do not define a __setitem__ method
+
     @profile
     def _prepare_object(self, Yr, T, new_dims=None, idx_components=None):
 
+        logger = logging.getLogger("caiman")
         init_batch = self.params.get('online', 'init_batch')
         old_dims = self.params.get('data', 'dims')
         self.is1p = (self.params.get('init', 'method_init') == 'corr_pnr' and 
@@ -154,7 +181,7 @@ class OnACID(object):
 
         if Yr.shape[-1] != self.params.get('online', 'init_batch'):
             raise Exception(
-                'The movie size used for initialization does not match with the minibatch size')
+                'The movie size used for initialization does not match the minibatch size')
 
         if new_dims is not None:
 
@@ -254,7 +281,7 @@ class OnACID(object):
         self.estimates.CY = self.estimates.CY * 1. / self.params.get('online', 'init_batch')
         self.estimates.CC = 1 * self.estimates.CC / self.params.get('online', 'init_batch')
 
-        logging.info(f'Expecting {expected_comps} components')
+        logger.info(f'Expecting {expected_comps} components')
         self.estimates.CY.resize([expected_comps + self.params.get('init', 'nb'), self.estimates.CY.shape[-1]], refcheck=False)
         if self.params.get('online', 'use_dense'):
             self.estimates.Ab_dense = np.zeros((self.estimates.CY.shape[-1], expected_comps + self.params.get('init', 'nb')),
@@ -275,7 +302,6 @@ class OnACID(object):
 
         if self.is1p:
             estim = self.estimates
-            d1, d2 = estim.dims    
             estim.Yres_buf -= estim.b0
             if ssub_B == 1:
                 estim.Atb = estim.Ab.T.dot(estim.W.dot(estim.b0) - estim.b0)
@@ -309,6 +335,7 @@ class OnACID(object):
             self.estimates.rho_buf = RingBuffer(self.estimates.rho_buf, self.params.get('online', 'minibatch_shape'))
             self.estimates.sv = np.sum(self.estimates.rho_buf.get_last_frames(
                 min(self.params.get('online', 'init_batch'), self.params.get('online', 'minibatch_shape')) - 1), 0)
+
         self.estimates.AtA = (self.estimates.Ab.T.dot(self.estimates.Ab)).toarray()
         self.estimates.AtY_buf = self.estimates.Ab.T.dot(self.estimates.Yr_buf.T)
         self.estimates.groups = list(map(list, update_order(self.estimates.Ab)[0]))
@@ -2080,7 +2107,7 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
         
         #Create DataLoader for batching 
         dataset = TensorDataset(final_crops_tensor)
-        loader = DataLoader(dataset, batch_size=min_num_trial, shuffle=False)
+        loader = DataLoader(dataset, batch_size=int(min_num_trial), shuffle=False)
 
         loaded_model.eval()
         all_predictions = []
@@ -2090,7 +2117,7 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
                 all_predictions.append(outputs)   
         
         predictions = torch.cat(all_predictions).cpu().numpy()
-        keep_cnn = list(np.where(predictions_np[:,0] > thresh_CNN_noisy)[0])
+        keep_cnn = list(np.where(predictions[:,0] > thresh_CNN_noisy)[0])
         cnn_pos = Ain2[keep_cnn]
     else:
         keep_cnn = []  # list(range(len(Ain_cnn)))
