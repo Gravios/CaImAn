@@ -5,6 +5,7 @@ Functions for managing spatial components
 """
 
 import cv2
+import gc
 import logging
 import numpy as np
 import os
@@ -13,16 +14,9 @@ import scipy
 from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
 from scipy.sparse import spdiags
 from scipy.linalg import eig
-from scipy.ndimage import (
-    binary_dilation,
-    binary_closing,
-    generate_binary_structure,
-    grey_dilation,
-    iterate_structure,
-    label,
-    median_filter
-)
+from scipy.ndimage import binary_dilation, binary_closing, generate_binary_structure, grey_dilation, iterate_structure, label, median_filter
 import shutil
+from sklearn import linear_model
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
@@ -325,13 +319,6 @@ def regression_ipyparallel(pars):
        Raises:
            Exception 'Least Square Method not found!
        """
-
-    # /!\ need to import since it is run from within the server
-    import numpy as np
-    import sys
-    import gc
-    from sklearn import linear_model
-
     Y_name, C_name, noise_sn, idxs_C, idxs_Y, method_least_square, cct = pars
     # we load from the memmap file
     if isinstance(Y_name, str):
@@ -923,9 +910,6 @@ def determine_search_location(A, dims, method='ellipse', min_size=3, max_size=8,
 def construct_dilate_parallel(pars):
     """
     """
-
-    from scipy.ndimage.morphology import generate_binary_structure, iterate_structure, grey_dilation
-
     A_i, dims, expandCore, d  = pars
     A_temp = np.reshape(A_i.toarray(), dims[::-1])
     if len(expandCore) > 0:
