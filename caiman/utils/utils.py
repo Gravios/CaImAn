@@ -13,21 +13,21 @@ https://docs.python.org/3/library/urllib.request.htm
 import certifi
 import contextlib
 import cv2
-import h5py
-import multiprocessing
 import inspect
+import h5py
 import logging
 import matplotlib.pyplot as plt
+import multiprocessing
 import numpy as np
 import os
 import pickle
 import scipy
+from scipy.ndimage import gaussian_filter
 import ssl
 import subprocess
+from tifffile import TiffFile
 import time
 import torch
-from scipy.ndimage import gaussian_filter
-from tifffile import TiffFile
 from typing import Any, Union, Iterable
 from urllib.request import urlopen
 

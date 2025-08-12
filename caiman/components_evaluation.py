@@ -281,7 +281,7 @@ def evaluate_components_CNN(A,
             model_file = model_name + ".pt"
         else:
             raise FileNotFoundError(f"File for requested model {model_name} not found")
-        print(f"USING MODEL (torch API): {model_file}")
+        print(f"Using model: {model_file}")
         loaded_model = PyTorchCNN()
         loaded_model.load_state_dict(torch.load(model_file))
 
@@ -298,9 +298,10 @@ def evaluate_components_CNN(A,
     ]
     final_crops = np.array([cv2.resize(im / np.linalg.norm(im), (patch_size, patch_size)) for im in crop_imgs])
     
-    final_crops = torch.tensor(final_crops, dtype=torch.float32)
-    final_crops = final_crops.unsqueeze(1)
-    
+    # Numpy to PyTorch and add a channel dimension using unsqueeze
+    final_crops = torch.tensor(final_crops, dtype=torch.float32).unsqueeze(1)
+
+    # Pass the preprocessed image crops through the model to get predictions
     with torch.no_grad():
         predictions = loaded_model(final_crops)
 

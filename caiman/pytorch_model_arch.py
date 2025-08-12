@@ -1,3 +1,10 @@
+#!/usr/bin/env python
+"""
+Contains the model architecture for cnn_model.pt and cnn_model_online.pt. The files 
+cnn_model.pt and cnn_model_online.pt contain the model weights. The weight files are 
+used to load the weights into the model architecture. 
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,3 +49,4 @@ class PyTorchCNN(nn.Module):
         x = self.dropout3(x)
         x = self.fc2(x)
         return F.softmax(x, dim=1)
+        

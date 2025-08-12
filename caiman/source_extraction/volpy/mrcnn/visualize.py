@@ -319,4 +319,6 @@ def vp_load_image(dir, fnames, ind):
     full path to file
     """
     fname = fnames[ind]
-    return np.load(dir + fname)['img'], dir + fname
+    path = os.path.join(dir, fname)
+    return np.load(path)['img'], path
+
