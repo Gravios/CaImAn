@@ -52,7 +52,7 @@ from caiman.source_extraction.cnmf.utilities import (update_order, peak_local_ma
 import caiman.summary_images
 from caiman.utils.nn_models import (fit_NL_model, create_LN_model, quantile_loss, rate_scheduler)
 from caiman.utils.stats import pd_solve
-from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, parmap, load_graph
+from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, parmap
 
 try:
     cv2.setNumThreads(0)

@@ -271,7 +271,7 @@ def evaluate_components_CNN(A,
     """
     logger = logging.getLogger("caiman")
     if not isGPU and 'CAIMAN_ALLOW_GPU' not in os.environ:
-        print("GPU run not requested, disabling use of GPUs")
+        logger.info("GPU run not requested, disabling use of GPUs")
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
     logger.info('Using Torch')
@@ -283,7 +283,7 @@ def evaluate_components_CNN(A,
             model_file = model_name + ".pt"
         else:
             raise FileNotFoundError(f"File for requested model {model_name} not found")
-        print(f"Using model: {model_file}")
+        logger.info(f"Using model: {model_file}")
         loaded_model = PyTorchCNN()
         loaded_model.load_state_dict(torch.load(model_file))
 

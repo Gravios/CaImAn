@@ -13,8 +13,8 @@ https://docs.python.org/3/library/urllib.request.htm
 import certifi
 import contextlib
 import cv2
-import inspect
 import h5py
+import inspect
 import logging
 import matplotlib.pyplot as plt
 import multiprocessing
