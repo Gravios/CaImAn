@@ -11,8 +11,8 @@ Revised by Changjia Cai, Eric Thompson, Manuel Paez
 
 class Config:
     # Paths
-    DATA_DIR = r'/mnt/home/mpaez/ceph/volpy_training_data/'
-    MODEL_SAVE_DIR = r'/mnt/home/mpaez/ceph/volpy_models/'
+    DATA_DIR = r'~/volpy_training_data/' #Edit to your data directory
+    MODEL_SAVE_DIR = r'~/volpy_models/' #Edit to your model directory
 
     # Model and Training Hyperparameters
     NUM_CLASSES = 1 + 1  # Background + Neuron

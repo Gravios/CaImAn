@@ -1232,7 +1232,7 @@ class OnACID(object):
                             old_comps = self.N
 
                         if np.isnan(np.sum(frame)):
-                            raise Exception('Frame {frame_count} contains NaN')
+                            raise Exception(f'Frame {frame_count} contains NaN')
                         if t % 500 == 0:
                             logger.info(f'Epoch: {iter + 1}. {t} frames have been processed.'
                                          f'{self.N - old_comps} new components were added. Total: {self.N}')
