@@ -34,9 +34,9 @@ def make_G_matrix(T, g):
     if isinstance(g, np.ndarray):
         if len(g) == 1 and g < 0:
             g = 0
-        gs = np.matrix(np.hstack((1, -(g[:]).T)))
-        ones_ = np.matrix(np.ones((T, 1)))
-        G = spdiags((ones_ * gs).T, list(range(0, -len(g) - 1, -1)), T, T)
+        gs = np.array([np.hstack((1, -(g[:]).T))])
+        ones_ = np.ones((T, 1))
+        G = spdiags((ones_ @ gs).T, list(range(0, -len(g) - 1, -1)), T, T)
 
         return G
     else:
@@ -49,7 +49,7 @@ def constrained_foopsi_parallel(arg_in):
     """
 
     Ytemp, nT, jj_, bl, c1, g, sn, argss = arg_in
-    T = np.shape(Ytemp)[0]
+    T = Ytemp.shape[0]
     cc_, cb_, c1_, gn_, sn_, sp_, lam_ = caiman.source_extraction.cnmf.deconvolution.constrained_foopsi(
         Ytemp, bl=bl, c1=c1, g=g, sn=sn, **argss)
     gd_ = np.max(np.real(np.roots(np.hstack((1, -gn_.T)))))
@@ -174,8 +174,8 @@ def update_temporal_components(Y, A, b, Cin, fin, bl=None, c1=None, g=None, sn=N
         raise Exception("You have to provide a value for p")
 
     # INITIALIZATION OF VARS
-    d, T = np.shape(Y)
-    nr = np.shape(A)[-1]
+    d, T = Y.shape
+    nr = A.shape[-1]
     if b is not None:
         # if b.shape[0] < b.shape[1]:
         #     b = b.T
@@ -193,7 +193,7 @@ def update_temporal_components(Y, A, b, Cin, fin, bl=None, c1=None, g=None, sn=N
         sn = np.repeat(None, nr)
 
     A = scipy.sparse.hstack((A, b)).tocsc()
-    S = np.zeros(np.shape(Cin))
+    S = np.zeros(Cin.shape)
     Cin = np.vstack((Cin, fin))
     C = Cin.copy()
     nA = np.ravel(A.power(2).sum(axis=0)) + np.finfo(np.float32).eps
