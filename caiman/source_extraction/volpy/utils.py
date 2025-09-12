@@ -19,6 +19,7 @@ from caiman.paths import caiman_datadir
 from caiman.source_extraction.volpy.mrcnn import utils
 from caiman.source_extraction.volpy.mrcnn.config import Config
 from caiman.source_extraction.volpy.mrcnn.model import get_model_instance_segmentation, mrcnn_inference
+from caiman.source_extraction.volpy.mrcnn.utils import ScaleImage, data_transform 
 
 def quick_annotation(img, min_radius, max_radius, roughness=2):
     """ Quick annotation method in VolPy using cell magic wand plugin
