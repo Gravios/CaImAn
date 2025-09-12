@@ -18,7 +18,7 @@ from caiman.paths import caiman_datadir
 
 from caiman.source_extraction.volpy.mrcnn import utils
 from caiman.source_extraction.volpy.mrcnn.config import Config
-from caiman.source_extraction.volpy.mrcnn.model import get_model_instance_segmentation
+from caiman.source_extraction.volpy.mrcnn.model import get_model_instance_segmentation, mrcnn_inference
 
 def quick_annotation(img, min_radius, max_radius, roughness=2):
     """ Quick annotation method in VolPy using cell magic wand plugin
@@ -140,7 +140,7 @@ def mrcnn_inference_pytorch(img, size_range, weights_path, display_result=True):
     img_tv_tensor = torchvision.tv_tensors.Image(img_tensor)
 
     # Perform Inference
-    _, _, binarized_masks = mrcnn_infer(
+    _, _, binarized_masks = mrcnn_inference(
         model=model,
         img=img_tv_tensor, 
         thresh=config.DETECTION_MIN_CONFIDENCE,
