@@ -514,13 +514,13 @@ def fit_NL_model(model_NL, Y, patience=5, val_split=0.2, batch_size=32,
     chk = ModelCheckpoint(filepath=path_to_model,
                           verbose=0, save_best_only=True, save_weights_only=True)
     es = EarlyStopping(monitor='val_loss', patience=patience,
-                       restore_best_weights=True)
-    sch = [] if schedule is None else [LearningRateScheduler(schedule, verbose=1)]
+                       restore_best_weights=True, verbose=0)
+    sch = [] if schedule is None else [LearningRateScheduler(schedule, verbose=0)]
     callbacks = [es, chk] + sch
 
     history_NL = model_NL.fit(Y, Y, epochs=epochs, batch_size=batch_size,
                             shuffle=True, validation_split=val_split,
-                            callbacks=callbacks)
+                            callbacks=callbacks, verbose=0)
     model_NL.load_weights(os.path.join(run_logdir, 'model.weights.h5'))
     return model_NL, history_NL, path_to_model
 

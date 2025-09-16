@@ -1217,7 +1217,7 @@ class OnACID(object):
                             else:
                                 activity = 0.
 #                                frame = frame.astype(np.float32) - activity
-                            frame = frame - np.squeeze(model_LN.predict(np.expand_dims(np.expand_dims(frame.astype(np.float32) - activity, 0), -1)))
+                            frame = frame - np.squeeze(model_LN.predict(np.expand_dims(np.expand_dims(frame.astype(np.float32) - activity, 0), -1), verbose=0))
                             frame = np.maximum(frame, 0)
                         frame_count += 1
                         t_frame_start = time()
