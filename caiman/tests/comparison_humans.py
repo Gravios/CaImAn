@@ -12,16 +12,6 @@ try:
 except:
     print('OpenCV is naturally single threaded')
 
-try:
-    if __IPYTHON__:
-        print(1)
-        # this is used for debugging purposes only. allows to reload classes
-        # when changed
-        get_ipython().magic('load_ext autoreload')
-        get_ipython().magic('autoreload 2')
-except NameError:
-    print('Not launched under iPython')
-
 import caiman as cm
 import matplotlib.pyplot as plt
 import numpy as np
