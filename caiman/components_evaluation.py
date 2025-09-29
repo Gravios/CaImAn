@@ -260,7 +260,7 @@ def classify_components_ep(Y, A, C, b, f, Athresh=0.1, Npeaks=5, tB=-3, tA=10, t
 def evaluate_components_CNN(A,
                             dims,
                             gSig,
-                            model_name: Optional[str] = None
+                            model_name: Optional[str] = None,
                             patch_size: int = 50,
                             loaded_model=None,
                             isGPU: bool = False) -> tuple[Any, np.array]:
