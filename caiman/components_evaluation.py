@@ -15,7 +15,7 @@ import warnings
 
 import caiman
 from caiman.paths import caiman_datadir
-from caiman.pytorch_model_arch import PyTorchCNN, keras_cnn_model_from_pickle
+from caiman.keras_model_arch import keras_cnn_model_from_pickle
 import caiman.utils.stats
 
 try:
