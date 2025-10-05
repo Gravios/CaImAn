@@ -357,7 +357,7 @@ def run_inference(config, plot_results=True):
         return
         
     print(f"Loading model from {model_path}")
-    model.load_state_dict(torch.load(model_path, weights_only=False))
+    model.load_state_dict(torch.load(model_path))
     model.to(device)
 
     val_indices_path = os.path.join(config.MODEL_SAVE_DIR, 'validation_indices.npy')

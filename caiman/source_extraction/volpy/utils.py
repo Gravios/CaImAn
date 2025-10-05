@@ -131,7 +131,7 @@ def mrcnn_inference_pytorch(img, size_range, weights_path, display_result=True):
 
     #Load Model and weights
     model = get_model_instance_segmentation(num_classes=config.NUM_CLASSES) 
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=False))
+    model.load_state_dict(torch.load(weights_path, map_location=device))
     model.to(device)
     model.eval() #Set to evaluation mode 
 

@@ -72,7 +72,7 @@ def test_mrcnn_pytorch():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model = get_model_instance_segmentation(num_classes=config.NUM_CLASSES)
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=False))
+    model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
 
     # Load the same Caiman demo data 
