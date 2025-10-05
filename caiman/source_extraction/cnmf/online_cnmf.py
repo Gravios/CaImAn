@@ -363,7 +363,7 @@ class OnACID(object):
             path = self.params.get('online', 'path_to_model').split(".")[:-1]
             model_path = '.'.join(path + ['pt'])
             loaded_model = PyTorchCNN()
-            loaded_model.load_state_dict(torch.load(model_path))
+            loaded_model.load_state_dict(torch.load(model_path, weights_only=False))
 
         self.loaded_model = loaded_model
 
