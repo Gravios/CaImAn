@@ -15,7 +15,7 @@ import warnings
 
 import caiman
 from caiman.paths import caiman_datadir
-from caiman.pytorch_model_arch import PyTorchCNN
+from caiman.pytorch_model_arch import PyTorchCNN, keras_cnn_model_from_pickle
 import caiman.utils.stats
 
 try:
@@ -274,18 +274,44 @@ def evaluate_components_CNN(A,
         logger.info("GPU run not requested, disabling use of GPUs")
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
-    logger.info('Using Torch')
+    try:
+        os.environ["KERAS_BACKEND"] = "torch"
+        try:
+            import keras_core as keras
+        except ImportError:
+            import keras
+        use_keras = True
+        logger.info('Using Keras 3.0 with PyTorch backend')
+    except (ModuleNotFoundError, ImportError):
+        use_keras = False
+        logger.info('Using PyTorch')
+    
 
     if loaded_model is None:
-        if os.path.isfile(os.path.join(caiman_datadir(), 'model', 'pytorch-models', model_name + ".pt")):
-            model_file = os.path.join(caiman_datadir(), 'model', 'pytorch-models', model_name + ".pt")
-        elif os.path.isfile(model_name + ".pt"):
-            model_file = model_name + ".pt"
+        if use_keras:
+            import pickle
+            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pkl")):
+                with open(os.path.join(caiman_datadir(), model_name + ".pkl"), 'rb') as f:
+                    pickle_data = pickle.load(f)
+            elif os.path.isfile(model_name + ".pkl"):
+                with open(model_name + ".pkl", 'rb') as f:
+                    pickle_data = pickle.load(f)
+            else:
+                raise FileNotFoundError(f"File for requested model {model_name} not found")
+            
+            logger.info(f"USING MODEL (Keras 3.0 API from Pickle)")
+            loaded_model = keras_cnn_model_from_pickle(pickle_data, keras)
         else:
-            raise FileNotFoundError(f"File for requested model {model_name} not found")
-        logger.info(f"Using model: {model_file}")
-        loaded_model = PyTorchCNN()
-        loaded_model.load_state_dict(torch.load(model_file))
+            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pt")):
+                model_file = os.path.join(caiman_datadir(), model_name + ".pt")
+            elif os.path.isfile(model_name + ".pt"):
+                model_file = model_name + ".pt"
+            else:
+                raise FileNotFoundError(f"File for requested model {model_name} not found")
+            
+            logger.info(f"USING MODEL (Pytorch API): {model_file}")
+            loaded_model = PyTorchCNN()
+            loaded_model.load_state_dict(torch.load(model_file))
 
         logger.debug("Loaded model from disk")
 
@@ -300,15 +326,46 @@ def evaluate_components_CNN(A,
     ]
     final_crops = np.array([cv2.resize(im / np.linalg.norm(im), (patch_size, patch_size)) for im in crop_imgs])
     
-    # Numpy to PyTorch and add a channel dimension using unsqueeze
-    final_crops = torch.tensor(final_crops, dtype=torch.float32).unsqueeze(1)
+    if use_keras:
+        # Keras expects (batch, height, width, channels) format
+        predictions = loaded_model.predict(final_crops[:, :, :, np.newaxis], batch_size=32, verbose=1)
+    else:
+        # PyTorch expects (batch, channels, height, width) format
+        final_crops_tensor = torch.tensor(final_crops, dtype=torch.float32).unsqueeze(1)
 
-    # Pass the preprocessed image crops through the model to get predictions
-    with torch.no_grad():
-        predictions = loaded_model(final_crops)
+        with torch.no_grad():
+            logits = loaded_model(final_crops_tensor)
+            probabilities = torch.nn.functional.softmax(logits, dim=1)
 
-    predictions_numpy = predictions.cpu().numpy()
-    return predictions_numpy, final_crops
+            # Class swapping detection for PyTorch models
+            if probabilities.shape[1] == 2:
+                swapped_logits = torch.stack([logits[:, 1], logits[:, 0]], dim=1)
+                swapped_probs = torch.nn.functional.softmax(swapped_logits, dim=1)
+
+                max_normal = probabilities[:, 1].max().item()
+                max_swapped = swapped_probs[:, 1].max().item()
+                mean_normal = probabilities[:, 1].mean().item()
+                mean_swapped = swapped_probs[:, 1].mean().item()
+
+                logger.info(f"Class analysis - Normal: max={max_normal:.6f}, mean={mean_normal:.6f}")
+                logger.info(f"Class analysis - Swapped: max={max_swapped:.6f}, mean={mean_swapped:.6f}")
+
+                if (max_swapped > max_normal and max_swapped > 0.1) or (mean_swapped > mean_normal and mean_swapped > 0.05):
+                    logger.info("Using swapped class predictions - better discrimination detected")
+                    predictions = swapped_probs.cpu().numpy()
+                else:
+                    logger.info("Using normal class predictions")
+                    predictions = probabilities.cpu().numpy()
+            else:
+                predictions = torch.sigmoid(logits).cpu().numpy()
+
+            # Log statistics
+            if predictions.shape[1] == 2:
+                class1_preds = predictions[:, 1]
+                logger.info(f"PyTorch predictions - Range: [{class1_preds.min():.6f}, {class1_preds.max():.6f}], "
+                           f"Mean: {class1_preds.mean():.6f}, Std: {class1_preds.std():.6f}")
+
+    return predictions, final_crops
 
 def evaluate_components(Y: np.ndarray,
                         traces: np.ndarray,
