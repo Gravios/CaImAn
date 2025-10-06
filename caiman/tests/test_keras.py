@@ -2,6 +2,7 @@
 
 import numpy as np
 import os
+import pickle
 
 from caiman.keras_model_arch import keras_cnn_model_from_pickle
 from caiman.paths import caiman_datadir
@@ -16,7 +17,6 @@ def test_keras():
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
     try:
-        import pickle
         model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
         model_file = model_name + ".pkl"
         with open(model_file, 'rb') as f:

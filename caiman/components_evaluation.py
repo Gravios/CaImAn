@@ -6,6 +6,7 @@ import logging
 import numpy as np
 import os
 import peakutils
+import pickle
 import scipy
 from scipy.sparse import csc_matrix
 from scipy.stats import norm
@@ -14,8 +15,8 @@ from typing import Any, Union
 import warnings
 
 import caiman
-from caiman.paths import caiman_datadir
 from caiman.keras_model_arch import keras_cnn_model_from_pickle
+from caiman.paths import caiman_datadir
 import caiman.utils.stats
 
 try:
@@ -283,7 +284,6 @@ def evaluate_components_CNN(A,
     logger.info('Using Keras 3.0 with PyTorch backend')
     
     if loaded_model is None:
-        import pickle
         if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pkl")):
             with open(os.path.join(caiman_datadir(), model_name + ".pkl"), 'rb') as f:
                     pickle_data = pickle.load(f)
@@ -292,7 +292,7 @@ def evaluate_components_CNN(A,
                     pickle_data = pickle.load(f)
         else:
             raise FileNotFoundError(f"File for requested model {model_name} not found")
-            
+
         logger.info(f"USING MODEL (Keras 3.0 API from Pickle)")
         loaded_model = keras_cnn_model_from_pickle(pickle_data, keras)
 

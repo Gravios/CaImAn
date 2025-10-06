@@ -21,6 +21,7 @@ from math import sqrt
 from multiprocessing import cpu_count
 import numpy as np
 import os
+import pickle
 from scipy.ndimage import percentile_filter
 from scipy.sparse import coo_matrix, csc_matrix, spdiags, hstack
 from scipy.stats import norm
@@ -39,8 +40,8 @@ from caiman.motion_correction import (motion_correct_iteration_fast,
                                   high_pass_filter_space, sliding_window,
                                   register_translation_3d, apply_shifts_dft)
 import caiman.paths
-from caiman.pytorch_model_arch import keras_cnn_model_from_pickle
 from caiman.paths import caiman_datadir
+from caiman.pytorch_model_arch import keras_cnn_model_from_pickle
 from caiman.source_extraction.cnmf.cnmf import CNMF
 from caiman.source_extraction.cnmf.estimates import Estimates
 from caiman.source_extraction.cnmf.initialization import imblur, initialize_components, hals, downscale
@@ -368,7 +369,6 @@ class OnACID(object):
             logger.info('Using Keras with PyTorch backend')
             model_name = self.params.get('online', 'path_to_model').split(".")[0]  # Remove extension
 
-            import pickle
             if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pkl")):
                 with open(os.path.join(caiman_datadir(), model_name + ".pkl"), 'rb') as f:
                     pickle_data = pickle.load(f)
