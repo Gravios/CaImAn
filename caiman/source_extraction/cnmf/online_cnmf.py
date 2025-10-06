@@ -41,7 +41,7 @@ from caiman.motion_correction import (motion_correct_iteration_fast,
                                   register_translation_3d, apply_shifts_dft)
 import caiman.paths
 from caiman.paths import caiman_datadir
-from caiman.pytorch_model_arch import keras_cnn_model_from_pickle
+from caiman.keras_model_arch import keras_cnn_model_from_pickle
 from caiman.source_extraction.cnmf.cnmf import CNMF
 from caiman.source_extraction.cnmf.estimates import Estimates
 from caiman.source_extraction.cnmf.initialization import imblur, initialize_components, hals, downscale
