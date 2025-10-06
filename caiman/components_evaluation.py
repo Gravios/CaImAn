@@ -11,7 +11,7 @@ import scipy
 from scipy.sparse import csc_matrix
 from scipy.stats import norm
 import torch
-from typing import Any, Union
+from typing import Any, Optional, Union
 import warnings
 
 import caiman
@@ -261,7 +261,7 @@ def classify_components_ep(Y, A, C, b, f, Athresh=0.1, Npeaks=5, tB=-3, tA=10, t
 def evaluate_components_CNN(A,
                             dims,
                             gSig,
-                            model_name: str = os.path.join(caiman_datadir(), 'model', 'cnn_model'),
+                            model_name: Optional[str] = None,
                             patch_size: int = 50,
                             loaded_model=None,
                             isGPU: bool = False) -> tuple[Any, np.array]:
@@ -280,6 +280,10 @@ def evaluate_components_CNN(A,
         import keras_core as keras
     except ImportError:
         import keras
+    if model_name is None:
+        model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
+
+    logger.info('Using Torch')
 
     logger.info('Using Keras 3.0 with PyTorch backend')
     
@@ -424,10 +428,10 @@ def evaluate_components(Y: np.ndarray,
             tr_tmp = np.pad(traces.T, ((padbefore, padafter), (0, 0)), mode='reflect')
             numFramesNew, num_traces = tr_tmp.shape
                                                                                              # compute baseline quickly
-            logger.debug("binning data ...")
+            logger.debug("Binning data ...")
             tr_BL = np.reshape(tr_tmp, (downsampfact, numFramesNew // downsampfact, num_traces), order='F')
             tr_BL = np.percentile(tr_BL, 8, axis=0)
-            logger.debug("interpolating data ...")
+            logger.debug("Interpolating data ...")
             logger.debug(tr_BL.shape)
             tr_BL = scipy.ndimage.zoom(np.array(tr_BL, dtype=np.float32), [downsampfact, 1],
                                        order=3,
@@ -463,11 +467,15 @@ def evaluate_components(Y: np.ndarray,
 
 def grouper(n: int, iterable, fillvalue: bool = None):
     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
+    # Given an iterable, generate sufficient tuples of length n to hold them, using fillvalue
+    # as a packing substitute if things don't divide cleanly
+    # You may need to play around with this to fully understand what it's doing.
     args = [iter(iterable)] * n
     return itertools.zip_longest(*args, fillvalue=fillvalue)
 
 
 def evaluate_components_placeholder(params):
+    # This marshalls arguments/handles calls to evalute_components() for use with map_async()
     fname, traces, A, C, b, f, final_frate, remove_baseline, N, robust_std, Athresh, Npeaks, thresh_C = params
     Yr, dims, T = caiman.load_memmap(fname)
     Y = np.reshape(Yr, dims + (T,), order='F')
@@ -803,3 +811,4 @@ def estimate_components_quality(traces,
         return idx_components, idx_components_bad, np.array(fitness_raw), np.array(fitness_delta), np.array(r_values)
     else:
         return idx_components, idx_components_bad
+
