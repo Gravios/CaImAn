@@ -177,7 +177,7 @@ def save_memmap_each(fnames: list[str],
     return fnames_new
 
 def save_memmap_join(mmap_fnames:list[str], base_name: str = None, n_chunks: int = 20, dview=None,
-                     add_to_mov: float = 0) -> str:
+                     add_to_mov: float = 0.0) -> str:
     """
     Makes a large file memmap from a number of smaller files
 
@@ -190,7 +190,7 @@ def save_memmap_join(mmap_fnames:list[str], base_name: str = None, n_chunks: int
 
         dview: cluster handle
 
-        add_to_mov: (undocumented)
+        add_to_mov: constant to add to the entire movie
 
     """
     logger = logging.getLogger("caiman")
@@ -449,7 +449,7 @@ def save_memmap(filenames:list[str],
                                               xy_shifts=xy_shifts,
                                               is_3D=is_3D,
                                               slices=slices,
-                                              add_to_movie=0)  # applied below in save_memmap_join
+                                              add_to_movie=0.0)  # applied below in save_memmap_join
         else:
             fname_parts = filenames
 
