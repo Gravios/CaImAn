@@ -20,7 +20,7 @@ def test_keras():
         model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
         model_file = model_name + ".pkl"
         with open(model_file, 'rb') as f:
-            print('USING MODEL:' + model_file)
+            print(f"Using model {model_file}")
             pickle_data = pickle.load(f)
 
         loaded_model = keras_cnn_model_from_pickle(pickle_data, keras)
