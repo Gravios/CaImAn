@@ -66,10 +66,10 @@ except:
     def profile(a): return a
 
 os.environ["KERAS_BACKEND"] = "torch"
-    try:
-        import keras_core as keras
-    except ImportError:
-        import keras
+try:
+    import keras_core as keras
+except ImportError:
+    import keras
 
 #TODO If we ever get a chance, it would make sense to refactor CNMF and OnACID to have a
 #     parent class, as OnACID started as a copy of the CNMF codebase and they have similar

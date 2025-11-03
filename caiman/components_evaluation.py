@@ -30,6 +30,12 @@ except:
     def profile(a):
         return a
 
+os.environ["KERAS_BACKEND"] = "torch"
+    try:
+        import keras_core as keras
+    except ImportError:
+        import keras
+
 @profile
 def compute_event_exceptionality(traces: np.ndarray,
                                  robust_std: bool = False,
@@ -275,11 +281,6 @@ def evaluate_components_CNN(A,
         logger.info("GPU run not requested, disabling use of GPUs")
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
-    os.environ["KERAS_BACKEND"] = "torch"
-    try:
-        import keras_core as keras
-    except ImportError:
-        import keras
     if model_name is None:
         model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
 
