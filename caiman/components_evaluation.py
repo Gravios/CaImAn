@@ -31,10 +31,10 @@ except:
         return a
 
 os.environ["KERAS_BACKEND"] = "torch"
-    try:
-        import keras_core as keras
-    except ImportError:
-        import keras
+try:
+    import keras_core as keras
+except ImportError:
+    import keras
 
 @profile
 def compute_event_exceptionality(traces: np.ndarray,
