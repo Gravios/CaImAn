@@ -21,14 +21,14 @@ from math import sqrt
 from multiprocessing import cpu_count
 import numpy as np
 import os
+import pickle
 from scipy.ndimage import percentile_filter
 from scipy.sparse import coo_matrix, csc_matrix, spdiags, hstack
 from scipy.stats import norm
 from sklearn.decomposition import NMF
 from skimage.morphology import disk
 from sklearn.preprocessing import normalize
-import torch
-from torch.utils.data import DataLoader, TensorDataset
+# Removed PyTorch imports since we're using Keras with PyTorch backend now
 from time import time
 
 import caiman
@@ -40,7 +40,8 @@ from caiman.motion_correction import (motion_correct_iteration_fast,
                                   high_pass_filter_space, sliding_window,
                                   register_translation_3d, apply_shifts_dft)
 import caiman.paths
-from caiman.pytorch_model_arch import PyTorchCNN
+from caiman.paths import caiman_datadir
+from caiman.keras_model_arch import keras_cnn_model_from_pickle
 from caiman.source_extraction.cnmf.cnmf import CNMF
 from caiman.source_extraction.cnmf.estimates import Estimates
 from caiman.source_extraction.cnmf.initialization import imblur, initialize_components, hals, downscale
@@ -63,6 +64,12 @@ try:
     profile
 except:
     def profile(a): return a
+
+os.environ["KERAS_BACKEND"] = "torch"
+try:
+    import keras_core as keras
+except ImportError:
+    import keras
 
 #TODO If we ever get a chance, it would make sense to refactor CNMF and OnACID to have a
 #     parent class, as OnACID started as a copy of the CNMF codebase and they have similar
@@ -359,11 +366,20 @@ class OnACID(object):
             loaded_model = None
             self.params.set('online', {'sniper_mode': False})
         else:
-            logger.info('Using Torch')
-            path = self.params.get('online', 'path_to_model').split(".")[:-1]
-            model_path = '.'.join(path + ['pt'])
-            loaded_model = PyTorchCNN()
-            loaded_model.load_state_dict(torch.load(model_path))
+            logger.info('Using Keras with PyTorch backend')
+            model_name = self.params.get('online', 'path_to_model').split(".")[0]  # Remove extension
+
+            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pkl")):
+                with open(os.path.join(caiman_datadir(), model_name + ".pkl"), 'rb') as f:
+                    pickle_data = pickle.load(f)
+            elif os.path.isfile(model_name + ".pkl"):
+                with open(model_name + ".pkl", 'rb') as f:
+                    pickle_data = pickle.load(f)
+            else:
+                raise FileNotFoundError(f"File for requested model {model_name} not found")
+
+            logger.info(f"USING MODEL (Keras from Pickle)")
+            loaded_model = keras_cnn_model_from_pickle(pickle_data, keras)
 
         self.loaded_model = loaded_model
 
@@ -2108,21 +2124,10 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
         Ain2 = np.reshape(Ain2,(-1,) + tuple(np.diff(ijSig_cnn).squeeze()),order= 'F')
         Ain2 = np.stack([cv2.resize(ain,(patch_size ,patch_size)) for ain in Ain2])
 
-        final_crops = Ain2[:, :, :, np.newaxis]
-        final_crops_tensor = torch.tensor(final_crops, dtype=torch.float32).permute(0, 3, 1, 2)
-        
-        #Create DataLoader for batching 
-        dataset = TensorDataset(final_crops_tensor)
-        loader = DataLoader(dataset, batch_size=int(min_num_trial), shuffle=False)
+        final_crops = Ain2[:, :, :, np.newaxis]  # Keep in Keras format (BHWC)
 
-        loaded_model.eval()
-        all_predictions = []
-        with torch.no_grad():
-            for batch in loader:
-                outputs = loaded_model(batch[0])
-                all_predictions.append(outputs)   
-        
-        predictions = torch.cat(all_predictions).cpu().numpy()
+        # Use Keras model prediction instead of PyTorch
+        predictions = loaded_model.predict(final_crops, batch_size=int(min_num_trial))
         keep_cnn = list(np.where(predictions[:,0] > thresh_CNN_noisy)[0])
         cnn_pos = Ain2[keep_cnn]
     else:

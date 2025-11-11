@@ -8,13 +8,22 @@ one photon data using a "ring-CNN" background model.
 import os
 os.environ["KERAS_BACKEND"] = "torch"
 
-import keras 
-from keras.callbacks import ModelCheckpoint, EarlyStopping, LearningRateScheduler
-from keras.initializers import Constant, RandomUniform
-from keras.layers import Input, Dense, Reshape, Layer, Activation
-from keras.models import Model
-import keras.ops as ops  
-from keras.optimizers import Adam
+try:
+    import keras_core as keras
+    from keras_core.callbacks import ModelCheckpoint, EarlyStopping, LearningRateScheduler
+    from keras_core.initializers import Constant, RandomUniform
+    from keras_core.layers import Input, Dense, Reshape, Layer, Activation
+    from keras_core.models import Model
+    import keras_core.ops as ops
+    from keras_core.optimizers import Adam
+except ImportError:
+    import keras
+    from keras.callbacks import ModelCheckpoint, EarlyStopping, LearningRateScheduler
+    from keras.initializers import Constant, RandomUniform
+    from keras.layers import Input, Dense, Reshape, Layer, Activation
+    from keras.models import Model
+    import keras.ops as ops
+    from keras.optimizers import Adam
 import numpy as np
 import time
 import torch 
