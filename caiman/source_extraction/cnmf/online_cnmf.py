@@ -430,6 +430,10 @@ class OnACID(object):
             self.estimates.max_img = Yres.max(-1)
 
         self.comp_upd = []
+        # The following are used for real-clock statistics for how the code is performing.
+        # If we ever find a better way to do this, it'd be preferable (although that may require a
+        # different overall design of the online code - one possibility would be the Apache bucket
+        # model) --pgunn
         self.t_shapes:list = []
         self.t_detect:list = []
         self.t_motion:list = []
@@ -680,7 +684,7 @@ class OnACID(object):
                 # set the update counter to 0 for components that are overlapping the newly added
                 idx_overlap = self.estimates.AtA[nb_:-num_added, -num_added:].nonzero()[0]
                 self.update_counter[idx_overlap] = 0
-            self.t_detect.append(time() - t_new)
+        self.t_detect.append(time() - t_new) # Used to be inside the conditional and dependent on finding components, but that messes up statistics
         t_stat = time()
         if self.params.get('online', 'batch_update_suff_stat'):
         # faster update using minibatch of frames
