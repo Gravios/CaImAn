@@ -121,7 +121,8 @@ class CNMF(object):
                 caused by handling many components (we have seen over 2000) that will need to be processed.
         """
 
-        self.dview = dview
+        self.runtype = "CNMF" # Single field to query to determine where an hdf5 file comes from
+        self.dview = dview # longer-term this should be removed from the CNMF object and moved to a RunContext
 
         # these are movie properties that will be refactored into the Movie object
         self.dims = None
