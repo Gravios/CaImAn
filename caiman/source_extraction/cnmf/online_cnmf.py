@@ -118,7 +118,7 @@ class OnACID(object):
                 To use set ``"init_method"`` to ``"seeded"``
 
         """
-        self.runtype = "OnACID" # Single field to query to determine where an hdf5 file comes from
+        self.strategy = "OnACID" # Single field to query to determine where an hdf5 file comes from
         if path is None:
             self.params = CNMFParams() if params is None else params
             self.estimates = Estimates() if estimates is None else estimates
