@@ -124,7 +124,8 @@ There are many repositories that use Caiman, or help make using Caiman easier.
 * [jnormcorre](https://github.com/apasarkar/jnormcorre): [JAX](https://github.com/google/jax) implementation of NoRMCorre for motion correction using JAX acceleration
 * [funimag](https://github.com/paninski-lab/funimag): matrix decomposition for denoising and compression
 * [mesmerize-core](https://github.com/nel-lab/mesmerize-core): parameter optimization, data organization and visualizations with Caiman
-* [improv](https://github.com/project-improv/improv):  a platform for creating online analysis workflows that lets you use Caiman in real time (e.g., for all-optical experiments)
+* [improv](https://github.com/project-improv/improv):  A platform for creating online analysis workflows that lets you use Caiman in real time (e.g., for all-optical experiments)
+* [pluvianus](https://github.com/katonage/pluvianus): A PyQT-based result browser for Caiman
 
 If you have questions about these related packages please reach out to their maintainers directly. If you would like your software to be in this list, please contact one of the developers or open an issue.
 
