@@ -449,6 +449,13 @@ def load_dict_from_hdf5(filename:str) -> dict:
     with h5py.File(filename, 'r') as h5file:
         return recursively_load_dict_contents_from_group(h5file, '/')
 
+def hdf5_runmode(filename:str) -> str:
+    ''' Load and return the runmode used to generate the hdf5 file, useful to make sure you're loading the type you think you are '''
+    with h5py.File(filename, 'r') as h5file:
+        if 'runmode' in h5file.attrs:
+            return h5file.attrs['runmode'] # Key is set in constructors of OnAcid and CNMF classes and carried forward thr serialisation
+        else:
+            return 'UNKNOWN' # For older files, or people opening the wrong file
 
 def recursively_save_dict_contents_to_group(h5file:h5py.File, path:str, dic:dict) -> None:
     '''

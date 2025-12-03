@@ -41,7 +41,7 @@ from caiman.source_extraction.cnmf.pre_processing import preprocess_data
 from caiman.source_extraction.cnmf.spatial import update_spatial_components
 from caiman.source_extraction.cnmf.temporal import update_temporal_components, constrained_foopsi_parallel
 from caiman.source_extraction.cnmf.utilities import update_order
-from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5
+from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, hdf5_runmode
 
 
 try:
@@ -755,11 +755,16 @@ def load_CNMF(filename:str, n_processes=1, dview=None):
             used to set up parallelization, default None
     '''
 
+    logger = logging.getLogger("caiman")
     new_obj = CNMF(n_processes)
     file_extension = os.path.splitext(filename)[1].lower()
 
     if file_extension in ('.hdf5', '.h5'):
         filename = caiman.paths.fn_relocated(filename)
+        runmode = hdf5_runmode(filename)
+        if runmode != 'cnmf':
+            logger.warning(f'Datafile {filename} not marked as cnmf')
+
         for key, val in load_dict_from_hdf5(filename).items():
             if key == 'params':
                 prms = CNMFParams()

@@ -53,7 +53,7 @@ from caiman.source_extraction.cnmf.utilities import (update_order, peak_local_ma
 import caiman.summary_images
 from caiman.utils.nn_models import (fit_NL_model, create_LN_model, quantile_loss, rate_scheduler)
 from caiman.utils.stats import pd_solve
-from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, parmap
+from caiman.utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, parmap, hdf5_runmode
 
 try:
     cv2.setNumThreads(0)
@@ -2577,7 +2577,12 @@ def load_OnlineCNMF(filename, dview = None):
             useful to set up parllelization in the objects
     """
 
+    logger = logging.getLogger("caiman")
     filename = caiman.paths.fn_relocated(filename)
+    runmode = hdf5_runmode(filename)
+    if runmode != 'OnACID':
+        logger.warning(f'Datafile {filename} not marked as OnACID')
+
     for key, val in load_dict_from_hdf5(filename).items():
         if key == 'params':
             prms = CNMFParams()
