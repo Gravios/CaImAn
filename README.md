@@ -147,10 +147,10 @@ If possible, we'd also ask that you cite the papers where the original algorithm
 
 # Main developers
 * (emeritus) Eftychios A. Pnevmatikakis, **Flatiron Institute, Simons Foundation** 
-* (emeritus) Andrea Giovannucci, **University of North Carolina, Chapel Hill**
-* (emeritus) Johannes Friedrich, **Allen Institute, Seattle Washington**
+* (emeritus) Andrea Giovannucci, **University of North Carolina, Chapel Hill** (and earlier at the Flatiron Institute)
+* (emeritus) Johannes Friedrich, **Allen Institute, Seattle Washington** (and earlier at the Flatiron Institute)
 * (emeritus) Changjia Cai, **University of North Carolina, Chapel Hill**
-* Kushal Kolar, **Flatiron Institute, Simons Foundation**
+* Kushal Kolar, **Flatiron Institute, Simons Foundation** (and earlier at UNC Chapel Hill)
 * Pat Gunn, **Flatiron Institute, Simons Foundation**
 
 A complete list of contributors can be found [here](https://github.com/flatironinstitute/Caiman/graphs/contributors).
@@ -169,6 +169,7 @@ Special thanks to the following people for letting us use their datasets in demo
 Also a special thanks to:
 * Eric Thompson, for various strong contributions to code and demos, both before and during his employment at the Flatiron Institute.
 * Ethan Blackwood, for several contributions in various areas
+* Manuel Paez, for substantial work on porting machine learning models into Keras/Pytorch that were originally written in Tensorflow
 
 # License
 This program is free software; you can redistribute it and/or
