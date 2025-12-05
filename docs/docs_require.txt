@@ -12,7 +12,7 @@ peakutils
 pims
 psutil
 pynwb
-pytorch
+torch
 scikit-image
 scikit-learn
 scipy
