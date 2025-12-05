@@ -329,4 +329,10 @@ def pd_solve(a, b):
     if info == 0:
         return dpotrs(L, b)[0]
     else:
-        return np.linalg.solve(a, b)
+        try:
+            pdsv =  np.linalg.solve(a, b)
+        except LinAlgError :
+            logger = logging.getLogger("caiman")
+            logger.warning("Unable to solve directly, using least squares instead.")
+            pdsv = np.linalg.lstsq(a, b, rcond=None)[0]
+        return pdsv
