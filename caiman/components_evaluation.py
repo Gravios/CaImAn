@@ -6,17 +6,18 @@ import logging
 import numpy as np
 import os
 import peakutils
-import tensorflow as tf
+import pickle
 import scipy
 from scipy.sparse import csc_matrix
 from scipy.stats import norm
-from typing import Any, Union
+import torch
+from typing import Any, Optional, Union
 import warnings
 
 import caiman
+from caiman.keras_model_arch import keras_cnn_model_from_pickle
 from caiman.paths import caiman_datadir
 import caiman.utils.stats
-import caiman.utils.utils
 
 try:
     cv2.setNumThreads(0)
@@ -28,6 +29,12 @@ try:
 except:
     def profile(a):
         return a
+
+os.environ["KERAS_BACKEND"] = "torch"
+try:
+    import keras_core as keras
+except ImportError:
+    import keras
 
 @profile
 def compute_event_exceptionality(traces: np.ndarray,
@@ -260,7 +267,7 @@ def classify_components_ep(Y, A, C, b, f, Athresh=0.1, Npeaks=5, tB=-3, tA=10, t
 def evaluate_components_CNN(A,
                             dims,
                             gSig,
-                            model_name: str = os.path.join(caiman_datadir(), 'model', 'cnn_model'),
+                            model_name: Optional[str] = None,
                             patch_size: int = 50,
                             loaded_model=None,
                             isGPU: bool = False) -> tuple[Any, np.array]:
@@ -270,45 +277,29 @@ def evaluate_components_CNN(A,
         then this code will try not to use a GPU. Otherwise it will use one if it finds it.
     """
     logger = logging.getLogger("caiman")
-
-    # TODO: Find a less ugly way to do this
     if not isGPU and 'CAIMAN_ALLOW_GPU' not in os.environ:
-        print("GPU run not requested, disabling use of GPUs")
+        logger.info("GPU run not requested, disabling use of GPUs")
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-    try:
-        os.environ["KERAS_BACKEND"] = "tensorflow"
-        from tensorflow.keras.models import model_from_json
-        use_keras = True
-        logger.info('Using Keras')
-    except (ModuleNotFoundError):
-        use_keras = False
-        logger.info('Using Tensorflow')
 
+    if model_name is None:
+        model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
+
+    logger.info('Using Torch')
+
+    logger.info('Using Keras 3.0 with PyTorch backend')
+    
     if loaded_model is None:
-        if use_keras:
-            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".json")):
-                model_file = os.path.join(caiman_datadir(), model_name + ".json")
-                model_weights = os.path.join(caiman_datadir(), model_name + ".h5")
-            elif os.path.isfile(model_name + ".json"):
-                model_file = model_name + ".json"
-                model_weights = model_name + ".h5"
-            else:
-                raise FileNotFoundError(f"File for requested model {model_name} not found")
-            with open(model_file, 'r') as json_file:
-                print(f"USING MODEL (keras API): {model_file}")
-                loaded_model_json = json_file.read()
-
-            loaded_model = model_from_json(loaded_model_json)
-            loaded_model.load_weights(model_name + '.h5')
+        if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".pkl")):
+            with open(os.path.join(caiman_datadir(), model_name + ".pkl"), 'rb') as f:
+                    pickle_data = pickle.load(f)
+        elif os.path.isfile(model_name + ".pkl"):
+            with open(model_name + ".pkl", 'rb') as f:
+                    pickle_data = pickle.load(f)
         else:
-            if os.path.isfile(os.path.join(caiman_datadir(), model_name + ".h5.pb")):
-                model_file = os.path.join(caiman_datadir(), model_name + ".h5.pb")
-            elif os.path.isfile(model_name + ".h5.pb"):
-                model_file = model_name + ".h5.pb"
-            else:
-                raise FileNotFoundError(f"File for requested model {model_name} not found")
-            print(f"USING MODEL (tensorflow API): {model_file}")
-            loaded_model = caiman.utils.utils.load_graph(model_file)
+            raise FileNotFoundError(f"File for requested model {model_name} not found")
+
+        logger.info(f"USING MODEL (Keras 3.0 API from Pickle)")
+        loaded_model = keras_cnn_model_from_pickle(pickle_data, keras)
 
         logger.debug("Loaded model from disk")
 
@@ -322,14 +313,7 @@ def evaluate_components_CNN(A,
                                               half_crop[1]:com[1] + half_crop[1]] for mm, com in zip(A.tocsc().T, coms)
     ]
     final_crops = np.array([cv2.resize(im / np.linalg.norm(im), (patch_size, patch_size)) for im in crop_imgs])
-    if use_keras:
-        predictions = loaded_model.predict(final_crops[:, :, :, np.newaxis], batch_size=32, verbose=1)
-    else:
-        tf_in = loaded_model.get_tensor_by_name('prefix/conv2d_20_input:0')
-        tf_out = loaded_model.get_tensor_by_name('prefix/output_node0:0')
-        with tf.Session(graph=loaded_model) as sess:
-            predictions = sess.run(tf_out, feed_dict={tf_in: final_crops[:, :, :, np.newaxis]})
-            sess.close()
+    predictions = loaded_model.predict(final_crops[:, :, :, np.newaxis], batch_size=32, verbose=1)
 
     return predictions, final_crops
 
@@ -445,10 +429,10 @@ def evaluate_components(Y: np.ndarray,
             tr_tmp = np.pad(traces.T, ((padbefore, padafter), (0, 0)), mode='reflect')
             numFramesNew, num_traces = tr_tmp.shape
                                                                                              # compute baseline quickly
-            logger.debug("binning data ...")
+            logger.debug("Binning data ...")
             tr_BL = np.reshape(tr_tmp, (downsampfact, numFramesNew // downsampfact, num_traces), order='F')
             tr_BL = np.percentile(tr_BL, 8, axis=0)
-            logger.debug("interpolating data ...")
+            logger.debug("Interpolating data ...")
             logger.debug(tr_BL.shape)
             tr_BL = scipy.ndimage.zoom(np.array(tr_BL, dtype=np.float32), [downsampfact, 1],
                                        order=3,
@@ -484,11 +468,15 @@ def evaluate_components(Y: np.ndarray,
 
 def grouper(n: int, iterable, fillvalue: bool = None):
     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
+    # Given an iterable, generate sufficient tuples of length n to hold them, using fillvalue
+    # as a packing substitute if things don't divide cleanly
+    # You may need to play around with this to fully understand what it's doing.
     args = [iter(iterable)] * n
     return itertools.zip_longest(*args, fillvalue=fillvalue)
 
 
 def evaluate_components_placeholder(params):
+    # This marshalls arguments/handles calls to evalute_components() for use with map_async()
     fname, traces, A, C, b, f, final_frate, remove_baseline, N, robust_std, Athresh, Npeaks, thresh_C = params
     Yr, dims, T = caiman.load_memmap(fname)
     Y = np.reshape(Yr, dims + (T,), order='F')
@@ -824,3 +812,4 @@ def estimate_components_quality(traces,
         return idx_components, idx_components_bad, np.array(fitness_raw), np.array(fitness_delta), np.array(r_values)
     else:
         return idx_components, idx_components_bad
+

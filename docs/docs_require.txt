@@ -12,10 +12,10 @@ peakutils
 pims
 psutil
 pynwb
+pytorch
 scikit-image
 scikit-learn
 scipy
-tensorflow
 tifffile
 tqdm
 zarr

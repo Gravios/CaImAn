@@ -739,7 +739,13 @@ class movie(caiman.base.timeseries.timeseries):
 
         Returns:
             self (caiman movie)
+
         """
+        # FIXME The semantics of this function are less than ideal.
+        # It sometimes modifies self inline, and sometimes creates a new object.
+        # In some future caiman we should probably make this consistent and either
+        #     have it not return anything (always working inline) or have it always return
+        #     a new object and leave the original alone.
         logger = logging.getLogger("caiman")
 
         T, d1, d2 = self.shape

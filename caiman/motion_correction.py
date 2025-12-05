@@ -426,8 +426,11 @@ class MotionCorrect(object):
                 If minimum value is negative, subtract it from the data
 
         Returns:
-            m_reg: caiman movie object
-                caiman movie object with applied shifts (not memory mapped)
+            if save_memmap is not true:
+                A caiman movie object
+                    caiman movie object with applied shifts (not memory mapped)
+            if save_memmap is true:
+                A string containing the filename for the memory-mapped movie
         """
         logger = logging.getLogger("caiman")
 
@@ -482,6 +485,7 @@ class MotionCorrect(object):
         if save_memmap:
             dims = m_reg.shape
             fname_tot = caiman.paths.memmap_frames_filename(save_base_name, dims[1:], dims[0], order)
+            fname_tot = caiman.paths.fn_relocated(fname_tot)
             big_mov = np.memmap(fname_tot, mode='w+', dtype=np.float32,
                         shape=caiman.mmapping.prepare_shape((np.prod(dims[1:]), dims[0])), order=order)
             big_mov[:] = np.reshape(m_reg.transpose(1, 2, 0), (np.prod(dims[1:]), dims[0]), order='F')

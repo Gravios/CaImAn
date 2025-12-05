@@ -29,23 +29,6 @@ The following is all done in your anaconda prompt, starting in your base environ
     mamba create -n caiman caiman # build a caiman environment
     conda activate caiman  # activate the environment
 
-### Step 1: Install Caiman (alternative for Windows users)
-Windows users will need to follow an alternative set of steps because tensorflow does not have good packaging for Windows with conda (packaging changes are underway to solve this but are not available as of this writing).
-
-First, you will need to install Visual Studio 2019 or possibly a later version, with the C++ compiler and commandline utilities.
-Then you will clone this repo to your windows system, and enter the checkout directory.
-
-Next, you will build and activate a mostly-empty conda environment:
-
-    mamba create -n caiman python=3.11 pip vs2019_win-64
-    conda activate caiman
-
-Finally, you will use pip to install Caiman's prerequisites and Caiman itself:
-    pip install .
-
-This step may fail if the compiler is not correctly installed and is the most fragile part of this install route; reach out if you encounter issues.
-
-After this, assuming you succeed, leave the source directory. Later steps will not function correctly when run in the source/checkout directory.
 
 ### Step 2: Download code samples and data sets
 Create a working directory called `caiman_data` that includes code samples and related data. Run the following command from the same conda environment that you created in Step 1:  
@@ -66,6 +49,22 @@ Jupyter will open. Navigate to demos/notebooks/ and click on `demo_pipeline.ipyn
 This differs from the quick start above in two ways:
 * For the first step only, go to [this doc](https://github.com/flatironinstitute/CaImAn/blob/main/docs/source/Installation.rst) and run through the parts of section 1B relevant to your operating system. After that, steps 2 and onward are the same
 * You will probably want to manually set some environment variables before any use of caiman; see [here](https://github.com/conda-forge/caiman-feedstock/blob/main/recipe/activate.sh) for a Linux/OSX example, or [here](https://github.com/conda-forge/caiman-feedstock/blob/main/recipe/activate.bat) for a Windows example. Either make a note of this or modify your dotfiles/configuration to do it for you.
+
+### Route B alternative for Windows users
+First, you will need to install Visual Studio 2019 or possibly a later version, with the C++ compiler and commandline utilities.
+Then you will clone this repo to your windows system, and enter the checkout directory.
+
+Next, you will build and activate a mostly-empty conda environment:
+
+    mamba create -n caiman python=3.11 pip vs2019_win-64
+    conda activate caiman
+
+Finally, you will use pip to install Caiman's prerequisites and Caiman itself:
+    pip install .
+
+This step may fail if the compiler is not correctly installed and is the most fragile part of this install route; reach out if you encounter issues.
+
+After this, assuming you succeed, leave the source directory. Later steps will not function correctly when run in the source/checkout directory.
 
 ## For installation help
 Caiman should install easily on Linux, Mac, and Windows. If you run into problems, we have a dedicated [installation page](./docs/source/Installation.rst). If you don't find what you need there, [create an issue](https://github.com/flatironinstitute/Caiman/issues) on GitHub.
@@ -125,7 +124,8 @@ There are many repositories that use Caiman, or help make using Caiman easier.
 * [jnormcorre](https://github.com/apasarkar/jnormcorre): [JAX](https://github.com/google/jax) implementation of NoRMCorre for motion correction using JAX acceleration
 * [funimag](https://github.com/paninski-lab/funimag): matrix decomposition for denoising and compression
 * [mesmerize-core](https://github.com/nel-lab/mesmerize-core): parameter optimization, data organization and visualizations with Caiman
-* [improv](https://github.com/project-improv/improv):  a platform for creating online analysis workflows that lets you use Caiman in real time (e.g., for all-optical experiments)
+* [improv](https://github.com/project-improv/improv):  A platform for creating online analysis workflows that lets you use Caiman in real time (e.g., for all-optical experiments)
+* [pluvianus](https://github.com/katonage/pluvianus): A PyQT-based result browser for Caiman
 
 If you have questions about these related packages please reach out to their maintainers directly. If you would like your software to be in this list, please contact one of the developers or open an issue.
 
