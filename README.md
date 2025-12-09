@@ -69,6 +69,13 @@ After this, assuming you succeed, leave the source directory. Later steps will n
 ## For installation help
 Caiman should install easily on Linux, Mac, and Windows. If you run into problems, we have a dedicated [installation page](./docs/source/Installation.rst). If you don't find what you need there, [create an issue](https://github.com/flatironinstitute/Caiman/issues) on GitHub.
 
+# Upgrading
+If you upgrade caiman, you should not generally need to clear out and recreate your caiman\_data directory between minor releases (e.g. 1.2.3 to 1.2.4); we try to avoid API changes that might break demos between those releases, although you will miss out on any improvements to notebooks (it is normal for people to change notebooks on their own without renaming them).
+
+If you want to get the latest changes, either remove or rename your caiman\_data directory and create a new one with `caimanmanager install` as above. Afterwards you can move data and/or modified notebooks back in (still possibly losing improvements we've made to notebooks along the way).
+
+If you upgrade caiman between major versions (e.g. 1.0.15 to 1.1.0), APIs are more likely to have changed and you may need to make more substantial changes to integrate your changes into the new versions. The process is the same.
+
 # Demo notebooks
 Caiman provides demo notebooks to showcase each of our main features, from motion correction to online CNMF. We recommend starting with the CNMF notebook (`demo_pipeline.ipynb`), which contains more explanation and details than the other notebooks: it covers many concepts that will be used without explanation in the other notebooks. The CNMFE notebook (`demo_pipeline_cnmfE.ipynb`), is also more detailed. Once you've gotten things set up and worked through those "anchor" notebooks, the best way to get started is to work through the demo notebook that most closely matches your use case; you should be able to adapt it for your particular needs.
 
