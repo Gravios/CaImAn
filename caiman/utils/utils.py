@@ -503,7 +503,7 @@ def recursively_save_dict_contents_to_group(h5file:h5py.File, path:str, dic:dict
 
         if isinstance(item, (list, tuple)):
             if len(item) > 0 and all(isinstance(elem, str) for elem in item):
-                item = np.string_(item)
+                item = np.bytes_(item)
             else:
                 item = np.array(item)
         if not isinstance(key, str):
