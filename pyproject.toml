@@ -28,7 +28,7 @@ dependencies = [
   "matplotlib",
   "moviepy",
   "mypy",
-  "numpy",
+  "numpy >= 2.0.0",
   "numpydoc",
   "opencv-python",
   "panel >= 1.0.2",
