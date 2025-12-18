@@ -26,6 +26,7 @@ import psutil
 import pynwb
 import scipy
 import sys
+import time
 
 import caiman
 from caiman.components_evaluation import estimate_components_quality
@@ -132,6 +133,13 @@ class CNMF(object):
         self.skip_refinement = skip_refinement
         self.remove_very_bad_comps = remove_very_bad_comps
 
+        self.provenance = [] # This will provide a rough record of the history of the object, largely with the intent of it
+                             # being useful in the serialized file form. The formatting for this will be a list of dicts,
+                             # the dicts all having at least the fields "event":str, "time":int, and "text":str
+                             # Other fields are permitted. Time is Unix epochtime. The semantics used here will be mirrored in
+                             # the OnACID class
+        self.provenance.append({'event': 'init', 'time': int(time.time()), 'text': 'CNMF Object initialized'})
+
         if params is None:
             self.params = CNMFParams(
                 border_pix=border_pix, del_duplicates=del_duplicates, low_rank_background=low_rank_background,
@@ -208,9 +216,13 @@ class CNMF(object):
         Returns:
             cnmf object with the current estimates
         """
+
+        # TODO: This both modifies self and returns a new cnmf object. Consider revising semantics.
+
         logger = logging.getLogger("caiman")
         if indices is None:
             indices = (slice(None), slice(None))
+
         fnames = self.params.get('data', 'fnames')
         if os.path.exists(fnames[0]):
             _, extension = os.path.splitext(fnames[0])[:2]
@@ -218,6 +230,8 @@ class CNMF(object):
         else:
             logger.error(f"Error: File not found, with file list:\n{fnames[0]}")
             raise Exception('File not found!')
+
+        self.provenance.append({'event': 'fit_file', 'time': int(time.time()), 'text': f'Run fit_file', 'data_target': str(fnames)})
 
         base_name = pathlib.Path(fnames[0]).stem + "_memmap_"
         if extension == '.mmap':
@@ -290,6 +304,7 @@ class CNMF(object):
             cnm
                 A new CNMF object
         """
+        self.provenance.append({'event': 'refit', 'time': int(time.time()), 'text': f'Run refit', 'data_target': str(images)})
         cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview)
         cnm.params.patch['rf'] = None
         cnm.params.patch['only_init'] = False
@@ -316,6 +331,7 @@ class CNMF(object):
         """
         logger = logging.getLogger("caiman")
         # Todo : to compartment
+        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'text': f'Run fit', 'data_target': str(images)})
         if isinstance(indices, slice):
             indices = [indices]
 
@@ -550,6 +566,7 @@ class CNMF(object):
                         indices of components to be removed
         """
 
+        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'text': f'Remove named components', 'data_target': str(ind_rm)})
         self.estimates.Ab, self.estimates.Ab_dense, self.estimates.CC, self.estimates.CY, self.M,\
             self.N, self.estimates.noisyC, self.estimates.OASISinstances, self.estimates.C_on,\
             expected_comps, self.ind_A,\
@@ -571,6 +588,8 @@ class CNMF(object):
              Yr :    np.ndarray
                      movie in format pixels (d) x frames (T)
         """
+        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'text': f'Compute and store residuals inline'})
+
         block_size, num_blocks_per_run = self.params.get('temporal', 'block_size_temp'), self.params.get('temporal', 'num_blocks_per_run_temp')
         if 'csc_matrix' not in str(type(self.estimates.A)):
             self.estimates.A = scipy.sparse.csc_matrix(self.estimates.A)
@@ -625,6 +644,8 @@ class CNMF(object):
         args_in = [(F[jj], None, jj, None, None, None, None,
                     args) for jj in range(F.shape[0])]
 
+        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'text': f'Deconvolve on traces', 'method_used': str(method_deconvolution)})
+
         if 'multiprocessing' in str(type(self.dview)):
             results = self.dview.map_async(
                 constrained_foopsi_parallel, args_in).get(4294967)
@@ -659,6 +680,7 @@ class CNMF(object):
         kw2 = {k: lc[k] for k in params}
         kwargs_new = {**kw2, **kwargs}
         self.params.set('temporal', kwargs_new)
+        self.provenance.append({'event': 'update_temporal', 'time': int(time.time()), 'text': f'Update temporal components based on provided Y'})
 
         self.estimates.C, self.estimates.A, self.estimates.b, self.estimates.f, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, \
@@ -687,6 +709,9 @@ class CNMF(object):
         for key in kwargs_new:
             if hasattr(self, key):
                 setattr(self, key, kwargs_new[key])
+
+        self.provenance.append({'event': 'update_spatial', 'time': int(time.time()), 'text': f'Update spatial components based on provided Y'})
+
         self.estimates.A, self.estimates.b, self.estimates.C, self.estimates.f =\
             update_spatial_components(Y, C=self.estimates.C, f=self.estimates.f, A_in=self.estimates.A,
                                       b_in=self.estimates.b, dview=self.dview,
@@ -695,6 +720,8 @@ class CNMF(object):
     def merge_comps(self, Y, mx=50, fast_merge=True) -> None:
         """merges components
         """
+        self.provenance.append({'event': 'merge_comps', 'time': int(time.time()), 'text': f'Merge components based on provided Y'})
+
         self.estimates.A, self.estimates.C, self.estimates.nr, self.estimates.merged_ROIs, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, self.estimates.g, self.empty_merged, \
         self.estimates.YrA =\
@@ -740,6 +767,9 @@ class CNMF(object):
                 mapped form
         """
         # TODO Weird that this returns Yr
+
+        self.provenance.append({'event': 'preprocess', 'time': int(time.time()), 'text': f'Remove bad pixels and compute per-pixel noise based on provided Yr'})
+
         Yr, self.estimates.sn, self.estimates.g, self.estimates.psx = preprocess_data(
             Yr, dview=self.dview, **self.params.get_group('preprocess'))
         return Yr
