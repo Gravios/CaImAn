@@ -1027,7 +1027,8 @@ class OnACID(object):
             self.estimates.lam = np.zeros(nr)
         else:
             raise Exception('Unknown initialization method!')
-        dims, Ts = caiman.base.movies.get_file_size(fls, var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
+
+        _, Ts = caiman.base.movies.get_file_size(fls, var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
         dims = Y.shape[1:]
         self.params.set('data', {'dims': dims})
         T1 = np.array(Ts).sum()*self.params.get('online', 'epochs') if T is None else T
@@ -1226,8 +1227,8 @@ class OnACID(object):
             for file_count, ffll in enumerate(process_files):
                 logger.warning(f'Now processing file {ffll}')
                 Y_ = caiman.base.movies.load_iter(
-                    ffll, var_name_hdf5=self.params.get('data', 'var_name_hdf5'),
-                    subindices=slice(init_batc_iter[file_count], None, None))
+                    ffll, var_name_hdf5 = self.params.get('data', 'var_name_hdf5'),
+                    subindices = slice(init_batc_iter[file_count], None, None))
 
                 old_comps = self.N     # number of existing components
                 frame_count = -1
@@ -1241,7 +1242,6 @@ class OnACID(object):
                                     activity *= self.img_norm
                             else:
                                 activity = 0.
-#                                frame = frame.astype(np.float32) - activity
                             frame = frame - np.squeeze(model_LN.predict(np.expand_dims(np.expand_dims(frame.astype(np.float32) - activity, 0), -1), verbose=0))
                             frame = np.maximum(frame, 0)
                         frame_count += 1
@@ -1278,6 +1278,7 @@ class OnACID(object):
                         else:
                             templ = None
                             frame_cor = frame_
+
                         self.t_motion.append(time.time() - t_mot)
                         
                         if self.params.get('online', 'normalize'):
@@ -1383,7 +1384,6 @@ class OnACID(object):
                 all_comps = np.nan_to_num(est.corr_img * pnr_img)
                 fac = 1. / self.params.get('init', 'min_corr') / self.params.get('init', 'min_pnr')
             else:
-                #all_comps = np.reshape(self.Yres_buf.mean(0), self.dims, order='F')
                 all_comps = np.reshape(est.mean_buff, self.dims, order='F')
                 fac = 1. / np.percentile(est.mean_buff, 99.995)
         else:
@@ -1513,7 +1513,7 @@ def bare_initialization(Y, init_batch=1000, k=1, method_init='greedy_roi', gnb=1
 
         return cnm_init
     else:
-        try:
+        try: # XXX Can this try actually fail?
             return Ain, np.array(b_in), Cin, f_in, YrA, W, b0
         except:
             return Ain, np.array(b_in), Cin, f_in, YrA
@@ -1572,9 +1572,7 @@ def seeded_initialization(Y, Ain, dims=None, init_batch=1000, order_init=None, g
     f_in = model.components_.squeeze()
     f_in = np.atleast_2d(f_in)
     Y_resf = np.dot(Yr, f_in.T)
-#    b_in = np.maximum(Y_resf.dot(np.linalg.inv(f_in.dot(f_in.T))), 0)
     b_in = np.maximum(np.linalg.solve(f_in.dot(f_in.T), Y_resf.T), 0).T
-    # b_in = np.maximum(pd_solve(f_in.dot(f_in.T), Y_resf.T), 0).T
     Yr_no_bg = (Yr - b_in.dot(f_in)).astype(np.float32)
 
     Cin = np.zeros([Ain.shape[-1],Yr.shape[-1]], dtype = np.float32)
@@ -1608,7 +1606,6 @@ def seeded_initialization(Y, Ain, dims=None, init_batch=1000, order_init=None, g
             2, Ain=Ain, Cin=Cin, b_in=np.array(b_in), f_in=f_in, p=1, **kwargs)
         cnm_init.estimates.A, cnm_init.estimates.C, cnm_init.estimates.b, cnm_init.estimates.f, cnm_init.estimates.S, \
                 cnm_init.estimates.YrA = Ain, Cin, b_in, f_in, np.fmax(np.atleast_2d(Cin), 0), YrA
-    #    cnm_init.g = np.array([[gg] for gg in np.ones(nr)*0.9])
         cnm_init.estimates.g = np.array([-np.poly([0.9] * max(p, 1))[1:]
                                for gg in np.ones(nr)])
         cnm_init.estimates.bl = np.zeros(nr)
@@ -1855,8 +1852,6 @@ def init_shapes_and_sufficient_stats(Y, A, C, b, f, W=None, b0=None, ssub_B=1, b
     K = A.shape[1]  # number of neurons
     if W is None:
         nb = b.shape[1]  # number of background components
-    # if isinstance(bSiz, (int, float)):
-    #     bSiz = [bSiz] * len(dims)
         Ab = np.hstack([b, A])
     else:
         Ab = A
@@ -1964,8 +1959,6 @@ def update_shapes(CY, CC, Ab, ind_A, sn=None, q=0.5, indicator_components=None,
                         Ab_dense[ind_pixels, m] = tmp / max(1, sqrt(tmp.dot(tmp)))
                         Ab.data[Ab.indptr[m]:Ab.indptr[m + 1]] = Ab_dense[ind_pixels, m]
                         ind_A[m - nb] = Ab.indices[slice(Ab.indptr[m], Ab.indptr[m + 1])]
-                # Ab.data[Ab.indptr[nb]:] = np.concatenate(
-                #     [Ab_dense[ind_A[m - nb], m] for m in range(nb, M)])
                 # N.B. why does selecting only overlapping neurons help surprisingly little, i.e
                 # Ab[ind_pixels][:, overlap[m]].dot(CC[overlap[m], m])
                 # where overlap[m] are the indices of all neurons overlappping with & including m?
@@ -2059,17 +2052,11 @@ def rank1nmf(Ypx, ain, iters=10):
         cin_res = ain.dot(Ypx)  # / ain.dot(ain)
         cin = np.maximum(cin_res, 0)
         ain = np.maximum(Ypx.dot(cin), 0)
-        # ain /= (sqrt(ain.dot(ain)) + np.finfo(np.float32).eps)
         if t in (0, iters-1):
             ain /= (sqrt(ain.dot(ain)) + eps)
         elif t % 2 == 0:  # division by squared norm every 2nd iter is faster yet numerically stable
             ain /= (ain.dot(ain) + eps)
-        # nc = cin.dot(cin)
-        # ain = np.maximum(Ypx.dot(cin.T) / nc, 0)
-        # tmp = cin - cin_old
-        # if tmp.dot(tmp) < 1e-6 * nc:
-        #     break
-        # cin_old = cin.copy()
+
     cin_res = ain.dot(Ypx)  # / ain.dot(ain)
     cin = np.maximum(cin_res, 0)
     return ain, cin, cin_res
@@ -2141,7 +2128,6 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
             compute_corr = True  # determine when to compute corr coef
 
         na = ain.dot(ain)
-        # sv[indices_] /= 1  # 0
         if na:
             ain /= sqrt(na)
             Ain.append(ain)
