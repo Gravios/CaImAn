@@ -335,8 +335,7 @@ class CNMF(object):
 
         """
         logger = logging.getLogger("caiman")
-        # Todo : to compartment
-        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'description': f'Ran fit', 'data_target': str(images)})
+        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'description': f'Ran fit'})
         if isinstance(indices, slice):
             indices = [indices]
 
@@ -571,7 +570,7 @@ class CNMF(object):
                         indices of components to be removed
         """
 
-        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'description': f'Removed named components', 'data_target': str(ind_rm)})
+        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'description': f'Removed named components', 'indices_removed': str(ind_rm)})
         self.estimates.Ab, self.estimates.Ab_dense, self.estimates.CC, self.estimates.CY, self.M,\
             self.N, self.estimates.noisyC, self.estimates.OASISinstances, self.estimates.C_on,\
             expected_comps, self.ind_A,\
@@ -593,7 +592,7 @@ class CNMF(object):
              Yr :    np.ndarray
                      movie in format pixels (d) x frames (T)
         """
-        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'description': f'Computed and stored residuals inline'})
+        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'description': f'Populated YrA with Computed/stored residuals'})
 
         block_size, num_blocks_per_run = self.params.get('temporal', 'block_size_temp'), self.params.get('temporal', 'num_blocks_per_run_temp')
         if 'csc_matrix' not in str(type(self.estimates.A)):
@@ -649,7 +648,7 @@ class CNMF(object):
         args_in = [(F[jj], None, jj, None, None, None, None,
                     args) for jj in range(F.shape[0])]
 
-        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'description': f'Deconvolved on traces', 'method_used': str(method_deconvolution)})
+        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'description': f'Deconvolved on traces', 'method_deconvolution': str(method_deconvolution)})
 
         if 'multiprocessing' in str(type(self.dview)):
             results = self.dview.map_async(
