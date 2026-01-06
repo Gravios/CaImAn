@@ -59,11 +59,6 @@ try:
 except():
     pass
 
-try:
-    profile
-except:
-    def profile(a): return a
-
 os.environ["KERAS_BACKEND"] = "torch"
 try:
     import keras_core as keras
@@ -162,7 +157,6 @@ class OnACID(object):
         return getattr(self, idx)
     # We want subscripting to be read-only so we do not define a __setitem__ method
 
-    @profile
     def _prepare_object(self, Yr, T, new_dims=None, idx_components=None):
         # Internal function used by initialize_online()
         logger = logging.getLogger("caiman")
@@ -443,7 +437,6 @@ class OnACID(object):
 
         return self
 
-    @profile
     def fit_next(self, t, frame_in, num_iters_hals=3):
         """
         This method fits the next frame using the online algorithm and
@@ -1639,7 +1632,6 @@ def HALS4shapes(Yr, A, C, iters=2):
 
 
 # definitions for demixed time series extraction and denoising/deconvolving
-@profile
 def HALS4activity(Yr, A, noisyC, AtA=None, iters=5, tol=1e-3, groups=None,
                   order=None):
     """Solves C = argmin_C ||Yr-AC|| using block-coordinate decent. Can use
@@ -1761,7 +1753,6 @@ def demix1p(y, A, noisyC, AtA, Atb, AtW, AtWA, iters=5, tol=1e-3,
     return C, noisyC
 
 
-@profile
 def demix_and_deconvolve(C, noisyC, AtY, AtA, OASISinstances, iters=3, n_refit=0):
     """
     Solve C = argmin_C ||Y-AC|| subject to C following AR(p) dynamics
@@ -1882,7 +1873,6 @@ def init_shapes_and_sufficient_stats(Y, A, C, b, f, W=None, b0=None, ssub_B=1, b
     return Ab, ind_A, CY, CC
 
 
-@profile
 def update_shapes(CY, CC, Ab, ind_A, sn=None, q=0.5, indicator_components=None,
                   Ab_dense=None, update_bkgrd=True, iters=5):
 
@@ -2061,7 +2051,6 @@ def rank1nmf(Ypx, ain, iters=10):
     cin = np.maximum(cin_res, 0)
     return ain, cin, cin_res
 
-@profile
 def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
                              gHalf=(5, 5), sniper_mode=True, rval_thr=0.85,
                              patch_size=50, loaded_model=None, test_both=False,
@@ -2186,7 +2175,6 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
 
     return Ain, Cin, Cin_res, idx, ijsig_all, cnn_pos, local_maxima
 
-@profile
 def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
                           dims, gSig, gSiz, ind_A, CY, CC, groups, oases, gnb=1,
                           rval_thr=0.875, bSiz=3, robust_std=False,
