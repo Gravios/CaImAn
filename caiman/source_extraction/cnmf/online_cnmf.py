@@ -2502,103 +2502,6 @@ def remove_components_online(ind_rem, gnb, Ab, use_dense, Ab_dense, AtA, CY,
 
     return Ab, Ab_dense, CC, CY, M, N, noisyC, OASISinstances, C_on, exp_comps, ind_A, groups, AtA
 
-def initialize_movie_online(Y, K, gSig, rf, stride, base_name,
-                            p=1, merge_thresh=0.95, rval_thr_online=0.9, thresh_fitness_delta_online=-30, thresh_fitness_raw_online=-50,
-                            rval_thr_init=.5, thresh_fitness_delta_init=-20, thresh_fitness_raw_init=-20,
-                            rval_thr_refine=0.95, thresh_fitness_delta_refine=-100, thresh_fitness_raw_refine=-100,
-                            final_frate=10, Npeaks=10, single_thread=True, dview=None, n_processes=None):
-    """
-    Initialize movie using CNMF on minibatch. See CNMF parameters
-    """
-
-    Yr = Y.to_2D().T
-    # merging threshold, max correlation allowed
-    # order of the autoregressive system
-    base_name = base_name + '.mmap'
-    fname_new = Y.save(caiman.paths.fn_relocated(base_name), order='C')
-    Yr, dims, T = caiman.load_memmap(fname_new)
-    d1, d2 = dims
-    images = np.reshape(Yr.T, [T] + list(dims), order='F')
-    Y = np.reshape(Yr, dims + (T,), order='F')
-    Cn2 = caiman.local_correlations(Y)
-    # RUN ALGORITHM ON PATCHES
-    cnm_init = caiman.source_extraction.cnmf.CNMF(n_processes, method_init='greedy_roi', k=K, gSig=gSig, merge_thresh=merge_thresh,
-                                              p=0, dview=dview, Ain=None, rf=rf, stride=stride, method_deconvolution='oasis', skip_refinement=False,
-                                              normalize_init=False, options_local_NMF=None,
-                                              minibatch_shape=100, minibatch_suff_stat=5,
-                                              update_num_comps=True, rval_thr=rval_thr_online, thresh_fitness_delta=thresh_fitness_delta_online, thresh_fitness_raw=thresh_fitness_raw_online,
-                                              batch_update_suff_stat=True, max_comp_update_shape=5)
-
-    cnm_init.fit(images)
-    A_tot = cnm_init.A
-    C_tot = cnm_init.C
-    YrA_tot = cnm_init.YrA
-    b_tot = cnm_init.b
-    f_tot = cnm_init.f
-
-    print(f"Number of components: {A_tot.shape[-1]}")
-
-    traces = C_tot + YrA_tot
-    fitness_raw, fitness_delta, erfc_raw, erfc_delta, r_values, significant_samples = caiman.components_evaluation.evaluate_components(
-        Y, traces, A_tot, C_tot, b_tot, f_tot, final_frate, remove_baseline=True, N=5, robust_std=False, Athresh=0.1, Npeaks=Npeaks,  thresh_C=0.3)
-
-    idx_components_r = np.where(r_values >= rval_thr_init)[0]
-    idx_components_raw = np.where(fitness_raw < thresh_fitness_raw_init)[0]
-    idx_components_delta = np.where(
-        fitness_delta < thresh_fitness_delta_init)[0]
-
-    idx_components = np.union1d(idx_components_r, idx_components_raw)
-    idx_components = np.union1d(idx_components, idx_components_delta)
-    idx_components_bad = np.setdiff1d(list(range(len(traces))), idx_components)
-
-    print(('Keeping ' + str(len(idx_components)) +
-           ' and discarding  ' + str(len(idx_components_bad))))
-
-    A_tot = A_tot.tocsc()[:, idx_components]
-    C_tot = C_tot[idx_components]
-
-    cnm_refine = caiman.source_extraction.cnmf.CNMF(n_processes, method_init='greedy_roi', k=A_tot.shape, gSig=gSig, merge_thresh=merge_thresh, rf=None, stride=None,
-                                                p=p, dview=dview, Ain=A_tot, Cin=C_tot, f_in=f_tot, method_deconvolution='oasis', skip_refinement=True,
-                                                normalize_init=False, options_local_NMF=None,
-                                                minibatch_shape=100, minibatch_suff_stat=5,
-                                                update_num_comps=True, rval_thr=rval_thr_refine, thresh_fitness_delta=thresh_fitness_delta_refine, thresh_fitness_raw=thresh_fitness_raw_refine,
-                                                batch_update_suff_stat=True, max_comp_update_shape=5)
-
-    cnm_refine.fit(images)
-
-    A, C, b, f, YrA = cnm_refine.A, cnm_refine.C, cnm_refine.b, cnm_refine.f, cnm_refine.YrA
-
-    final_frate = 10
-    Npeaks = 10
-    traces = C + YrA
-
-    fitness_raw, fitness_delta, erfc_raw, erfc_delta, r_values, significant_samples = \
-        caiman.components_evaluation.evaluate_components(Y, traces, A, C, b, f, final_frate, remove_baseline=True,
-                                                     N=5, robust_std=False, Athresh=0.1, Npeaks=Npeaks,  thresh_C=0.3)
-
-    idx_components_r = np.where(r_values >= rval_thr_refine)[0]
-    idx_components_raw = np.where(fitness_raw < thresh_fitness_raw_refine)[0]
-    idx_components_delta = np.where(
-        fitness_delta < thresh_fitness_delta_refine)[0]
-
-    idx_components = np.union1d(idx_components_r, idx_components_raw)
-    idx_components = np.union1d(idx_components, idx_components_delta)
-    idx_components_bad = np.setdiff1d(list(range(len(traces))), idx_components)
-
-    print(' ***** ')
-    print((len(traces)))
-    print((len(idx_components)))
-
-    cnm_refine.sn = sn # FIXME: There is no sn in scope here
-    cnm_refine.idx_components = idx_components
-    cnm_refine.idx_components_bad = idx_components_bad
-    cnm_refine.r_values = r_values
-    cnm_refine.fitness_raw = fitness_raw
-    cnm_refine.fitness_delta = fitness_delta
-    cnm_refine.Cn2 = Cn2
-
-    return cnm_refine, Cn2, fname_new
-
 def load_OnlineCNMF(filename, dview = None):
     """load object saved with the CNMF save method
 
@@ -2638,4 +2541,6 @@ def load_OnlineCNMF(filename, dview = None):
     return new_obj
 
 def inv_mat_vec(A):
+    # Helper function, used in fit_next() method
     return np.linalg.solve(A[0], A[1])
+
