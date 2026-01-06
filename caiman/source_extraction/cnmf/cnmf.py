@@ -138,7 +138,7 @@ class CNMF(object):
                              # the dicts all having at least the fields "event":str, "time":int, and "text":str
                              # Other fields are permitted. Time is Unix epochtime. The semantics used here will be mirrored in
                              # the OnACID class
-        self.provenance.append({'event': 'init', 'time': int(time.time()), 'description': 'CNMF Object initialized'})
+        self.provenance.append({'event': 'create', 'time': int(time.time()), 'description': 'CNMF Object created'})
 
         if params is None:
             self.params = CNMFParams(
