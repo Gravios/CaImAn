@@ -138,7 +138,7 @@ class CNMF(object):
                              # the dicts all having at least the fields "event":str, "time":int, and "text":str
                              # Other fields are permitted. Time is Unix epochtime. The semantics used here will be mirrored in
                              # the OnACID class
-        self.provenance.append({'event': 'init', 'time': int(time.time()), 'text': 'CNMF Object initialized'})
+        self.provenance.append({'event': 'init', 'time': int(time.time()), 'description': 'CNMF Object initialized'})
 
         if params is None:
             self.params = CNMFParams(
@@ -231,7 +231,7 @@ class CNMF(object):
             logger.error(f"Error: File not found, with file list:\n{fnames[0]}")
             raise Exception('File not found!')
 
-        self.provenance.append({'event': 'fit_file', 'time': int(time.time()), 'text': f'Run fit_file', 'data_target': str(fnames)})
+        self.provenance.append({'event': 'fit_file', 'time': int(time.time()), 'description': f'Ran fit_file', 'data_target': str(fnames)})
 
         base_name = pathlib.Path(fnames[0]).stem + "_memmap_"
         if extension == '.mmap':
@@ -304,7 +304,7 @@ class CNMF(object):
             cnm
                 A new CNMF object
         """
-        self.provenance.append({'event': 'refit', 'time': int(time.time()), 'text': f'Run refit', 'data_target': str(images)})
+        self.provenance.append({'event': 'refit', 'time': int(time.time()), 'description': f'Ran refit', 'data_target': str(images)})
         cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview)
         cnm.params.patch['rf'] = None
         cnm.params.patch['only_init'] = False
@@ -331,7 +331,7 @@ class CNMF(object):
         """
         logger = logging.getLogger("caiman")
         # Todo : to compartment
-        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'text': f'Run fit', 'data_target': str(images)})
+        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'description': f'Ran fit', 'data_target': str(images)})
         if isinstance(indices, slice):
             indices = [indices]
 
@@ -566,7 +566,7 @@ class CNMF(object):
                         indices of components to be removed
         """
 
-        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'text': f'Remove named components', 'data_target': str(ind_rm)})
+        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'description': f'Removed named components', 'data_target': str(ind_rm)})
         self.estimates.Ab, self.estimates.Ab_dense, self.estimates.CC, self.estimates.CY, self.M,\
             self.N, self.estimates.noisyC, self.estimates.OASISinstances, self.estimates.C_on,\
             expected_comps, self.ind_A,\
@@ -588,7 +588,7 @@ class CNMF(object):
              Yr :    np.ndarray
                      movie in format pixels (d) x frames (T)
         """
-        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'text': f'Compute and store residuals inline'})
+        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'description': f'Computed and stored residuals inline'})
 
         block_size, num_blocks_per_run = self.params.get('temporal', 'block_size_temp'), self.params.get('temporal', 'num_blocks_per_run_temp')
         if 'csc_matrix' not in str(type(self.estimates.A)):
@@ -644,7 +644,7 @@ class CNMF(object):
         args_in = [(F[jj], None, jj, None, None, None, None,
                     args) for jj in range(F.shape[0])]
 
-        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'text': f'Deconvolve on traces', 'method_used': str(method_deconvolution)})
+        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'description': f'Deconvolved on traces', 'method_used': str(method_deconvolution)})
 
         if 'multiprocessing' in str(type(self.dview)):
             results = self.dview.map_async(
@@ -680,7 +680,7 @@ class CNMF(object):
         kw2 = {k: lc[k] for k in params}
         kwargs_new = {**kw2, **kwargs}
         self.params.set('temporal', kwargs_new)
-        self.provenance.append({'event': 'update_temporal', 'time': int(time.time()), 'text': f'Update temporal components based on provided Y'})
+        self.provenance.append({'event': 'update_temporal', 'time': int(time.time()), 'description': f'Updated temporal components based on provided Y'})
 
         self.estimates.C, self.estimates.A, self.estimates.b, self.estimates.f, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, \
@@ -710,7 +710,7 @@ class CNMF(object):
             if hasattr(self, key):
                 setattr(self, key, kwargs_new[key])
 
-        self.provenance.append({'event': 'update_spatial', 'time': int(time.time()), 'text': f'Update spatial components based on provided Y'})
+        self.provenance.append({'event': 'update_spatial', 'time': int(time.time()), 'description': f'Updated spatial components based on provided Y'})
 
         self.estimates.A, self.estimates.b, self.estimates.C, self.estimates.f =\
             update_spatial_components(Y, C=self.estimates.C, f=self.estimates.f, A_in=self.estimates.A,
@@ -720,7 +720,7 @@ class CNMF(object):
     def merge_comps(self, Y, mx=50, fast_merge=True) -> None:
         """merges components
         """
-        self.provenance.append({'event': 'merge_comps', 'time': int(time.time()), 'text': f'Merge components based on provided Y'})
+        self.provenance.append({'event': 'merge_comps', 'time': int(time.time()), 'description': f'Merged components based on provided Y'})
 
         self.estimates.A, self.estimates.C, self.estimates.nr, self.estimates.merged_ROIs, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, self.estimates.g, self.empty_merged, \
@@ -768,7 +768,7 @@ class CNMF(object):
         """
         # TODO Weird that this returns Yr
 
-        self.provenance.append({'event': 'preprocess', 'time': int(time.time()), 'text': f'Remove bad pixels and compute per-pixel noise based on provided Yr'})
+        self.provenance.append({'event': 'preprocess', 'time': int(time.time()), 'description': f'Removed bad pixels and computed per-pixel noise based on provided Yr'})
 
         Yr, self.estimates.sn, self.estimates.g, self.estimates.psx = preprocess_data(
             Yr, dview=self.dview, **self.params.get_group('preprocess'))
