@@ -1470,6 +1470,14 @@ def bare_initialization(Y, init_batch=1000, k=1, method_init='greedy_roi', gnb=1
     else:
         Y = Y[:, :, :init_batch]
 
+    # FIXME Unclear what parts in the try block might fail, otherwise we could
+    # presumably hoist the common elements out
+    #
+    # It may be that the inconsistent return type for initialize_components()
+    # is what's being handled here (it returns an extra parameter if
+    # method == 'corr_pnr' and there is a ring_size_factor), in which case this
+    # is a particularly bad way to handle that variation because it will run twice
+    # in some circumstances without a good reason.
     try:
         Ain, Cin, b_in, f_in, center = initialize_components(
             Y, K=k, gSig=gSig, nb=gnb, method_init=method_init, **kwargs)
@@ -1488,6 +1496,7 @@ def bare_initialization(Y, init_batch=1000, k=1, method_init='greedy_roi', gnb=1
             Y, K=k, gSig=gSig, nb=gnb, method_init=method_init, **kwargs)
         Ain = coo_matrix(Ain)
         YrA, _, W, b0 = extra_1p[-4:]
+
     if return_object:
         cnm_init = caiman.source_extraction.cnmf.cnmf.CNMF(2, k=k, gSig=gSig, Ain=Ain, Cin=Cin, b_in=np.array(
             b_in), f_in=f_in, method_init=method_init, p=p, gnb=gnb, **kwargs)
@@ -1503,7 +1512,6 @@ def bare_initialization(Y, init_batch=1000, k=1, method_init='greedy_roi', gnb=1
         cnm_init.estimates.lam = np.zeros(k)
         cnm_init.dims = Y.shape[:-1]
         cnm_init.params.set('online', {'init_batch': init_batch})
-
         return cnm_init
     else:
         try: # XXX Can this try actually fail?
@@ -2191,7 +2199,14 @@ def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
                           max_img=None, downscale_matrix=None, upscale_matrix=None):
     """
     Checks for new components in the residual buffer and incorporates them if they pass the acceptance tests
+
+    Returns:
+    Ab, Cf, Yres_buf, rho_buf, CC, CY, ind_A, sv, groups, ind_new, ind_new_all, sv, cnn_pos
     """
+
+    # FIXME This is called once in fit_next() and it would be good to refactor it, possibly into a method
+    # (making argument passing easier to read), possibly inlining it and then looking for a new abstraction,
+    # or possibly some more fundamental reworking. Please do not call this from outside code.
 
     ind_new = []
     gHalf = np.array(gSiz) // 2

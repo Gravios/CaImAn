@@ -50,12 +50,6 @@ try:
 except:
     pass
 
-try:
-    profile
-except:
-    def profile(a): return a
-
-
 class CNMF(object):
     """  Source extraction using constrained non-negative matrix factorization.
 
