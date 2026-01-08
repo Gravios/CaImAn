@@ -913,7 +913,7 @@ class OnACID(object):
         Y = caiman.load(fls[0], subindices=slice(0, opts['init_batch'],
                  None), var_name_hdf5=self.params.get('data', 'var_name_hdf5')).astype(np.float32)
         if model_LN is not None:
-            Y = Y - caiman.movie(np.squeeze(model_LN.predict(np.expand_dims(Y, -1))))
+            Y = Y - caiman.movie(np.squeeze(model_LN.predict(np.expand_dims(Y, -1), verbose=0)))
             Y = np.maximum(Y, 0)
         # Downsample if needed
         ds_factor = np.maximum(opts['ds_factor'], 1)
