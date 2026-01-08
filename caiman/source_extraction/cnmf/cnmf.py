@@ -208,8 +208,6 @@ class CNMF(object):
             cnmf object with the current estimates
         """
 
-        # TODO: This both modifies self and returns a new cnmf object. Consider revising semantics.
-
         logger = logging.getLogger("caiman")
         if indices is None:
             indices = (slice(None), slice(None))
