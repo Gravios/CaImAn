@@ -515,8 +515,8 @@ class OnACID(object):
                           self.estimates.upscale_matrix.dot(self.estimates.W.dot(
                             self.estimates.downscale_matrix.dot(res_frame))))
         mn_ = self.estimates.mn.copy()
-        self.estimates.mn = (t-1)/t*self.estimates.mn + res_frame/t
-        self.estimates.vr = (t-1)/t*self.estimates.vr + (res_frame - mn_)*(res_frame - self.estimates.mn)/t
+        self.estimates.mn = (t - 1) / t * self.estimates.mn + res_frame / t
+        self.estimates.vr = (t - 1) / t * self.estimates.vr + (res_frame - mn_) * (res_frame - self.estimates.mn) / t
         self.estimates.sn = np.sqrt(self.estimates.vr)
         
         t_new = time.time()
@@ -553,6 +553,7 @@ class OnACID(object):
                 g_est = np.mean(self.estimates.g, 0)
             else:
                 g_est = 0
+
             use_corr = self.params.get('online', 'use_corr_img')
             # FIXME The next statement is really hard to read
             (self.estimates.Ab, Cf_temp, self.estimates.Yres_buf, self.estimates.rho_buf,
@@ -1240,8 +1241,8 @@ class OnACID(object):
                         frame_count += 1
                         t_frame_start = time.time()
                         if np.isnan(np.sum(frame)):
-                            raise Exception('Frame ' + str(frame_count) +
-                                            ' contains NaN')
+                            raise Exception(f'Frame {frame_count} contains NaN')
+
                         if t % 500 == 0:
                             logger.info(f'Epoch: {iter + 1}. {t}' +
                                          ' frames have been processed in total. ' +
@@ -1251,6 +1252,7 @@ class OnACID(object):
 
                         if np.isnan(np.sum(frame)):
                             raise Exception(f'Frame {frame_count} contains NaN')
+
                         if t % 500 == 0:
                             logger.info(f'Epoch: {iter + 1}. {t} frames have been processed.'
                                          f'{self.N - old_comps} new components were added. Total: {self.N}')
@@ -1275,7 +1277,7 @@ class OnACID(object):
                         self.t_motion.append(time.time() - t_mot)
                         
                         if self.params.get('online', 'normalize'):
-                            frame_cor = frame_cor/self.img_norm
+                            frame_cor = frame_cor / self.img_norm
                         # Fit next frame
                         self.fit_next(t, frame_cor.reshape(-1, order='F'))
                         # Show
@@ -1307,6 +1309,7 @@ class OnACID(object):
                          epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
         noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
         self.estimates.YrA = noisyC - self.estimates.C
+
         if self.estimates.OASISinstances is not None:
             self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
             self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
@@ -1314,6 +1317,7 @@ class OnACID(object):
         else:
             self.estimates.bl = [0] * self.estimates.C.shape[0]
             self.estimates.S = np.zeros_like(self.estimates.C)
+
         if self.params.get('online', 'ds_factor') > 1:
             dims = frame.shape
             self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
@@ -1323,16 +1327,21 @@ class OnACID(object):
                                                               dims[::-1]).reshape(-1, order='F')[:,None] for i in range(self.params.get('init', 'nb'))], axis=1)
             else:
                 self.estimates.b = np.resize(self.estimates.b, (self.estimates.A.shape[0], 0))
+
             if self.estimates.b0 is not None:
                 b0 = self.estimates.b0.reshape(self.estimates.dims, order='F')
                 b0 = cv2.resize(b0, dims[::-1])
                 self.estimates.b0 = b0.reshape((-1, 1), order='F')
+
             self.params.set('data', {'dims': dims})
             self.estimates.dims = dims
+
         if self.params.get('online', 'save_online_movie'):
             out.release()
+
         if self.params.get('online', 'show_movie'):
             cv2.destroyAllWindows()
+
         self.t_online = t_online
         self.estimates.C_on = self.estimates.C_on[:self.M]
         self.estimates.noisyC = self.estimates.noisyC[:self.M]
@@ -2147,7 +2156,7 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
         final_crops = Ain2[:, :, :, np.newaxis]  # Keep in Keras format (BHWC)
 
         # Use Keras model prediction instead of PyTorch
-        predictions = loaded_model.predict(final_crops, batch_size=int(min_num_trial))
+        predictions = loaded_model.predict(final_crops, batch_size=int(min_num_trial), verbose=0)
         keep_cnn = list(np.where(predictions[:,0] > thresh_CNN_noisy)[0])
         cnn_pos = Ain2[keep_cnn]
     else:

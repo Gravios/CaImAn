@@ -544,3 +544,4 @@ def get_MCNN_model(Y, gSig=5, n_channels=8, lr=1e-4, pct=10, r_factor=1.5,
     model_NL = fit_NL_model(model_NL, Y, patience=patience, val_split=val_split,
                             batch_size=batch_size, epochs=epochs)
     return model_NL
+
