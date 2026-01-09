@@ -1028,7 +1028,7 @@ def computing_indicator(Y, A_in, b, C, f, nb, method, dims, min_size, max_size, 
                 scipy.sparse.hstack([A_in, scipy.sparse.coo_matrix(b)]), dims, method=method, min_size=min_size, max_size=max_size, dist=dist, expandCore=expandCore,
                 dview=dview)
 
-        ind2_ = [np.where(iid_.squeeze())[0]  for iid_ in dist_indicator.astype(bool).toarray()]
+        ind2_ = [np.where(np.atleast_1d(iid_))[0]  for iid_ in dist_indicator.astype(bool).toarray()]
         ind2_ = [iid_ if (np.size(iid_) > 0) and (np.min(iid_) < nr) else [] for iid_ in ind2_]
 
     return ind2_, nr, C, f, b, A_in
