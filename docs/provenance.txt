@@ -4,7 +4,7 @@ information to reliably entirely reproduce the file, but we can at least make a 
 disambiguate common cases.
 
 The design is as follows:
-In the HDF5 file there is a toplevel list of provenance entries representing the linear history of the object, covering
+In the cnmf object there is a toplevel list of provenance entries representing the linear history of the object, covering
 processing steps, timestamps, and perhaps a limited representation of parameters for the processing steps. Each list entry
 will have (at least) the following elements, stored as a small dictionary:
 	event       (str) - A stable, small-string representation for the event
@@ -13,5 +13,8 @@ will have (at least) the following elements, stored as a small dictionary:
 		reword it as the software goes on; it is not necessarily stable and is not good for software parsing the
 		provenance to look at. If we ever add an i8n/localisation system to Caiman, these strings will be localised
 
+This lands in the hdf5 file as a single json-encoded string, saved as an attribute called 'provenance'.
+
 Some events will have additional fields to partly-or-wholly represent parameters to the code generating the event. These fields
-may have any datatype, provided they can be serialised/deserialised cleanly into hdf5 (no handles to live code objects)
+may have any datatype, provided they can be serialised/deserialised cleanly into json(no handles to live code objects).
+
