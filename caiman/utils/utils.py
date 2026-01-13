@@ -385,9 +385,9 @@ def load_dict_from_hdf5(filename:str) -> dict:
 
     with h5py.File(filename, 'r') as h5file:
         ret = recursively_load_dict_contents_from_group(h5file, '/')
-        if 'provenance' in h5file:
+        if 'provenance' in h5file.attrs:
             prov = json.loads(h5file.attrs['provenance'])
-            ret['providence'] = prov
+            ret['provenance'] = prov
         # TODO: Add code to look for and load provenance entries, json-decoding them
         return ret
 
