@@ -763,7 +763,7 @@ def load_CNMF(filename:str, n_processes=1, dview=None):
     if file_extension in ('.hdf5', '.h5'):
         filename = caiman.paths.fn_relocated(filename)
         runmode = hdf5_runmode(filename)
-        if runmode != 'cnmf':
+        if runmode != 'CNMF':
             logger.warning(f'Datafile {filename} not marked as cnmf')
 
         for key, val in load_dict_from_hdf5(filename).items():
@@ -859,3 +859,4 @@ def load_CNMF(filename:str, n_processes=1, dview=None):
         raise NotImplementedError(f'Unsupported file extension {file_extension}')
 
     return new_obj
+
