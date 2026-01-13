@@ -273,7 +273,7 @@ class CNMF(object):
         """
         cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview) # New object; this call does NOT modify self
 
-        cnm.provenance += self.provenance # Hoping we don't need to check to see if it exists to cover deserialisation cases from old code
+        cnm.provenance += self.provenance
         cnm.provenance.append({'event': 'refit', 'time': int(time.time()), 'description': f'Ran refit, history imported from old object', 'data_target': str(images)})
         # We add the "history imported" note because the datestamp from the init of the new CNMF will be later than imported history (meaning right now)
         # so if you parse in list order you'll see a time-oddity here
