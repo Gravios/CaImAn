@@ -26,6 +26,7 @@ import psutil
 import pynwb
 import scipy
 import sys
+import time
 
 import caiman
 from caiman.components_evaluation import estimate_components_quality
@@ -48,12 +49,6 @@ try:
     cv2.setNumThreads(0)
 except:
     pass
-
-try:
-    profile
-except:
-    def profile(a): return a
-
 
 class CNMF(object):
     """  Source extraction using constrained non-negative matrix factorization.
@@ -132,6 +127,13 @@ class CNMF(object):
         self.skip_refinement = skip_refinement
         self.remove_very_bad_comps = remove_very_bad_comps
 
+        self.provenance = [] # This will provide a rough record of the history of the object, largely with the intent of it
+                             # being useful in the serialized file form. The formatting for this will be a list of dicts,
+                             # the dicts all having at least the fields "event":str, "time":int, and "text":str
+                             # Other fields are permitted. Time is Unix epochtime. The semantics used here will be mirrored in
+                             # the OnACID class
+        self.provenance.append({'event': 'create', 'time': int(time.time()), 'description': 'CNMF Object created'})
+
         if params is None:
             self.params = CNMFParams(
                 border_pix=border_pix, del_duplicates=del_duplicates, low_rank_background=low_rank_background,
@@ -188,29 +190,28 @@ class CNMF(object):
         return getattr(self, idx)
     # We want subscripting to be read-only so we do not define a __setitem__ method
 
-    def fit_file(self, motion_correct=False, indices=None, include_eval=False):
+    def fit_file(self, motion_correct=False, indices=None) -> None:
         """
         Packages the analysis pipeline (motion correction, memory
         mapping, patch based CNMF processing and component evaluation) in a
         single method that can be called on a specific (sequence of) file(s).
         It is assumed that the CNMF object already contains a params object
         where the location of the files and all the relevant parameters have
-        been specified. The method will perform the last step, i.e. component
-        evaluation, if the flag "include_eval" is set to `True`.
+        been specified. This method does not perform component evaluation.
 
         Args:
             motion_correct (bool)
                 flag for performing motion correction
             indices (list of slice objects)
                 perform analysis only on a part of the FOV
-            include_eval (bool)
-                flag for performing component evaluation
         Returns:
             cnmf object with the current estimates
         """
+
         logger = logging.getLogger("caiman")
         if indices is None:
             indices = (slice(None), slice(None))
+
         fnames = self.params.get('data', 'fnames')
         if os.path.exists(fnames[0]):
             _, extension = os.path.splitext(fnames[0])[:2]
@@ -218,6 +219,8 @@ class CNMF(object):
         else:
             logger.error(f"Error: File not found, with file list:\n{fnames[0]}")
             raise Exception('File not found!')
+
+        self.provenance.append({'event': 'fit_file', 'time': int(time.time()), 'description': f'Ran fit_file', 'data_target': str(fnames)})
 
         base_name = pathlib.Path(fnames[0]).stem + "_memmap_"
         if extension == '.mmap':
@@ -255,29 +258,7 @@ class CNMF(object):
 
         images = np.reshape(Yr.T, [T] + list(dims), order='F')
         self.mmap_file = fname_new
-        if not include_eval:
-            return self.fit(images, indices=indices)
-
         self.fit(images, indices=indices)
-        Cn = caiman.summary_images.local_correlations(images[::max(T//1000, 1)], swap_dim=False)
-        Cn[np.isnan(Cn)] = 0
-        self.save(fname_new[:-5] + '_init.hdf5')
-        # Rerun seeded CNMF on accepted patches to refine and perform deconvolution
-        cnm2 = self.refit(images, dview=self.dview)
-        cnm2.estimates.evaluate_components(images, cnm2.params, dview=self.dview)
-        # Extract DF/F values
-        cnm2.estimates.detrend_df_f(quantileMin=8, frames_window=250)
-        cnm2.estimates.Cn = Cn
-        cnm2.save(cnm2.mmap_file[:-4] + 'hdf5')
-
-        # XXX Why are we stopping the cluster here? What started it? Why remove log files?
-        caiman.cluster.stop_server(dview=self.dview)
-        log_files = glob.glob('*_LOG_*')
-        for log_file in log_files:
-            os.remove(log_file)
-
-        return cnm2
-
 
     def refit(self, images, dview=None):
         """
@@ -290,7 +271,13 @@ class CNMF(object):
             cnm
                 A new CNMF object
         """
-        cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview)
+        cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview) # New object; this call does NOT modify self
+
+        cnm.provenance += self.provenance
+        cnm.provenance.append({'event': 'refit', 'time': int(time.time()), 'description': f'Ran refit, history imported from old object', 'data_target': str(images)})
+        # We add the "history imported" note because the datestamp from the init of the new CNMF will be later than imported history (meaning right now)
+        # so if you parse in list order you'll see a time-oddity here
+        
         cnm.params.patch['rf'] = None
         cnm.params.patch['only_init'] = False
         estimates = deepcopy(self.estimates)
@@ -315,7 +302,7 @@ class CNMF(object):
 
         """
         logger = logging.getLogger("caiman")
-        # Todo : to compartment
+        self.provenance.append({'event': 'fit', 'time': int(time.time()), 'description': f'Ran fit'})
         if isinstance(indices, slice):
             indices = [indices]
 
@@ -550,6 +537,7 @@ class CNMF(object):
                         indices of components to be removed
         """
 
+        self.provenance.append({'event': 'remove_components', 'time': int(time.time()), 'description': f'Removed named components', 'indices_removed': str(ind_rm)})
         self.estimates.Ab, self.estimates.Ab_dense, self.estimates.CC, self.estimates.CY, self.M,\
             self.N, self.estimates.noisyC, self.estimates.OASISinstances, self.estimates.C_on,\
             expected_comps, self.ind_A,\
@@ -571,6 +559,8 @@ class CNMF(object):
              Yr :    np.ndarray
                      movie in format pixels (d) x frames (T)
         """
+        self.provenance.append({'event': 'compute_residuals', 'time': int(time.time()), 'description': f'Populated YrA with Computed/stored residuals'})
+
         block_size, num_blocks_per_run = self.params.get('temporal', 'block_size_temp'), self.params.get('temporal', 'num_blocks_per_run_temp')
         if 'csc_matrix' not in str(type(self.estimates.A)):
             self.estimates.A = scipy.sparse.csc_matrix(self.estimates.A)
@@ -625,6 +615,8 @@ class CNMF(object):
         args_in = [(F[jj], None, jj, None, None, None, None,
                     args) for jj in range(F.shape[0])]
 
+        self.provenance.append({'event': 'deconvolve', 'time': int(time.time()), 'description': f'Deconvolved on traces', 'method_deconvolution': str(method_deconvolution)})
+
         if 'multiprocessing' in str(type(self.dview)):
             results = self.dview.map_async(
                 constrained_foopsi_parallel, args_in).get(4294967)
@@ -659,6 +651,7 @@ class CNMF(object):
         kw2 = {k: lc[k] for k in params}
         kwargs_new = {**kw2, **kwargs}
         self.params.set('temporal', kwargs_new)
+        self.provenance.append({'event': 'update_temporal', 'time': int(time.time()), 'description': f'Updated temporal components based on provided Y'})
 
         self.estimates.C, self.estimates.A, self.estimates.b, self.estimates.f, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, \
@@ -687,6 +680,9 @@ class CNMF(object):
         for key in kwargs_new:
             if hasattr(self, key):
                 setattr(self, key, kwargs_new[key])
+
+        self.provenance.append({'event': 'update_spatial', 'time': int(time.time()), 'description': f'Updated spatial components based on provided Y'})
+
         self.estimates.A, self.estimates.b, self.estimates.C, self.estimates.f =\
             update_spatial_components(Y, C=self.estimates.C, f=self.estimates.f, A_in=self.estimates.A,
                                       b_in=self.estimates.b, dview=self.dview,
@@ -695,6 +691,8 @@ class CNMF(object):
     def merge_comps(self, Y, mx=50, fast_merge=True) -> None:
         """merges components
         """
+        self.provenance.append({'event': 'merge_comps', 'time': int(time.time()), 'description': f'Merged components based on provided Y'})
+
         self.estimates.A, self.estimates.C, self.estimates.nr, self.estimates.merged_ROIs, self.estimates.S, \
         self.estimates.bl, self.estimates.c1, self.estimates.neurons_sn, self.estimates.g, self.empty_merged, \
         self.estimates.YrA =\
@@ -740,6 +738,9 @@ class CNMF(object):
                 mapped form
         """
         # TODO Weird that this returns Yr
+
+        self.provenance.append({'event': 'preprocess', 'time': int(time.time()), 'description': f'Removed bad pixels and computed per-pixel noise based on provided Yr'})
+
         Yr, self.estimates.sn, self.estimates.g, self.estimates.psx = preprocess_data(
             Yr, dview=self.dview, **self.params.get_group('preprocess'))
         return Yr
@@ -762,7 +763,7 @@ def load_CNMF(filename:str, n_processes=1, dview=None):
     if file_extension in ('.hdf5', '.h5'):
         filename = caiman.paths.fn_relocated(filename)
         runmode = hdf5_runmode(filename)
-        if runmode != 'cnmf':
+        if runmode != 'CNMF':
             logger.warning(f'Datafile {filename} not marked as cnmf')
 
         for key, val in load_dict_from_hdf5(filename).items():
@@ -858,3 +859,4 @@ def load_CNMF(filename:str, n_processes=1, dview=None):
         raise NotImplementedError(f'Unsupported file extension {file_extension}')
 
     return new_obj
+
