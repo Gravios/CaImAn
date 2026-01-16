@@ -12,9 +12,9 @@ try:
     import keras_core as keras
 except ImportError:
     import keras
-    
-def test_keras():
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+def test_keras(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
 
     try:
         model_name = os.path.join(caiman_datadir(), 'model', 'cnn_model')
@@ -31,7 +31,4 @@ def test_keras():
     try:
         predictions = loaded_model.predict(A, batch_size=32)
     except:
-        raise Exception('NN model could not be deployed. use_keras = ' + str(use_keras))
-
-if __name__ == "__main__":
-    test_keras()
+        raise Exception('NN model could not be deployed.')
