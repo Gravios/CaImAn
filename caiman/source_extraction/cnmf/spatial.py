@@ -1069,7 +1069,7 @@ def creatememmap(Y, Cf, dview):
         C_name = os.path.join(folder, 'C_temp.npy')
         np.save(C_name, Cf)
 
-        if isinstance(Y, np.core.memmap):  # if input file is already memory mapped then find the filename
+        if isinstance(Y, np.memmap):  # if input file is already memory mapped then find the filename
             Y_name = Y.filename
         # if not create a memory mapped version (necessary for parallelization)
         elif isinstance(Y, str) or dview is None:
@@ -1077,7 +1077,7 @@ def creatememmap(Y, Cf, dview):
         else:
             Y_name = os.path.join(folder, 'Y_temp.npy')
             np.save(Y_name, Y)
-            Y, _, _, _ = caiman.mmapping.load_memmap(Y_name)
+            Y, _, _ = caiman.mmapping.load_memmap(Y_name)
             raise Exception('Not implemented consistently')
     return C_name, Y_name, folder
 
