@@ -272,7 +272,7 @@ def kde(data, N=None, MIN=None, MAX=None):
     mesh = [(bins[i] + bins[i + 1]) / 2 for i in range(N)]
     bandwidth = np.sqrt(t_star) * R
 
-    density = density / np.trapz(density, mesh)
+    density = density / np.trapezoid(density, mesh)
     cdf = np.cumsum(density) * (mesh[1] - mesh[0])
 
     return bandwidth, mesh, density, cdf
