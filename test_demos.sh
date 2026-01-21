@@ -51,6 +51,9 @@ for demo in demos/general/*.py; do
                 # This demo normally likes to show its results to the user and wait for them
                 # to close those results before it exits; this supresses that behaviour
                 extra_args="--no_play"
+	elif [ $demo == "demos/general/demo_pipeline.py" ]; then
+                # ditto
+                extra_args="--no_play"
 	elif [ -d $demo ]; then
 		true
 	else
