@@ -16,6 +16,7 @@ import matplotlib.patches as patches
 from matplotlib.patches import Polygon, Rectangle
 import os
 import random
+from skimage.measure import find_contours
 
 def apply_mask(image: np.ndarray, mask: np.ndarray, 
             color: tuple[float, float, float] = (1, 0, 0), alpha: float = 0.5) -> np.ndarray:
