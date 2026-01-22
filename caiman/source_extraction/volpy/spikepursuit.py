@@ -212,7 +212,7 @@ def volspike(pars):
         plt.show()
     
     # flip the signal if necessary
-    if args['flip_signal']==True:
+    if args['flip_signal']:
         data = -data
     
     # remove the photobleaching effect by high-pass filtering the signal

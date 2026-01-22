@@ -331,7 +331,7 @@ def pd_solve(a, b):
     else:
         try:
             pdsv =  np.linalg.solve(a, b)
-        except LinAlgError :
+        except  np.linalg.LinAlgError:
             logger = logging.getLogger("caiman")
             logger.warning("Unable to solve directly, using least squares instead.")
             pdsv = np.linalg.lstsq(a, b, rcond=None)[0]
