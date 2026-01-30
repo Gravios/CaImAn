@@ -9,6 +9,7 @@ Written by Waleed Abdulla
 Revised by Eric Thompson, Changjia Cai, and Manuel Paez 
 """
 
+import matplotlib.pyplot as plt
 import os
 import sys
 import numpy as np
