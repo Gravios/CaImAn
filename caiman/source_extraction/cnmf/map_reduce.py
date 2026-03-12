@@ -73,6 +73,26 @@ def cnmf_patches(args_in):
     logger = logging.getLogger("caiman")
     file_name, idx_, shapes, params = args_in
 
+    # ── Exception barrier ─────────────────────────────────────────────────
+    # multiprocessing.Pool serialises worker exceptions with pickle before
+    # sending them back to the parent.  Some scipy/LAPACK exception types
+    # (e.g. _flapack.error) are not importable in the parent process and
+    # therefore cannot be pickled, causing a secondary MaybeEncodingError
+    # that hides the real failure.  Wrapping here ensures any exception is
+    # re-raised as a plain RuntimeError (always picklable) with the full
+    # original traceback embedded as a string.
+    try:
+        return _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger)
+    except Exception as _e:
+        import traceback as _tb
+        raise RuntimeError(
+            f"cnmf_patches failed on patch starting at idx={idx_[0]}:\n"
+            + _tb.format_exc()
+        ) from None
+
+
+def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
+
     # ── Support both legacy path strings and shared-memory handles ────────
     if isinstance(file_name, ShmHandle):
         # Name-log uses a synthetic filename for readability
