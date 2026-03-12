@@ -17,6 +17,29 @@ import caiman
 import caiman.base.movies
 from caiman.source_extraction.cnmf.pre_processing import get_noise_fft
 
+# ── Optional GPU acceleration (CuPy) ─────────────────────────────────────────
+# Imported lazily so the module is importable without a CUDA installation.
+# All GPU helpers check _gpu_available() before touching CuPy symbols.
+try:
+    import cupy as _cp
+    import cupyx.scipy.ndimage as _cpnd
+    _CUPY_LOADED = True
+except ImportError:
+    _cp = None
+    _cpnd = None
+    _CUPY_LOADED = False
+
+
+def _gpu_available() -> bool:
+    """Return True if CuPy is installed and a CUDA device is reachable."""
+    if not _CUPY_LOADED:
+        return False
+    try:
+        _cp.zeros(1)
+        return True
+    except Exception:
+        return False
+
 def max_correlation_image(Y, bin_size: int = 1000, eight_neighbours: bool = True, swap_dim: bool = True) -> np.ndarray:
     """Computes the max-correlation image for the input dataset Y with bin_size
 
@@ -283,33 +306,197 @@ def local_correlations(Y, eight_neighbours: bool = True, swap_dim: bool = True, 
     return rho
 
 
-def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True,
-                    background_filter: str = 'disk') -> tuple[np.ndarray, np.ndarray]:
+def _local_correlations_fft_gpu(Y_gpu) -> "np.ndarray":
+    """GPU implementation of local_correlations_fft for 2-D movies.
+
+    Parameters
+    ----------
+    Y_gpu : cp.ndarray, shape (T, d1, d2) float32
+        Already zero-mean and unit-variance along the time axis.
+
+    Returns
+    -------
+    np.ndarray (d1, d2)  — correlation image, already on CPU.
     """
-    compute the correlation image and the peak-to-noise ratio (PNR) image.
-    If gSig is provided, then spatially filtered the video.
+    # 8-neighbour sum kernel: 3×3 box minus centre pixel.
+    sz = _cp.ones((3, 3), dtype=_cp.float32)
+    sz[1, 1] = 0.0
+
+    # Batch the 2-D neighbour-sum filter across all T frames.
+    # cupyx.scipy.ndimage.convolve operates on a single array, so we loop over
+    # frames — each call dispatches a CUDA kernel, still far faster than CPU.
+    Yconv = _cp.stack([_cpnd.convolve(img, sz, mode='constant') for img in Y_gpu])
+
+    # Border pixels have fewer than 8 neighbours; compute the exact count once.
+    MASK = _cpnd.convolve(
+        _cp.ones(Y_gpu.shape[1:], dtype=_cp.float32), sz, mode='constant'
+    )
+    MASK[MASK == 0] = 1.0  # avoid divide-by-zero at image corners
+
+    Cn_gpu = _cp.mean(Yconv * Y_gpu, axis=0) / MASK
+    return _cp.asnumpy(Cn_gpu)
+
+
+def _correlation_pnr_gpu(Y, gSig, center_psf, swap_dim,
+                         noise_range, noise_method) -> tuple:
+    """Full GPU implementation of correlation_pnr.
+
+    All intermediate arrays live in VRAM.  A single H2D transfer opens the
+    function; two D2H transfers (cn, pnr) close it.
+
+    The critical speedup vs CPU is in noise estimation: the CPU path calls
+    cv2.dft once **per pixel** (262,144 serial calls for 512×512 data).
+    Here a single cp.fft.rfft processes every pixel time-series simultaneously.
+    """
+    logger = logging.getLogger("caiman")
+
+    if swap_dim:
+        Y = np.transpose(Y, (Y.ndim - 1,) + tuple(range(Y.ndim - 1)))
+
+    T, d1, d2 = Y.shape
+
+    # ── H2D transfer (one copy of the subsampled movie) ───────────────────
+    data_gpu = _cp.asarray(Y.reshape(T, d1, d2).astype(np.float32))
+
+    # ── Spatial bandpass / PSF filter ─────────────────────────────────────
+    if gSig is not None:
+        if not isinstance(gSig, list):
+            gSig = [gSig, gSig]
+        ksize0 = int(2 * gSig[0]) * 2 + 1
+        ksize1 = int(2 * gSig[1]) * 2 + 1
+
+        # Build kernel on CPU (tiny), transfer to GPU once.
+        psf_cpu = cv2.getGaussianKernel(ksize0, gSig[0], cv2.CV_32F).dot(
+            cv2.getGaussianKernel(ksize1, gSig[1], cv2.CV_32F).T
+        )
+        if center_psf:
+            ind_nz = psf_cpu >= psf_cpu[0].max()
+            psf_cpu = psf_cpu - psf_cpu[ind_nz].mean()
+            psf_cpu[~ind_nz] = 0.0
+
+        kernel_gpu = _cp.asarray(psf_cpu.astype(np.float32))
+
+        for t in range(T):
+            data_gpu[t] = _cpnd.convolve(data_gpu[t], kernel_gpu, mode='reflect')
+
+    # ── Zero-mean along time ───────────────────────────────────────────────
+    data_gpu -= data_gpu.mean(axis=0, keepdims=True)
+
+    # ── Peak fluorescence (PNR numerator) ─────────────────────────────────
+    data_max = data_gpu.max(axis=0)                             # (d1, d2)
+
+    # ── Noise estimation via batched rfft ─────────────────────────────────
+    # Reshape to (pixels, T) so rfft runs along the time axis for all pixels
+    # at once.  On a 512×512 movie this replaces 262,144 serial cv2.dft calls.
+    xdft = _cp.fft.rfft(data_gpu.reshape(T, -1).T, axis=-1)    # (pixels, T//2+1)
+    n_freqs = xdft.shape[-1]
+    ff = _cp.linspace(0.0, 0.5, n_freqs)
+    band = (ff >= noise_range[0]) & (ff <= noise_range[1])
+    psd = (_cp.abs(xdft[:, band]) ** 2) * (2.0 / T)            # (pixels, n_band)
+
+    if noise_method == 'mean':
+        sn = _cp.sqrt(psd.mean(axis=-1))
+    elif noise_method == 'median':
+        sn = _cp.sqrt(_cp.median(psd, axis=-1))
+    else:  # logmexp
+        sn = _cp.sqrt(_cp.exp(_cp.mean(_cp.log(psd + 1e-10), axis=-1)))
+
+    sn = sn.reshape(d1, d2)                                     # (d1, d2)
+    del xdft, psd
+
+    # ── PNR image ─────────────────────────────────────────────────────────
+    pnr_gpu = _cp.divide(data_max, _cp.where(sn > 0, sn, _cp.inf))
+    pnr_gpu = _cp.maximum(pnr_gpu, 0.0)
+
+    # ── Threshold and compute local correlation ────────────────────────────
+    tmp_data = data_gpu / _cp.where(sn > 0, sn, _cp.inf)[_cp.newaxis]
+    tmp_data[tmp_data < 3.0] = 0.0
+
+    # Normalise for correlation computation (zero-mean, unit-variance along T)
+    mu  = tmp_data.mean(axis=0, keepdims=True)
+    std = tmp_data.std(axis=0, keepdims=True)
+    std[std == 0] = _cp.inf
+    tmp_norm = (tmp_data - mu) / std
+    del tmp_data, data_gpu, sn
+
+    # ── Local correlation image ────────────────────────────────────────────
+    cn = _local_correlations_fft_gpu(tmp_norm)      # D2H inside helper
+    del tmp_norm
+
+    pnr = _cp.asnumpy(pnr_gpu)
+    del pnr_gpu
+
+    _cp.get_default_memory_pool().free_all_blocks()
+    logger.debug("correlation_pnr: GPU path complete")
+    return cn, pnr
+
+
+def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True,
+                    background_filter: str = 'disk',
+                    noise_range: list = None, noise_method: str = 'mean',
+                    use_gpu: bool = None) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the local correlation image and peak-to-noise ratio (PNR) image.
+
+    If a CUDA GPU and CuPy are available the computation is dispatched to the
+    GPU automatically (or unconditionally when ``use_gpu=True``).  The GPU path
+    replaces the per-pixel ``cv2.dft`` loop in noise estimation with a single
+    batched ``cp.fft.rfft`` across all pixels simultaneously — the dominant
+    speedup for typical FOV sizes.
+
+    The function signature is a strict superset of the original: all existing
+    call sites work without modification.
 
     Args:
-        Y:  np.ndarray (3D or 4D).
-            Input movie data in 3D or 4D format
-        gSig:  scalar or vector.
-            gaussian width. If gSig == None, no spatial filtering
-        center_psf: Boolean
-            True indicates subtracting the mean of the filtering kernel
-        swap_dim: Boolean
-            True indicates that time is listed in the last axis of Y (matlab format)
-            and moves it in the front
-        background_filter: str
-            (undocumented)
+        Y : np.ndarray (3D or 4D)
+            Input movie data.
+        gSig : scalar or list, optional
+            Gaussian half-width for spatial bandpass filter (pixels).
+            ``None`` disables filtering.
+        center_psf : bool
+            Subtract the mean of the filter kernel (recommended for 2p data).
+        swap_dim : bool
+            ``True`` if time is in the *last* axis (MATLAB / CaImAn convention).
+        background_filter : str
+            ``'disk'`` (default) or ``'box'`` — background ring shape for the
+            CPU path only (GPU always uses the disk/Gaussian kernel).
+        noise_range : list [f_low, f_high], optional
+            Frequency band as a fraction of Nyquist for noise estimation.
+            Default ``[0.25, 0.5]``.
+        noise_method : str
+            ``'mean'`` (default), ``'median'``, or ``'logmexp'``.
+        use_gpu : bool or None
+            ``True``  — require GPU (raises if unavailable).
+            ``False`` — force CPU.
+            ``None``  — use GPU if available, otherwise CPU (default).
 
     Returns:
-        cn: np.ndarray (2D or 3D).
-            local correlation image of the spatially filtered (or not)
-            data
-        pnr: np.ndarray (2D or 3D).
-            peak-to-noise ratios of all pixels/voxels
-
+        cn  : np.ndarray (d1, d2)  — local correlation image.
+        pnr : np.ndarray (d1, d2)  — peak-to-noise ratio image.
     """
+    logger = logging.getLogger("caiman")
+
+    if noise_range is None:
+        noise_range = [0.25, 0.5]
+
+    # ── Dispatch decision ─────────────────────────────────────────────────
+    if use_gpu is True and not _gpu_available():
+        raise RuntimeError(
+            "correlation_pnr: use_gpu=True but no CUDA device found. "
+            "Install cupy-cuda12x (or the matching version) and check nvidia-smi."
+        )
+
+    _run_gpu = _gpu_available() if use_gpu is None else bool(use_gpu)
+
+    if _run_gpu:
+        logger.debug("correlation_pnr: dispatching to GPU")
+        return _correlation_pnr_gpu(
+            Y, gSig=gSig, center_psf=center_psf, swap_dim=swap_dim,
+            noise_range=noise_range, noise_method=noise_method,
+        )
+
+    # ── CPU path (original implementation, unchanged) ─────────────────────
+    logger.debug("correlation_pnr: using CPU path")
+
     if swap_dim:
         Y = np.transpose(Y, tuple(np.hstack((Y.ndim - 1, list(range(Y.ndim))[:-1]))))
 
@@ -338,8 +525,6 @@ def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True
                 psf[~ind_nonzero] = 0
                 for idx, img in enumerate(data_filtered):
                     data_filtered[idx,] = cv2.filter2D(img, -1, psf, borderType=1)
-
-            # data_filtered[idx, ] = cv2.filter2D(img, -1, psf, borderType=1)
         else:
             for idx, img in enumerate(data_filtered):
                 data_filtered[idx,] = cv2.GaussianBlur(img, ksize=ksize, sigmaX=gSig[0], sigmaY=gSig[1], borderType=1)

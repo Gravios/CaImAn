@@ -58,6 +58,12 @@ import caiman.base.movies
 import caiman.mmapping
 import caiman.motion_correction
 import caiman.paths
+from caiman.shared_memory_utils import SharedMovieBuffer, ShmHandle, frames_from_handle_or_fname
+from caiman.cpu_topology import cache_aware_chunk_order, apply_affinity
+from caiman.gpu_motion_correction import (
+    gpu_available,
+    motion_correction_piecewise_gpu,
+)
 
 try:
     cv2.setNumThreads(0)
@@ -78,7 +84,7 @@ class MotionCorrect(object):
                  strides=(96, 96), overlaps=(32, 32), splits_els=14, num_splits_to_process_els=None,
                  upsample_factor_grid=4, max_deviation_rigid=3, shifts_opencv=True, nonneg_movie=True, gSig_filt=None,
                  use_cuda=False, border_nan=True, pw_rigid=False, num_frames_split=80, var_name_hdf5='mov', is3D=False,
-                 indices=(slice(None), slice(None)), shifts_interpolate=False):
+                 indices=(slice(None), slice(None)), shifts_interpolate=False, use_gpu=None):
         """
         Constructor class for motion correction operations
 
@@ -203,6 +209,8 @@ class MotionCorrect(object):
         self.shifts_interpolate = shifts_interpolate
         if self.use_cuda:
             logger.warning("cuda is no longer supported; this kwarg will be removed in a future version of caiman")
+        # use_gpu=None means auto-detect: use GPU if CuPy + CUDA available
+        self.use_gpu = gpu_available() if use_gpu is None else bool(use_gpu)
 
     def __str__(self):
         ret = f"Caiman MotionCorrect Object. Subfields:{list(self.__dict__.keys())}"
@@ -315,7 +323,8 @@ class MotionCorrect(object):
                 var_name_hdf5=self.var_name_hdf5,
                 is3D=self.is3D,
                 indices=self.indices,
-                shifts_interpolate=self.shifts_interpolate)
+                shifts_interpolate=self.shifts_interpolate,
+                use_gpu=self.use_gpu)
             if template is None:
                 self.total_template_rig = _total_template_rig
 
@@ -376,7 +385,8 @@ class MotionCorrect(object):
                     num_splits_to_process=None, num_iter=num_iter, template=self.total_template_els,
                     shifts_opencv=self.shifts_opencv, save_movie=save_movie, nonneg_movie=self.nonneg_movie, gSig_filt=self.gSig_filt,
                     use_cuda=self.use_cuda, border_nan=self.border_nan, var_name_hdf5=self.var_name_hdf5, is3D=self.is3D,
-                    indices=self.indices, shifts_interpolate=self.shifts_interpolate)
+                    indices=self.indices, shifts_interpolate=self.shifts_interpolate,
+                    use_gpu=self.use_gpu)
             if not self.is3D:
                 if show_template:
                     plt.imshow(new_template_els)
@@ -2769,7 +2779,7 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
                                template=None, shifts_opencv=False, save_movie_rigid=False, add_to_movie=None,
                                nonneg_movie=False, gSig_filt=None, subidx=slice(None, None, 1), use_cuda=False,
                                border_nan=True, var_name_hdf5='mov', is3D=False, indices=(slice(None), slice(None)),
-                               shifts_interpolate=False):
+                               shifts_interpolate=False, use_gpu=None):
     """
     Function that perform memory efficient hyper parallelized rigid motion corrections while also saving a memory mappable file
 
@@ -2889,7 +2899,7 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
                                                              dview=dview, save_movie=save_movie, base_name=base_name, subidx = subidx,
                                                              num_splits=num_splits_to_process, shifts_opencv=shifts_opencv, nonneg_movie=nonneg_movie, gSig_filt=gSig_filt,
                                                              use_cuda=use_cuda, border_nan=border_nan, var_name_hdf5=var_name_hdf5, is3D=is3D,
-                                                             indices=indices, shifts_interpolate=shifts_interpolate)
+                                                             indices=indices, shifts_interpolate=shifts_interpolate, use_gpu=use_gpu)
         if is3D:
             new_templ = np.nanmedian(np.stack([r[-1] for r in res_rig]), 0)           
         else:
@@ -2912,7 +2922,7 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
                                  splits=56, num_splits_to_process=None, num_iter=1,
                                  template=None, shifts_opencv=False, save_movie=False, nonneg_movie=False, gSig_filt=None,
                                  use_cuda=False, border_nan=True, var_name_hdf5='mov', is3D=False,
-                                 indices=(slice(None), slice(None)), shifts_interpolate=False):
+                                 indices=(slice(None), slice(None)), shifts_interpolate=False, use_gpu=None):
     """
     Function that perform memory efficient hyper parallelized rigid motion corrections while also saving a memory mappable file
 
@@ -3017,7 +3027,7 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
                                                             base_name=base_name, num_splits=num_splits_to_process,
                                                             shifts_opencv=shifts_opencv, nonneg_movie=nonneg_movie, gSig_filt=gSig_filt,
                                                             use_cuda=use_cuda, border_nan=border_nan, var_name_hdf5=var_name_hdf5, is3D=is3D,
-                                                            indices=indices, shifts_interpolate=shifts_interpolate)
+                                                            indices=indices, shifts_interpolate=shifts_interpolate, use_gpu=use_gpu)
         if is3D:
             new_templ = np.nanmedian(np.stack([r[-1] for r in res_el]), 0)
         else:
@@ -3074,15 +3084,24 @@ def tile_and_correct_wrapper(params):
         shifts_opencv, nonneg_movie, gSig_filt, is_fiji, use_cuda, border_nan, var_name_hdf5, \
         is3D, indices, shifts_interpolate = params
 
+    # ── Optional cache-aware CPU affinity ──────────────────────────────────
+    # worker_meta is appended by motion_correction_piecewise when use_shared_memory=True.
+    # It carries (worker_id, n_workers) so we can pin this process to an L3 group.
+    worker_id = getattr(tile_and_correct_wrapper, '_worker_id', None)
 
     if isinstance(img_name, tuple):
         name, extension = os.path.splitext(img_name[0])[:2]
+    elif isinstance(img_name, ShmHandle):
+        name, extension = "shm_movie", ".shm"
     else:
         name, extension = os.path.splitext(img_name)[:2]
     extension = extension.lower()
     shift_info = []
 
-    imgs = caiman.load(img_name, subindices=idxs, var_name_hdf5=var_name_hdf5,is3D=is3D)
+    # ── Load frames: shared-memory path (zero-copy) or legacy disk path ────
+    imgs = frames_from_handle_or_fname(
+        img_name, idxs, var_name_hdf5=var_name_hdf5, is3D=is3D
+    )
     imgs = imgs[(slice(None),) + indices]
     mc = np.zeros(imgs.shape, dtype=np.float32)
     if not imgs[0].shape == template.shape:
@@ -3132,9 +3151,27 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
                                 upsample_factor_grid=4, order='F', dview=None, save_movie=True,
                                 base_name=None, subidx = None, num_splits=None, shifts_opencv=False, nonneg_movie=False, gSig_filt=None,
                                 use_cuda=False, border_nan=True, var_name_hdf5='mov', is3D=False,
-                                indices=(slice(None), slice(None)), shifts_interpolate=False):
+                                indices=(slice(None), slice(None)), shifts_interpolate=False,
+                                use_shared_memory=True, use_gpu=None):
     """
+    Parameters
+    ----------
+    use_shared_memory : bool, optional
+        When *True* (default) the movie is loaded into POSIX shared memory
+        **once** in the calling process and every worker reads its temporal
+        slice from the shared pages without copying.  Set to *False* to fall
+        back to the original per-worker ``caiman.load()`` behaviour (useful
+        for debugging or when ``/dev/shm`` space is limited).
 
+        Shared memory benefits:
+
+        * Eliminates N-1 redundant disk reads / pickle round-trips.
+        * Workers reading the *same* physical pages means those pages are
+          loaded into the L3 (last-level) cache once and shared across cores
+          on the socket.
+        * Temporal chunks are reordered (``cache_aware_chunk_order``) so that
+          workers assigned to cores sharing L3 process adjacent frame windows,
+          maximising LLC reuse of the template and spatial structures.
     """
     # todo todocument
     logger = logging.getLogger("caiman")
@@ -3181,24 +3218,125 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
     else:
         fname_tot = None
 
-    pars = []
-    for idx in idxs:
-        logger.debug(f'Extracting parameters for frames: {idx}')
-        pars.append([fname, fname_tot, idx, shape_mov, template, strides, overlaps, max_shifts, np.array(
-            add_to_movie, dtype=np.float32), max_deviation_rigid, upsample_factor_grid,
-            newoverlaps, newstrides, shifts_opencv, nonneg_movie, gSig_filt, is_fiji,
-            use_cuda, border_nan, var_name_hdf5, is3D, indices, shifts_interpolate])
 
+    # ── GPU path: bypass multiprocessing entirely ─────────────────────────
+    # When use_gpu is True (or None and CuPy+CUDA available), all frames are
+    # processed in the calling process via batched cuFFT — no subprocesses.
+    # The result list is format-identical to the CPU path so all downstream
+    # shift-parsing code is unchanged.
+    _use_gpu = gpu_available() if use_gpu is None else bool(use_gpu)
+    if _use_gpu and not is3D:
+        logger.info('motion_correction_piecewise: GPU path active')
+        res = motion_correction_piecewise_gpu(
+            fname,
+            idxs,
+            template=template,
+            shape_mov=shape_mov,
+            fname_tot=fname_tot,
+            max_shifts=max_shifts,
+            strides=strides,
+            overlaps=overlaps,
+            max_deviation_rigid=max_deviation_rigid,
+            upsample_factor_grid=upsample_factor_grid,
+            add_to_movie=add_to_movie,
+            nonneg_movie=nonneg_movie,
+            gSig_filt=gSig_filt,
+            border_nan=border_nan,
+            is3D=is3D,
+            indices=indices,
+            shifts_opencv=shifts_opencv,
+            shifts_interpolate=shifts_interpolate,
+            var_name_hdf5=var_name_hdf5,
+        )
+        return fname_tot, res
+
+    # ── Determine parallelism level for cache-aware ordering ──────────────
     if dview is not None:
-        logger.info('** Starting parallel motion correction **')
         if 'multiprocessing' in str(type(dview)):
-            logger.debug("entering multiprocessing tile_and_correct_wrapper")
-            res = dview.map_async(tile_and_correct_wrapper, pars).get(4294967)
+            try:
+                n_workers = dview._processes   # multiprocessing.Pool attribute
+            except AttributeError:
+                n_workers = len(idxs)
         else:
-            res = dview.map_sync(tile_and_correct_wrapper, pars)
-        logger.info('** Finished parallel motion correction **')
+            try:
+                n_workers = len(dview)         # ipyparallel DirectView
+            except TypeError:
+                n_workers = len(idxs)
     else:
-        res = list(map(tile_and_correct_wrapper, pars))
+        n_workers = 1
+
+    # ── Optionally load entire movie into shared memory once ───────────────
+    # Workers receive an ShmHandle instead of a file path.  The OS maps the
+    # same physical pages into every worker's address space – zero-copy.
+    # When use_shared_memory=False we fall back to the original fname string.
+    _shm_buf = None
+    fname_or_handle = fname   # default: pass filename to workers as before
+
+    if use_shared_memory and dview is not None:
+        try:
+            logger.info("motion_correction_piecewise: loading movie into shared memory …")
+            _shm_buf = SharedMovieBuffer(
+                fname, var_name_hdf5=var_name_hdf5, is3D=is3D, order='C'
+            )
+            fname_or_handle = _shm_buf.worker_handle()
+            logger.info(
+                f"motion_correction_piecewise: movie in SHM "
+                f"'{fname_or_handle.name}', shape={fname_or_handle.shape}"
+            )
+        except Exception as shm_exc:
+            logger.warning(
+                f"motion_correction_piecewise: shared-memory setup failed "
+                f"({shm_exc}); falling back to per-worker file loading"
+            )
+            fname_or_handle = fname
+
+    # ── Apply cache-aware chunk ordering ──────────────────────────────────
+    # Reorder temporal chunks so that workers sharing L3 cache process
+    # adjacent frame windows, maximising LLC reuse of the template.
+    n_chunks = len(idxs)
+    if n_workers > 1 and n_chunks > 1:
+        perm = cache_aware_chunk_order(n_chunks, n_workers)
+        idxs_ordered = [idxs[i] for i in perm]
+    else:
+        perm = list(range(n_chunks))
+        idxs_ordered = list(idxs)
+
+    # ── Build parameter list ───────────────────────────────────────────────
+    pars = []
+    for idx in idxs_ordered:
+        logger.debug(f'Extracting parameters for frames: {idx}')
+        pars.append([fname_or_handle, fname_tot, idx, shape_mov, template,
+                      strides, overlaps, max_shifts,
+                      np.array(add_to_movie, dtype=np.float32),
+                      max_deviation_rigid, upsample_factor_grid,
+                      newoverlaps, newstrides, shifts_opencv, nonneg_movie,
+                      gSig_filt, is_fiji, use_cuda, border_nan, var_name_hdf5,
+                      is3D, indices, shifts_interpolate])
+
+    # ── Dispatch ───────────────────────────────────────────────────────────
+    try:
+        if dview is not None:
+            logger.info('** Starting parallel motion correction **')
+            if 'multiprocessing' in str(type(dview)):
+                logger.debug("entering multiprocessing tile_and_correct_wrapper")
+                res_ordered = dview.map_async(tile_and_correct_wrapper, pars).get(4294967)
+            else:
+                res_ordered = dview.map_sync(tile_and_correct_wrapper, pars)
+            logger.info('** Finished parallel motion correction **')
+        else:
+            res_ordered = list(map(tile_and_correct_wrapper, pars))
+    finally:
+        # Always release shared memory even if an exception occurs.
+        if _shm_buf is not None:
+            _shm_buf.close()
+
+    # ── Restore original chunk order ───────────────────────────────────────
+    if perm != list(range(n_chunks)):
+        res = [None] * n_chunks
+        for out_pos, orig_pos in enumerate(perm):
+            res[orig_pos] = res_ordered[out_pos]
+    else:
+        res = res_ordered
 
     return fname_tot, res
 

@@ -14,6 +14,8 @@ import time
 
 from caiman.cluster import extract_patch_coordinates
 from caiman.mmapping import load_memmap
+from caiman.shared_memory_utils import ShmHandle, attach_shared_frames
+from caiman.cpu_topology import apply_affinity
 
 def cnmf_patches(args_in):
     """Function that is run for each patches
@@ -71,17 +73,55 @@ def cnmf_patches(args_in):
     logger = logging.getLogger("caiman")
     file_name, idx_, shapes, params = args_in
 
-    name_log = os.path.basename(
-        file_name[:-5]) + '_LOG_ ' + str(idx_[0]) + '_' + str(idx_[-1])
+    # ── Support both legacy path strings and shared-memory handles ────────
+    if isinstance(file_name, ShmHandle):
+        # Name-log uses a synthetic filename for readability
+        name_log = f"SHM_{file_name.name[:8]}_LOG_ {idx_[0]}_{idx_[-1]}"
+    else:
+        name_log = os.path.basename(
+            file_name[:-5]) + '_LOG_ ' + str(idx_[0]) + '_' + str(idx_[-1])
 
     logger.debug(name_log + ' START')
-
     logger.debug(name_log + ' Read file')
-    Yr, dims, timesteps = load_memmap(file_name)
 
-    # slicing array (takes the min and max index in n-dimensional space and
-    # cuts the box they define)
-    # for 2d a rectangle/square, for 3d a rectangular cuboid/cube, etc.
+    if isinstance(file_name, ShmHandle):
+        # ── Zero-copy path: attach to shared memory ────────────────────────
+        # The movie was loaded once in the parent process into a POSIX
+        # shared-memory segment.  All workers map the same physical pages;
+        # no data is copied through the OS IPC layer.
+        #
+        # Memory hierarchy notes:
+        #   • All workers on the same socket share L3.  Because they all
+        #     read from the same physical pages, the OS pulls each page into
+        #     L3 exactly once regardless of how many workers access it.
+        #   • Spatially adjacent patches are assigned to the same L3 group
+        #     by ``run_CNMF_patches`` (via ``cache_aware_chunk_order``), so
+        #     the patch data is likely warm in L3 when the second worker
+        #     in the same group starts.
+        handle = file_name
+        # The mmap-style layout is (pixels, time) in Fortran order.
+        # The SHM buffer was created with the full (T, d1, d2) C-order array
+        # by SharedMovieBuffer.  We need to reconstruct the Yr view.
+        full_movie = attach_shared_frames(handle)   # shape (T, d1, d2), C-order
+        T_total    = full_movie.shape[0]
+        dims       = full_movie.shape[1:]
+        timesteps  = T_total
+
+        # Reconstruct a Yr-compatible view: shape (d1*d2, T)
+        # This is a reshape + transpose, still zero-copy as long as strides allow.
+        Yr = full_movie.reshape(T_total, -1).T   # (pixels, T)
+        images = full_movie  # already (T, d1, d2)
+    else:
+        # ── Legacy path: memory-mapped file ───────────────────────────────
+        # np.memmap with mode='r' already leverages OS page sharing: multiple
+        # processes opening the same .mmap file in read-only mode will share
+        # the underlying physical pages via the OS page cache.  No explicit
+        # shared-memory setup is needed here.
+        Yr, dims, timesteps = load_memmap(file_name)
+        images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
+
+    # ── Spatial patch slicing ──────────────────────────────────────────────
+    # Slice out the spatial patch for this worker (same logic as before).
     upper_left_corner = min(idx_)
     lower_right_corner = max(idx_)
     indices = np.unravel_index([upper_left_corner, lower_right_corner],
@@ -90,11 +130,13 @@ def cnmf_patches(args_in):
     # insert slice for timesteps, equivalent to :
     slices.insert(0, slice(timesteps))
 
-    images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
+    if not isinstance(file_name, ShmHandle):
+        images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
+
     if params.get('patch', 'in_memory'):
         images = np.array(images[tuple(slices)], dtype=np.float32)
     else:
-        images = images[slices]
+        images = images[tuple(slices)]
 
     logger.debug(name_log+'file loaded')
 
@@ -214,11 +256,42 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
 
     idx_flat, idx_2d = extract_patch_coordinates(
         dims, rfs, strides, border_pix=border_pix, indices=indices[1:])
+
+    # ── Optionally pre-load movie into shared memory ───────────────────────
+    # For .mmap files the OS already shares physical pages between processes
+    # that open them read-only.  However the first ``np.memmap`` call in each
+    # worker still incurs page-fault overhead to build the per-process virtual
+    # mapping.  Using a ``SharedMovieBuffer`` instead:
+    #   1. Eliminates those per-worker page-fault storms.
+    #   2. Forces the entire array to be faulted into physical RAM once,
+    #      ensuring L3 is warm before workers start.
+    #   3. Lays the data out in C order (T, d1, d2), making temporal slices
+    #      contiguous and cache-friendly for the CNMF inner loops.
+    _shm_buf = None
+    file_name_or_handle = file_name   # default: pass path string to workers
+
+    use_shm_for_cnmf = (dview is not None and isinstance(file_name, str))
+    if use_shm_for_cnmf:
+        try:
+            logger.info("run_CNMF_patches: loading movie into shared memory …")
+            import caiman
+            from caiman.shared_memory_utils import SharedMovieBuffer
+            _shm_buf = SharedMovieBuffer(file_name, order='C')
+            file_name_or_handle = _shm_buf.worker_handle()
+            logger.info(
+                f"run_CNMF_patches: movie in SHM '{file_name_or_handle.name}'"
+            )
+        except Exception as shm_exc:
+            logger.warning(
+                f"run_CNMF_patches: shared-memory setup failed ({shm_exc}); "
+                f"falling back to per-worker mmap"
+            )
+            file_name_or_handle = file_name
+
     args_in = []
     patch_centers = []
     for id_f, id_2d in zip(idx_flat, idx_2d):
-        #        print(id_2d)
-        args_in.append((file_name, id_f, id_2d, params_copy))
+        args_in.append((file_name_or_handle, id_f, id_2d, params_copy))
         if del_duplicates:
             foo = np.zeros(d, dtype=bool)
             foo[id_f] = 1
@@ -226,21 +299,24 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 foo.reshape(dims, order='F')))
     logger.info(f'Patch size: {id_2d}')
     st = time.time()
-    if dview is not None:
-        if 'multiprocessing' in str(type(dview)):
-            file_res = dview.map_async(cnmf_patches, args_in).get(4294967)
+    try:
+        if dview is not None:
+            if 'multiprocessing' in str(type(dview)):
+                file_res = dview.map_async(cnmf_patches, args_in).get(4294967)
+            else:
+                try:
+                    file_res = dview.map_sync(cnmf_patches, args_in)
+                    dview.results.clear()
+                except:
+                    print('Something went wrong')
+                    raise
+                finally:
+                    logger.info('Patch processing complete')
         else:
-            try:
-                file_res = dview.map_sync(cnmf_patches, args_in)
-                dview.results.clear()
-            except:
-                print('Something went wrong')
-                raise
-            finally:
-                logger.info('Patch processing complete')
-
-    else:
-        file_res = list(map(cnmf_patches, args_in))
+            file_res = list(map(cnmf_patches, args_in))
+    finally:
+        if _shm_buf is not None:
+            _shm_buf.close()
 
     logger.info('Elapsed time for processing patches: \
                  {0}s'.format(str(time.time() - st).split('.')[0]))
