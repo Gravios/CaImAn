@@ -29,6 +29,55 @@ from caiman.source_extraction.cnmf.spatial import circular_constraint, connectiv
 from caiman.utils.stats import pd_solve, compressive_nmf
 from caiman.utils.utils import parmap
 
+# ── Shared-memory parallel compute_W infrastructure ───────────────────────────
+# compute_W parallelises over pixels using parmap (fork-based).  With fork, the
+# full residual matrix X is copied into every worker → OOM on large movies.
+#
+# Instead we put X in a POSIX shared-memory segment once and give each worker a
+# lightweight ShmHandle.  Workers attach to the same physical pages with no copy.
+# Only the tiny (index, data) results cross the IPC boundary.
+#
+# Three module-level names are needed so they can be pickled by
+# ProcessPoolExecutor (closures cannot be pickled across process boundaries):
+#   _W_shm_handle  — ShmHandle descriptor set by the pool initializer
+#   _W_shm_X       — numpy view set by the pool initializer
+#   _W_shm_meta    — (d1, ringidx) set by the pool initializer
+
+_W_shm_handle = None   # set in worker by initializer
+_W_shm_X      = None   # np.ndarray view into SHM
+_W_shm_meta   = None   # (d1, ringidx) tuple
+
+
+def _W_shm_init(handle, d1, ringidx):
+    """Pool initializer: attach to SHM and cache the X array + ring metadata."""
+    global _W_shm_handle, _W_shm_X, _W_shm_meta
+    import numpy as _np
+    from caiman.shared_memory_utils import ShmHandle, attach_shared_frames
+    _W_shm_handle = handle
+    _W_shm_X      = attach_shared_frames(handle)   # zero-copy view, shape (pixels, T)
+    _W_shm_meta   = (d1, ringidx)
+
+
+def _W_shm_pixel(p):
+    """Worker: solve the ring-model least-squares for one pixel using SHM X."""
+    from caiman.utils.stats import pd_solve as _pd_solve
+    import numpy as _np
+    X, (d1, ringidx) = _W_shm_X, _W_shm_meta
+    d2 = X.shape[0] // d1
+
+    x = p % d1 + ringidx[0]
+    y = p // d1 + ringidx[1]
+    inside = (x >= 0) & (x < d1) & (y >= 0) & (y < d2)
+    index  = x[inside] + y[inside] * d1
+
+    B    = X[index]
+    tmp  = _np.array(B.dot(B.T))
+    tmp[_np.diag_indices(len(tmp))] += _np.trace(tmp) * 1e-5
+    data = _pd_solve(tmp, B.dot(X[p]))
+    return index, data
+
+
+
 try:
     cv2.setNumThreads(0)
 except:
@@ -1997,7 +2046,32 @@ def compute_W(Y, A, C, dims, radius, data_fits_in_memory=True, ssub=1, tsub=1, p
             data = pd_solve(tmp, B.dot(tmp2))
             return index, data
 
-    Q = list((parmap if parallel else map)(process_pixel, range(d1 * d2)))
+    if parallel:
+        # ── Shared-memory parallel path ───────────────────────────────────────
+        # Place X in a POSIX shared-memory segment.  Workers attach to the same
+        # physical pages via _W_shm_init; no copy of X crosses IPC boundary.
+        import concurrent.futures as _cf
+        from caiman.shared_memory_utils import SharedMovieBuffer
+        import multiprocessing as _mp
+
+        # X is (pixels, T) — pass as an ndarray so SharedMovieBuffer skips the
+        # caiman.load() path and goes straight to the SHM copy.
+        _shm_buf = SharedMovieBuffer(X, order='C')
+        _handle  = _shm_buf.worker_handle()
+        _nprocs  = _mp.cpu_count()
+
+        try:
+            with _cf.ProcessPoolExecutor(
+                max_workers = _nprocs,
+                initializer = _W_shm_init,
+                initargs    = (_handle, d1, ringidx),
+                mp_context  = _mp.get_context('fork'),
+            ) as pool:
+                Q = list(pool.map(_W_shm_pixel, range(d1 * d2), chunksize=max(1, d1 * d2 // (_nprocs * 4))))
+        finally:
+            _shm_buf.close()
+    else:
+        Q = list(map(process_pixel, range(d1 * d2)))
     indices, data = np.array(Q, dtype=object).T
     indptr = np.concatenate([[0], np.cumsum(list(map(len, indices)))])
     indices = np.concatenate(indices)

@@ -137,40 +137,73 @@ class SharedMovieBuffer:
         self._handle: Optional[ShmHandle] = None
 
         # ── Load source data ──────────────────────────────────────────────────
-        if isinstance(fname, np.ndarray):
-            src = np.asarray(fname, dtype=np.float32)
-        else:
-            # Lazy import to avoid circular deps at module level
-            import caiman  # noqa: PLC0415
-            logger.info(f"SharedMovieBuffer: loading {fname!r} into RAM …")
-            src = np.asarray(
-                caiman.load(fname, var_name_hdf5=var_name_hdf5, is3D=is3D),
-                dtype=np.float32,
-            )
-
-        # Ensure requested layout
-        src = np.ascontiguousarray(src) if order == "C" else np.asfortranarray(src)
+        # Peak-RAM goal: one chunk (~256 MB) at a time, never the full movie.
+        #
+        # caiman.load() reads the entire movie into a regular RAM array before
+        # returning — at 14 GB that triples peak RSS (page-cache + load result
+        # + SHM).  Instead we use load_memmap() for .mmap files (zero-copy OS
+        # mapping) or np.asarray() for ndarray inputs, then stream into SHM in
+        # pixel-row chunks so we never hold more than one chunk extra in RAM.
         actual_dtype = np.dtype(np.float32)
 
+        if isinstance(fname, np.ndarray):
+            # Caller passed an in-memory array — use it directly.
+            # asarray is a no-op if already float32 and C/F contiguous.
+            src_arr = np.asarray(fname, dtype=actual_dtype)
+            if order == "C":
+                src_arr = np.ascontiguousarray(src_arr)
+            else:
+                src_arr = np.asfortranarray(src_arr)
+            src_shape = src_arr.shape
+            src_nbytes = src_arr.nbytes
+        else:
+            # .mmap path: load_memmap returns a zero-copy np.memmap backed by
+            # the file.  No data is read until we copy into SHM below.
+            from caiman.mmapping import load_memmap as _load_memmap
+            _Yr, _dims, _T = _load_memmap(fname)
+            # _Yr is (pixels, T) in the file's native order.
+            # Reconstruct (T, d1, d2) C-order view — still zero-copy.
+            src_arr = np.reshape(_Yr.T, [_T] + list(_dims), order="F")
+            src_shape  = src_arr.shape
+            src_nbytes = int(np.prod(src_shape)) * actual_dtype.itemsize
+            logger.info(
+                f"SharedMovieBuffer: streaming {fname!r} into SHM "
+                f"({src_nbytes / 2**30:.2f} GiB, order={order}) …"
+            )
+
         # ── Allocate shared memory ─────────────────────────────────────────────
-        # Size must cover the array *plus* up to CACHE_LINE_BYTES - 1 extra bytes
-        # so we can align the view's start address to CACHE_LINE_BYTES.
-        nbytes = src.nbytes + CACHE_LINE_BYTES
+        nbytes = src_nbytes + CACHE_LINE_BYTES
         self._shm = SharedMemory(create=True, size=nbytes)
 
         # Build a cache-line-aligned numpy view into the shm buffer
         raw_addr = ctypes.addressof(
             ctypes.c_char.from_buffer(self._shm.buf)
         )
-        offset = (-raw_addr) % CACHE_LINE_BYTES   # bytes to skip for alignment
-        aligned_buf = (ctypes.c_char * src.nbytes).from_buffer(
+        offset = (-raw_addr) % CACHE_LINE_BYTES
+        aligned_buf = (ctypes.c_char * src_nbytes).from_buffer(
             self._shm.buf, offset
         )
         self._arr = np.frombuffer(aligned_buf, dtype=actual_dtype).reshape(
-            src.shape, order=order
+            src_shape, order=order
         )
-        np.copyto(self._arr, src)
-        del src
+
+        # ── Stream src → SHM in chunks to keep peak RAM bounded ───────────────
+        # For ndarray inputs np.copyto is fine (src is already fully in RAM).
+        # For memmap inputs we copy one time-chunk at a time so the OS only
+        # pages in ~256 MB of the source file before writing to SHM.
+        if isinstance(fname, np.ndarray):
+            np.copyto(self._arr, src_arr)
+        else:
+            # self._arr is (T, d1, d2); chunk along the time axis.
+            T_total   = src_shape[0]
+            frame_bytes = src_nbytes // T_total
+            t_chunk   = max(1, int(256 * 1024 * 1024 // frame_bytes))
+            dst_flat  = self._arr.reshape(T_total, -1)   # (T, pixels) view
+            src_flat  = src_arr.reshape(T_total, -1)
+            for t0 in range(0, T_total, t_chunk):
+                t1 = min(t0 + t_chunk, T_total)
+                np.copyto(dst_flat[t0:t1], src_flat[t0:t1].astype(actual_dtype))
+            del dst_flat, src_flat, src_arr, _Yr
 
         self._handle = ShmHandle(
             name=self._shm.name,

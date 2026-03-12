@@ -306,47 +306,45 @@ def local_correlations(Y, eight_neighbours: bool = True, swap_dim: bool = True, 
     return rho
 
 
-def _local_correlations_fft_gpu(Y_gpu) -> "np.ndarray":
-    """GPU implementation of local_correlations_fft for 2-D movies.
+def _build_psf_kernel(gSig, center_psf):
+    """Build the spatial PSF kernel on CPU and return as a float32 ndarray."""
+    if not isinstance(gSig, list):
+        gSig = [gSig, gSig]
+    ksize0 = int(2 * gSig[0]) * 2 + 1
+    ksize1 = int(2 * gSig[1]) * 2 + 1
+    psf = cv2.getGaussianKernel(ksize0, gSig[0], cv2.CV_32F).dot(
+          cv2.getGaussianKernel(ksize1, gSig[1], cv2.CV_32F).T)
+    if center_psf:
+        ind_nz = psf >= psf[0].max()
+        psf -= psf[ind_nz].mean()
+        psf[~ind_nz] = 0.0
+    return psf.astype(np.float32)
 
-    Parameters
-    ----------
-    Y_gpu : cp.ndarray, shape (T, d1, d2) float32
-        Already zero-mean and unit-variance along the time axis.
 
-    Returns
-    -------
-    np.ndarray (d1, d2)  — correlation image, already on CPU.
-    """
-    # 8-neighbour sum kernel: 3×3 box minus centre pixel.
-    sz = _cp.ones((3, 3), dtype=_cp.float32)
-    sz[1, 1] = 0.0
-
-    # Batch the 2-D neighbour-sum filter across all T frames.
-    # cupyx.scipy.ndimage.convolve operates on a single array, so we loop over
-    # frames — each call dispatches a CUDA kernel, still far faster than CPU.
-    Yconv = _cp.stack([_cpnd.convolve(img, sz, mode='constant') for img in Y_gpu])
-
-    # Border pixels have fewer than 8 neighbours; compute the exact count once.
-    MASK = _cpnd.convolve(
-        _cp.ones(Y_gpu.shape[1:], dtype=_cp.float32), sz, mode='constant'
-    )
-    MASK[MASK == 0] = 1.0  # avoid divide-by-zero at image corners
-
-    Cn_gpu = _cp.mean(Yconv * Y_gpu, axis=0) / MASK
-    return _cp.asnumpy(Cn_gpu)
+def _filter_chunk(chunk_gpu, kernel_gpu):
+    """Apply the PSF filter in-place to a (Tc, d1, d2) chunk on the GPU."""
+    for t in range(chunk_gpu.shape[0]):
+        chunk_gpu[t] = _cpnd.convolve(chunk_gpu[t], kernel_gpu, mode='reflect')
 
 
 def _correlation_pnr_gpu(Y, gSig, center_psf, swap_dim,
-                         noise_range, noise_method) -> tuple:
-    """Full GPU implementation of correlation_pnr.
+                         noise_range, noise_method,
+                         chunk_gb: float = 2.0) -> tuple:
+    """Two-pass chunked GPU implementation of correlation_pnr.
 
-    All intermediate arrays live in VRAM.  A single H2D transfer opens the
-    function; two D2H transfers (cn, pnr) close it.
+    The input movie is streamed through the GPU in chunks of ``chunk_gb`` GB
+    rather than loaded all at once, so peak VRAM usage is bounded to that
+    budget plus a handful of (d1, d2) accumulators.
 
-    The critical speedup vs CPU is in noise estimation: the CPU path calls
-    cv2.dft once **per pixel** (262,144 serial calls for 512×512 data).
-    Here a single cp.fft.rfft processes every pixel time-series simultaneously.
+    Pass 1 — per chunk, accumulate:
+        * per-pixel sum and sum-of-squares  → global mean and variance
+        * per-pixel running maximum         → PNR numerator
+        * per-chunk Welch PSD segment       → noise std (sn)
+
+    Pass 2 — per chunk, accumulate:
+        * thresholded, normalised neighbour correlations → correlation image
+
+    Peak VRAM ≈ chunk_gb + ~100 MB for accumulators and one FFT segment.
     """
     logger = logging.getLogger("caiman")
 
@@ -354,94 +352,145 @@ def _correlation_pnr_gpu(Y, gSig, center_psf, swap_dim,
         Y = np.transpose(Y, (Y.ndim - 1,) + tuple(range(Y.ndim - 1)))
 
     T, d1, d2 = Y.shape
+    n_pixels   = d1 * d2
 
-    # ── H2D transfer (one copy of the subsampled movie) ───────────────────
-    data_gpu = _cp.asarray(Y.reshape(T, d1, d2).astype(np.float32))
+    # Frames per chunk: choose so one chunk ≤ chunk_gb GB
+    bytes_per_frame  = d1 * d2 * 4           # float32
+    frames_per_chunk = max(1, int(chunk_gb * 1e9 / bytes_per_frame))
+    frames_per_chunk = min(frames_per_chunk, T)
+    logger.debug(f"correlation_pnr GPU: T={T}, chunk={frames_per_chunk} frames "
+                 f"({frames_per_chunk * bytes_per_frame / 1e9:.2f} GB/chunk)")
 
-    # ── Spatial bandpass / PSF filter ─────────────────────────────────────
+    # Build PSF kernel once on CPU
+    kernel_gpu = None
     if gSig is not None:
-        if not isinstance(gSig, list):
-            gSig = [gSig, gSig]
-        ksize0 = int(2 * gSig[0]) * 2 + 1
-        ksize1 = int(2 * gSig[1]) * 2 + 1
+        kernel_gpu = _cp.asarray(_build_psf_kernel(gSig, center_psf))
 
-        # Build kernel on CPU (tiny), transfer to GPU once.
-        psf_cpu = cv2.getGaussianKernel(ksize0, gSig[0], cv2.CV_32F).dot(
-            cv2.getGaussianKernel(ksize1, gSig[1], cv2.CV_32F).T
-        )
-        if center_psf:
-            ind_nz = psf_cpu >= psf_cpu[0].max()
-            psf_cpu = psf_cpu - psf_cpu[ind_nz].mean()
-            psf_cpu[~ind_nz] = 0.0
+    # Neighbour-correlation kernel and border mask (tiny, stays in VRAM)
+    sz   = _cp.ones((3, 3), dtype=_cp.float32); sz[1, 1] = 0.0
+    MASK = _cpnd.convolve(_cp.ones((d1, d2), dtype=_cp.float32),
+                          sz, mode='constant')
+    MASK[MASK == 0] = 1.0
 
-        kernel_gpu = _cp.asarray(psf_cpu.astype(np.float32))
+    # ── Pass 1 accumulators ───────────────────────────────────────────────
+    # All (d1, d2) float64 to avoid precision loss in long sums
+    sum_gpu    = _cp.zeros((d1, d2), dtype=_cp.float64)
+    sum2_gpu   = _cp.zeros((d1, d2), dtype=_cp.float64)
+    data_max   = _cp.full((d1, d2), -_cp.inf, dtype=_cp.float32)
 
-        for t in range(T):
-            data_gpu[t] = _cpnd.convolve(data_gpu[t], kernel_gpu, mode='reflect')
+    # Welch PSD: accumulate mean-band-power per chunk, then average
+    ff         = _cp.linspace(0.0, 0.5, frames_per_chunk // 2 + 1)
+    band       = (ff >= noise_range[0]) & (ff <= noise_range[1])
+    psd_sum    = _cp.zeros((d1, d2), dtype=_cp.float64)
+    n_segments = 0
 
-    # ── Zero-mean along time ───────────────────────────────────────────────
-    data_gpu -= data_gpu.mean(axis=0, keepdims=True)
+    for t0 in range(0, T, frames_per_chunk):
+        t1    = min(t0 + frames_per_chunk, T)
+        Tc    = t1 - t0
+        chunk = _cp.asarray(Y[t0:t1].astype(np.float32))   # H2D: one chunk
 
-    # ── Peak fluorescence (PNR numerator) ─────────────────────────────────
-    data_max = data_gpu.max(axis=0)                             # (d1, d2)
+        if kernel_gpu is not None:
+            _filter_chunk(chunk, kernel_gpu)
 
-    # ── Noise estimation via batched rfft ─────────────────────────────────
-    # Reshape to (pixels, T) so rfft runs along the time axis for all pixels
-    # at once.  On a 512×512 movie this replaces 262,144 serial cv2.dft calls.
-    xdft = _cp.fft.rfft(data_gpu.reshape(T, -1).T, axis=-1)    # (pixels, T//2+1)
-    n_freqs = xdft.shape[-1]
-    ff = _cp.linspace(0.0, 0.5, n_freqs)
-    band = (ff >= noise_range[0]) & (ff <= noise_range[1])
-    psd = (_cp.abs(xdft[:, band]) ** 2) * (2.0 / T)            # (pixels, n_band)
+        sum_gpu  += chunk.sum(axis=0).astype(_cp.float64)
+        sum2_gpu += (chunk.astype(_cp.float64) ** 2).sum(axis=0)
+        data_max  = _cp.maximum(data_max, chunk.max(axis=0))
 
-    if noise_method == 'mean':
-        sn = _cp.sqrt(psd.mean(axis=-1))
-    elif noise_method == 'median':
-        sn = _cp.sqrt(_cp.median(psd, axis=-1))
-    else:  # logmexp
-        sn = _cp.sqrt(_cp.exp(_cp.mean(_cp.log(psd + 1e-10), axis=-1)))
+        # Welch segment: rfft along time axis (C-contiguous, no copy)
+        # Recompute band mask if this chunk is shorter than frames_per_chunk
+        if Tc != frames_per_chunk:
+            ff_c  = _cp.linspace(0.0, 0.5, Tc // 2 + 1)
+            band_c = (ff_c >= noise_range[0]) & (ff_c <= noise_range[1])
+        else:
+            band_c = band
 
-    sn = sn.reshape(d1, d2)                                     # (d1, d2)
-    del xdft, psd
+        xdft = _cp.fft.rfft(chunk.reshape(Tc, n_pixels), axis=0)  # (Tc//2+1, pixels)
+        psd  = (_cp.abs(xdft[band_c, :]) ** 2) * (2.0 / Tc)       # (n_band, pixels)
+        del xdft, chunk
 
-    # ── PNR image ─────────────────────────────────────────────────────────
-    pnr_gpu = _cp.divide(data_max, _cp.where(sn > 0, sn, _cp.inf))
-    pnr_gpu = _cp.maximum(pnr_gpu, 0.0)
+        if noise_method == 'mean':
+            psd_sum += psd.mean(axis=0).reshape(d1, d2).astype(_cp.float64)
+        elif noise_method == 'median':
+            psd_sum += _cp.median(psd, axis=0).reshape(d1, d2).astype(_cp.float64)
+        else:  # logmexp
+            psd_sum += _cp.exp(_cp.mean(_cp.log(psd + 1e-10), axis=0)).reshape(d1, d2).astype(_cp.float64)
+        del psd
+        n_segments += 1
 
-    # ── Threshold and compute local correlation ────────────────────────────
-    tmp_data = data_gpu / _cp.where(sn > 0, sn, _cp.inf)[_cp.newaxis]
-    tmp_data[tmp_data < 3.0] = 0.0
+    # Finalise Pass-1 statistics
+    mean_gpu = (sum_gpu / T).astype(_cp.float32)                   # (d1, d2)
+    var_gpu  = (_cp.maximum(sum2_gpu / T - (sum_gpu / T) ** 2,
+                            0.0)).astype(_cp.float32)
+    std_gpu  = _cp.sqrt(var_gpu); del var_gpu, sum_gpu, sum2_gpu   # (d1, d2)
+    std_gpu[std_gpu == 0] = _cp.inf
 
-    # Normalise for correlation computation (zero-mean, unit-variance along T)
-    mu  = tmp_data.mean(axis=0, keepdims=True)
-    std = tmp_data.std(axis=0, keepdims=True)
-    std[std == 0] = _cp.inf
-    tmp_norm = (tmp_data - mu) / std
-    del tmp_data, data_gpu, sn
+    sn = _cp.sqrt((psd_sum / n_segments).astype(_cp.float32))      # (d1, d2) noise std
+    del psd_sum
 
-    # ── Local correlation image ────────────────────────────────────────────
-    cn = _local_correlations_fft_gpu(tmp_norm)      # D2H inside helper
-    del tmp_norm
+    # data_max holds the per-pixel maximum *before* mean subtraction, so
+    # subtract the mean to get the zero-mean peak.
+    data_max -= mean_gpu
 
-    pnr = _cp.asnumpy(pnr_gpu)
-    del pnr_gpu
+    pnr_gpu = _cp.maximum(_cp.divide(data_max,
+                                     _cp.where(sn > 0, sn, _cp.inf)), 0.0)
+    pnr = _cp.asnumpy(pnr_gpu); del pnr_gpu, data_max
+
+    # Normalisation for correlation: z-score of (filtered - mean) / sn
+    # Per-frame: norm = ((frame - mean) / sn - mu_z) / std_z
+    # We need mu_z and std_z of the thresholded signal — approximate with a
+    # second pass over the chunks.
+    safe_sn = _cp.where(sn > 0, sn, _cp.inf)
+
+    # ── Pass 2: accumulate correlation ────────────────────────────────────
+    # We normalise each frame on the fly: z = (frame - mean) / sn, zero
+    # values below 3, then z-score across the chunk for the correlation.
+    YYconv_sum = _cp.zeros((d1, d2), dtype=_cp.float64)
+    n_frames_used = 0
+
+    for t0 in range(0, T, frames_per_chunk):
+        t1    = min(t0 + frames_per_chunk, T)
+        chunk = _cp.asarray(Y[t0:t1].astype(np.float32))   # H2D: one chunk
+
+        if kernel_gpu is not None:
+            _filter_chunk(chunk, kernel_gpu)
+
+        # z-score by noise std; threshold; z-score for correlation
+        chunk -= mean_gpu[_cp.newaxis]
+        chunk /= safe_sn[_cp.newaxis]                       # in-place: now data/sn
+        chunk[chunk < 3.0] = 0.0                            # threshold per-frame slice
+
+        # Normalise across time within this chunk for the correlation estimate
+        mu_c  = chunk.mean(axis=0)
+        std_c = chunk.std(axis=0); std_c[std_c == 0] = _cp.inf
+
+        Tc = t1 - t0
+        for t in range(Tc):
+            frame  = (chunk[t] - mu_c) / std_c             # (d1, d2) — 1 MB
+            Yconv  = _cpnd.convolve(frame, sz, mode='constant')
+            YYconv_sum += (Yconv * frame).astype(_cp.float64)
+            del frame, Yconv
+        del chunk, mu_c, std_c
+        n_frames_used += Tc
+
+    cn = _cp.asnumpy((YYconv_sum / n_frames_used / MASK).astype(_cp.float32))
+    del YYconv_sum, MASK, mean_gpu, std_gpu, safe_sn, sn
 
     _cp.get_default_memory_pool().free_all_blocks()
-    logger.debug("correlation_pnr: GPU path complete")
+    logger.debug("correlation_pnr: GPU chunked path complete")
     return cn, pnr
 
 
 def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True,
                     background_filter: str = 'disk',
                     noise_range: list = None, noise_method: str = 'mean',
-                    use_gpu: bool = None) -> tuple[np.ndarray, np.ndarray]:
+                    use_gpu: bool = None,
+                    chunk_gb: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
     """Compute the local correlation image and peak-to-noise ratio (PNR) image.
 
     If a CUDA GPU and CuPy are available the computation is dispatched to the
-    GPU automatically (or unconditionally when ``use_gpu=True``).  The GPU path
-    replaces the per-pixel ``cv2.dft`` loop in noise estimation with a single
-    batched ``cp.fft.rfft`` across all pixels simultaneously — the dominant
-    speedup for typical FOV sizes.
+    GPU automatically (or unconditionally when ``use_gpu=True``).  The movie is
+    streamed through the GPU in chunks of ``chunk_gb`` GB so that VRAM usage is
+    bounded regardless of movie size.
 
     The function signature is a strict superset of the original: all existing
     call sites work without modification.
@@ -468,6 +517,10 @@ def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True
             ``True``  — require GPU (raises if unavailable).
             ``False`` — force CPU.
             ``None``  — use GPU if available, otherwise CPU (default).
+        chunk_gb : float
+            GPU path only.  Size of each temporal chunk transferred to VRAM in
+            gigabytes.  Reduce if you get OOM; increase for fewer H2D transfers.
+            Default ``2.0``.
 
     Returns:
         cn  : np.ndarray (d1, d2)  — local correlation image.
@@ -492,6 +545,7 @@ def correlation_pnr(Y, gSig=None, center_psf: bool = True, swap_dim: bool = True
         return _correlation_pnr_gpu(
             Y, gSig=gSig, center_psf=center_psf, swap_dim=swap_dim,
             noise_range=noise_range, noise_method=noise_method,
+            chunk_gb=chunk_gb,
         )
 
     # ── CPU path (original implementation, unchanged) ─────────────────────
