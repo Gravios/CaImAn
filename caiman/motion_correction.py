@@ -63,6 +63,7 @@ from caiman.cpu_topology import cache_aware_chunk_order, apply_affinity
 from caiman.gpu_motion_correction import (
     gpu_available,
     motion_correction_piecewise_gpu,
+    motion_correction_piecewise_gpu_parallel,
 )
 
 try:
@@ -3226,28 +3227,57 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
     # shift-parsing code is unchanged.
     _use_gpu = gpu_available() if use_gpu is None else bool(use_gpu)
     if _use_gpu and not is3D:
-        logger.info('motion_correction_piecewise: GPU path active')
-        res = motion_correction_piecewise_gpu(
-            fname,
-            idxs,
-            template=template,
-            shape_mov=shape_mov,
-            fname_tot=fname_tot,
-            max_shifts=max_shifts,
-            strides=strides,
-            overlaps=overlaps,
-            max_deviation_rigid=max_deviation_rigid,
-            upsample_factor_grid=upsample_factor_grid,
-            add_to_movie=add_to_movie,
-            nonneg_movie=nonneg_movie,
-            gSig_filt=gSig_filt,
-            border_nan=border_nan,
-            is3D=is3D,
-            indices=indices,
-            shifts_opencv=shifts_opencv,
-            shifts_interpolate=shifts_interpolate,
-            var_name_hdf5=var_name_hdf5,
-        )
+        # Parallel GPU path: double-buffered I/O prefetch + async mmap writes
+        # + PW-rigid batch patch registration.
+        # Falls back to the serial GPU path on any initialisation error.
+        logger.info('motion_correction_piecewise: parallel GPU path active')
+        try:
+            res = motion_correction_piecewise_gpu_parallel(
+                fname,
+                idxs,
+                template=template,
+                shape_mov=shape_mov,
+                fname_tot=fname_tot,
+                max_shifts=max_shifts,
+                strides=strides,
+                overlaps=overlaps,
+                max_deviation_rigid=max_deviation_rigid,
+                upsample_factor_grid=upsample_factor_grid,
+                add_to_movie=add_to_movie,
+                nonneg_movie=nonneg_movie,
+                gSig_filt=gSig_filt,
+                border_nan=border_nan,
+                is3D=is3D,
+                indices=indices,
+                shifts_opencv=shifts_opencv,
+                shifts_interpolate=shifts_interpolate,
+                var_name_hdf5=var_name_hdf5,
+            )
+        except Exception as _par_exc:
+            logger.warning(
+                f'Parallel GPU MC failed ({_par_exc}); falling back to serial GPU path'
+            )
+            res = motion_correction_piecewise_gpu(
+                fname,
+                idxs,
+                template=template,
+                shape_mov=shape_mov,
+                fname_tot=fname_tot,
+                max_shifts=max_shifts,
+                strides=strides,
+                overlaps=overlaps,
+                max_deviation_rigid=max_deviation_rigid,
+                upsample_factor_grid=upsample_factor_grid,
+                add_to_movie=add_to_movie,
+                nonneg_movie=nonneg_movie,
+                gSig_filt=gSig_filt,
+                border_nan=border_nan,
+                is3D=is3D,
+                indices=indices,
+                shifts_opencv=shifts_opencv,
+                shifts_interpolate=shifts_interpolate,
+                var_name_hdf5=var_name_hdf5,
+            )
         return fname_tot, res
 
     # ── Determine parallelism level for cache-aware ordering ──────────────

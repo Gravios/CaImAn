@@ -566,15 +566,36 @@ def save_memmap(filenames:list[str],
 def parallel_dot_product(A: np.ndarray, b, block_size: int = 5000, dview=None, transpose=False,
                          num_blocks_per_run=20) -> np.ndarray:
     # todo: todocument
-    """ Chunk matrix product between matrix and column vectors
+    """ Chunk matrix product between matrix and column vectors.
+
+    If A is a standard CaImAn mmap with a decodable filename, workers
+    re-open it by name (legacy path).  If A is a temp mmap with an
+    undecodable filename (e.g. greedyROI_corr residual buffers), it is
+    placed into POSIX shared memory and workers attach zero-copy via
+    ShmHandle — avoiding the load_memmap filename parsing failure.
 
     Args:
-        A: memory mapped ndarray
-            pixels x time
-
+        A: memory mapped ndarray, shape (pixels, time)
         b: time x comps
     """
+    from caiman.shared_memory_utils import SharedMovieBuffer
+    import caiman.paths as _cpaths
     logger = logging.getLogger("caiman")
+
+    # Decide whether we can pass A by filename or need shared memory.
+    _shm_buf  = None
+    _A_ref    = A.filename if hasattr(A, 'filename') else None
+    if _A_ref is not None:
+        try:
+            _cpaths.decode_mmap_filename_dict(_A_ref)
+        except Exception:
+            # Temp mmap (e.g. _groi_B.mmap): put into shared memory so
+            # workers can attach without going through load_memmap.
+            # Pass A directly — np.memmap is an ndarray subclass so
+            # SharedMovieBuffer takes the ndarray path, doing one
+            # np.copyto into SHM rather than two copies.
+            _shm_buf = SharedMovieBuffer(A, order='F')
+            _A_ref   = _shm_buf.worker_handle()
 
     pars = []
     d1, d2 = A.shape
@@ -584,15 +605,15 @@ def parallel_dot_product(A: np.ndarray, b, block_size: int = 5000, dview=None, t
     if block_size < d1:
         for idx in range(0, d1 - block_size, block_size):
             idx_to_pass = list(range(idx, idx + block_size))
-            pars.append([A.filename, idx_to_pass, b, transpose])
+            pars.append([_A_ref, idx_to_pass, b, transpose])
 
         if (idx + block_size) < d1:
             idx_to_pass = list(range(idx + block_size, d1))
-            pars.append([A.filename, idx_to_pass, b, transpose])
+            pars.append([_A_ref, idx_to_pass, b, transpose])
 
     else:
         idx_to_pass = list(range(d1))
-        pars.append([A.filename, idx_to_pass, b, transpose])
+        pars.append([_A_ref, idx_to_pass, b, transpose])
 
     logger.debug('Start product')
     b = pickle.loads(b)
@@ -638,6 +659,8 @@ def parallel_dot_product(A: np.ndarray, b, block_size: int = 5000, dview=None, t
             if 'multiprocessing' not in str(type(dview)):
                 dview.clear()
 
+    if _shm_buf is not None:
+        _shm_buf.close()
     return output
 
 def dot_place_holder(par:list) -> tuple:
@@ -645,22 +668,27 @@ def dot_place_holder(par:list) -> tuple:
     logger = logging.getLogger("caiman")
 
     A_name, idx_to_pass, b_, transpose = par
-    A_, _, _ = load_memmap(A_name)
+    from caiman.shared_memory_utils import ShmHandle, attach_shared_frames
+    if isinstance(A_name, ShmHandle):
+        # Zero-copy attach to shared memory segment
+        A_ = attach_shared_frames(A_name)[idx_to_pass]
+    else:
+        A_, _, _ = load_memmap(A_name)
+        A_ = A_[idx_to_pass]
     b_ = pickle.loads(b_).astype(np.float32)
+    idx_to_pass = idx_to_pass  # kept for return value
 
     logger.debug((idx_to_pass[-1]))
     if 'sparse' in str(type(b_)):
         if transpose:
-            #            outp = (b_.tocsr()[idx_to_pass].T.dot(
-            #                A_[idx_to_pass])).T.astype(np.float32)
-            outp = (b_.T.tocsc()[:, idx_to_pass].dot(A_[idx_to_pass])).T.astype(np.float32)
+            outp = (b_.T.tocsc()[:, idx_to_pass].dot(A_)).T.astype(np.float32)
         else:
-            outp = (b_.T.dot(A_[idx_to_pass].T)).T.astype(np.float32)
+            outp = (b_.T.dot(A_.T)).T.astype(np.float32)
     else:
         if transpose:
-            outp = A_[idx_to_pass].T.dot(b_[idx_to_pass]).astype(np.float32)
+            outp = A_.T.dot(b_[idx_to_pass]).astype(np.float32)
         else:
-            outp = A_[idx_to_pass].dot(b_).astype(np.float32)
+            outp = A_.dot(b_).astype(np.float32)
 
     del b_, A_
     return idx_to_pass, outp

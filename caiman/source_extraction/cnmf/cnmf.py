@@ -277,14 +277,25 @@ class CNMF(object):
         cnm.provenance.append({'event': 'refit', 'time': int(time.time()), 'description': f'Ran refit, history imported from old object', 'data_target': str(images)})
         # We add the "history imported" note because the datestamp from the init of the new CNMF will be later than imported history (meaning right now)
         # so if you parse in list order you'll see a time-oddity here
-        
-        cnm.params.patch['rf'] = None
+
+        # Do NOT reset rf here: the caller (e.g. pipeline.py) sets the desired
+        # rf on opts before calling refit(), and overriding it to None would
+        # silently disable patches and the SharedMovieBuffer path that goes with
+        # them.  Only clear only_init so the full spatial/temporal update runs.
         cnm.params.patch['only_init'] = False
         estimates = deepcopy(self.estimates)
         estimates.select_components(use_object=True)
         estimates.coordinates = None
         cnm.estimates = estimates
         cnm.mmap_file = self.mmap_file
+        # Transfer precomp cache so refit skips the GPU filter pass
+        if hasattr(self, '_precomp_cache') and self._precomp_cache is not None:
+            _fp = self._precomp_cache.get('filtered_path')
+            if _fp and os.path.exists(_fp):
+                cnm._precomp_cache = self._precomp_cache
+                logger.info(f'refit(): reusing precomp cache {_fp}')
+            else:
+                logger.debug('refit(): precomp cache file missing — will recompute')
         cnm.fit(images)
         return cnm
 
@@ -325,7 +336,30 @@ class CNMF(object):
         self.params.set('online', {'init_batch': T})
         self.dims = images.shape[1:]
         Y = np.transpose(images, list(range(1, len(self.dims) + 1)) + [0])
-        Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
+
+        # ── Zero-copy Yr construction ─────────────────────────────────────────
+        # The canonical form needed downstream is Yr: (pixels, T), C-order.
+        # np.transpose(np.reshape(images, (T, -1), order='F')) achieves this
+        # but always forces a full-movie copy (~14 GB) because images is (T,
+        # d1, d2) C-order while order='F' reads pixels in a different order.
+        #
+        # When images is backed by a C-order mmap (load_memmap layout is
+        # exactly (pixels, T) C-order), we can recover Yr as a zero-copy
+        # np.memmap by re-opening the same file.  This avoids the copy in
+        # both the corr_pnr init path (only_init=True) and the refit path.
+        _fname = getattr(images, 'filename', None)
+        if _fname is not None:
+            try:
+                Yr, _dims_check, _T_check = caiman.mmapping.load_memmap(_fname)
+                if Yr.shape != (int(np.prod(self.dims)), T):
+                    raise ValueError(f"mmap shape mismatch: {Yr.shape}")
+                # load_memmap returns (pixels, T) C-order np.memmap — no copy.
+            except Exception as _e:
+                logger.debug(f"fit(): mmap Yr shortcut failed ({_e}), falling back to reshape copy")
+                Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
+        else:
+            Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
+
         if np.isfortran(Yr):
             raise Exception('The file is in F order, it should be in C order (see save_memmap function)')
 
@@ -356,6 +390,14 @@ class CNMF(object):
         logger.info('using ' + str(self.params.get('temporal', 'block_size_temp')) + ' block_size_temp')
 
         if self.params.get('patch', 'rf') is None:  # no patches
+            # If a per-patch precomp slice is available, inject sn directly
+            # so preprocess_data skips get_noise_fft (~1.2 GB FFT buffer).
+            _precomp = self.params.get('init', 'precomp')
+            if (_precomp is not None
+                    and _precomp.get('sn') is not None
+                    and self.estimates.sn is None):
+                import numpy as _np
+                self.estimates.sn = _precomp['sn'].flatten(order='F')
             logger.info('preprocessing ...')
             Yr = self.preprocess(Yr)
             if self.estimates.A is None:
@@ -444,7 +486,11 @@ class CNMF(object):
                 logger.info(
                     ('Setting the stride to 10% of 2*rf automatically:' + str(self.params.get('patch', 'stride'))))
 
-            if not isinstance(images, np.memmap):
+            # np.reshape / np.transpose on a np.memmap return a plain ndarray
+            # view that still carries a .filename attribute.  Checking for the
+            # memmap subclass therefore rejects valid mmap-backed inputs produced
+            # by load_memmap → reshape → transpose.  Check .filename instead.
+            if not (hasattr(images, 'filename') and images.filename is not None):
                 raise Exception(
                     'You need to provide a memory mapped file as input if you use patches!!')
 
@@ -454,14 +500,84 @@ class CNMF(object):
             #import code
             #code.interact(local=dict(globals(), **locals()) )
 
+            # ── Release parent mmap before spawning patch workers ────────
+            _mmap_filename = images.filename
+            del images, Yr
+            import gc as _gc; _gc.collect()
+
+            # ── Terminate pipeline dview BEFORE precompute ───────────────
+            # The dview pool is created by cluster setup before fit() is
+            # called. Its workers sit alive and each consume ~570 MB RSS
+            # throughout the entire precompute (filter + sn + Cn = several
+            # minutes).  run_CNMF_patches will respawn a fresh dedicated
+            # pool after precompute anyway — so terminate early and give
+            # back that RAM before the GPU-heavy work begins.
+            # Store n_processes so run_CNMF_patches can spawn the same count.
+            if (self.dview is not None
+                    and 'multiprocessing' in str(type(self.dview))):
+                _n_proc_saved = self.dview._processes
+                self.params.set('patch', {'n_processes': _n_proc_saved})
+                self.dview.terminate()
+                self.dview.join()
+                self.dview = None
+                logger.info(
+                    f'fit(): terminated pipeline pool ({_n_proc_saved} workers) '
+                    f'before precompute — run_CNMF_patches will respawn after')
+
+            # Pass any cached precomp from a previous fit() to run_CNMF_patches.
+            # Also pass the F-order mmap path so precompute reads frames as
+            # contiguous 1MB blocks instead of 262K scattered reads.
+            _forder_path = getattr(self, '_forder_movie_path', None)
+            self.params.set('init', {
+                'precomp_cache':      getattr(self, '_precomp_cache', None),
+                'forder_movie_path':  _forder_path,
+            })
+
             self.estimates.A, self.estimates.C, self.estimates.YrA, self.estimates.b, self.estimates.f, \
                 self.estimates.sn, self.estimates.optional_outputs = run_CNMF_patches(
-                    images.filename, self.dims + (T,), self.params,
+                    _mmap_filename, self.dims + (T,), self.params,
                     dview=self.dview, memory_fact=self.params.get('patch', 'memory_fact'),
                     gnb=self.params.get('init', 'nb'), border_pix=self.params.get('patch', 'border_pix'),
                     low_rank_background=self.params.get('patch', 'low_rank_background'),
                     del_duplicates=self.params.get('patch', 'del_duplicates'),
                     indices=indices)
+
+            # Cache the precomp result map_reduce stored in params so
+            # refit() can reuse it without re-running the GPU precompute.
+            _new_cache = self.params.get('init', 'precomp_cache')
+            if _new_cache is not None:
+                # Clean up any previous cache file before replacing
+                _old_cache = getattr(self, '_precomp_cache', None)
+                if (_old_cache is not None
+                        and _old_cache.get('filtered_path') != _new_cache.get('filtered_path')):
+                    try: os.unlink(_old_cache['filtered_path'])
+                    except OSError: pass
+                self._precomp_cache = _new_cache
+
+            # Re-open Yr for the merge/spatial/temporal steps that follow.
+            Yr, _, _ = caiman.mmapping.load_memmap(_mmap_filename)
+
+            # Respawn dview for global spatial/temporal updates.
+            # We terminated it before precompute to save RAM; now the
+            # patch phase is done and we need parallel processing again.
+            if self.dview is None and self.params.get('patch', 'n_processes'):
+                try:
+                    _n = self.params.get('patch', 'n_processes')
+                    from caiman.source_extraction.cnmf.map_reduce import (
+                        _collect_log_params, _worker_logging_init)
+                    _spawn_ctx  = multiprocessing.get_context('spawn')
+                    self.dview  = _spawn_ctx.Pool(
+                        _n,
+                        initializer=_worker_logging_init,
+                        initargs=(_collect_log_params(),),
+                    )
+                    logger.info(
+                        f'fit(): respawned dview pool ({_n} workers) '
+                        f'for global spatial/temporal updates')
+                except Exception as _re:
+                    logger.warning(
+                        f'fit(): could not respawn dview ({_re}); '
+                        f'global updates will run single-threaded')
 
             #print("D: Finished with run_CNMF_patches(), self.estimates.* are populated. Next step would be update_temporal() but first: Entering a shell.")
             #code.interact(local=dict(globals(), **locals()) )
@@ -470,6 +586,14 @@ class CNMF(object):
                 raise Exception("After run_CNMF_patches(), one or more of the background components is empty. Please restart analysis with init/nb set to a lower value")
 
             self.estimates.bl, self.estimates.c1, self.estimates.g, self.estimates.neurons_sn = None, None, None, None
+            # S, lam, merged_ROIs all belong to the previous fit and are
+            # now stale: A/C have been replaced by run_CNMF_patches() with
+            # a potentially different component count.  Leaving S intact
+            # causes an IndexError in merge_components when nr = A.shape[1]
+            # does not match S.shape[0].  Reset to None so merge_comps
+            # receives None and skips the S[good_neurons] indexing safely.
+            self.estimates.S = None
+            self.estimates.lam = None
             logger.info("Merging")
             self.estimates.merged_ROIs = [0]
 
@@ -710,10 +834,12 @@ class CNMF(object):
         estim = self.estimates
         if (self.params.get('init', 'method_init') == 'corr_pnr' and
                 self.params.get('init', 'ring_size_factor') is not None):
+            _init_kwargs = {k: v for k, v in self.params.get_group('init').items()
+                           if k not in ('precomp', 'precomp_cache', 'forder_movie_path')}
             estim.A, estim.C, estim.b, estim.f, estim.center, \
                 extra_1p = initialize_components(
                     Y, sn=estim.sn, options_total=self.params.to_dict(),
-                    **self.params.get_group('init'))
+                    **_init_kwargs)
             try:
                 estim.S, estim.bl, estim.c1, estim.neurons_sn, \
                     estim.g, estim.YrA, estim.lam = extra_1p
@@ -721,9 +847,11 @@ class CNMF(object):
                 estim.S, estim.bl, estim.c1, estim.neurons_sn, \
                     estim.g, estim.YrA, estim.lam, estim.W, estim.b0 = extra_1p
         else:
+            _init_kwargs = {k: v for k, v in self.params.get_group('init').items()
+                           if k not in ('precomp', 'precomp_cache', 'forder_movie_path')}
             estim.A, estim.C, estim.b, estim.f, estim.center =\
                 initialize_components(Y, sn=estim.sn, options_total=self.params.to_dict(),
-                                      **self.params.get_group('init'))
+                                      **_init_kwargs)
 
         self.estimates = estim
 
@@ -741,8 +869,13 @@ class CNMF(object):
 
         self.provenance.append({'event': 'preprocess', 'time': int(time.time()), 'description': f'Removed bad pixels and computed per-pixel noise based on provided Yr'})
 
+        # Pass pre-computed sn if available (e.g. from corr_pnr precomp)
+        # so preprocess_data skips get_noise_fft and its ~1.2 GB FFT buffer.
+        _sn_hint = self.estimates.sn if self.estimates.sn is not None else None
+        _preproc_kwargs = {k: v for k, v in self.params.get_group('preprocess').items()
+                           if k != 'sn'}  # sn passed explicitly to skip noise FFT
         Yr, self.estimates.sn, self.estimates.g, self.estimates.psx = preprocess_data(
-            Yr, dview=self.dview, **self.params.get_group('preprocess'))
+            Yr, sn=_sn_hint, dview=self.dview, **_preproc_kwargs)
         return Yr
 
 

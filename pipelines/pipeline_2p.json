@@ -1,0 +1,63 @@
+{
+    "_comment": "Parameters for pipeline_p2.py \u2014 edit here, not in the script.",
+    "session": {
+        "data_root": "/data/src/",
+        "experiment": "stroh-sa/stroh-sa-20251222/",
+        "session_id": "stroh-sa-2966-20251222-record-0001"
+    },
+    "data": {
+        "fr": 30,
+        "decay_time": 1.5,
+        "add_baseline": 100.0
+    },
+    "motion_correction": {
+        "max_shifts": [
+            6,
+            6
+        ],
+        "strides": [
+            64,
+            64
+        ],
+        "overlaps": [
+            32,
+            32
+        ],
+        "max_deviation_rigid": 3,
+        "pw_rigid": false,
+        "shifts_opencv": true,
+        "border_nan": "copy"
+    },
+    "cnmf": {
+        "p": 1,
+        "gnb": 2,
+        "merge_thr": 0.85,
+        "rf": 30,
+        "stride": 12,
+        "K": 10,
+        "gSig": [
+            9,
+            9
+        ],
+        "gSiz": [
+            37,
+            37
+        ],
+        "ssub": 1,
+        "tsub": 1,
+        "method_init": "greedy_roi",
+        "method_deconv": "oasis"
+    },
+    "quality": {
+        "min_SNR": 1.5,
+        "rval_thr": 0.8,
+        "use_cnn": true,
+        "min_cnn_thr": 0.85,
+        "cnn_lowest": 0.1
+    },
+    "cluster": {
+        "n_processes": null,
+        "ram_budget_frac": 0.85,
+        "worker_overhead_frac": 0.15
+    }
+}

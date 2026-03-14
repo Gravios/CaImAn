@@ -692,6 +692,13 @@ class CNMFParams(object):
             'p_ssub': p_ssub,             # spatial downsampling factor
             'stride': stride,
             'p_tsub': p_tsub,             # temporal downsampling factor
+            'ram_budget_frac': 0.75,      # fraction of vm.available for patch workers
+            'worker_overhead_frac': 0.15, # multiplier on analytical RAM estimate per worker
+            'blas_threads_per_worker': 1, # BLAS threads per worker (set to n_cores/n_workers)
+                                          # (patch_data excluded — shared mmap, not private);
+                                          # calibrated: observed ~400 MB private RSS /
+                                          # 2.75 GB analytical-private = 0.14; 0.15 adds
+                                          # minimal headroom. Raise if you see OOM kills.
         }
 
         self.preprocess = {
@@ -733,6 +740,7 @@ class CNMFParams(object):
             'maxIter': 5,             # number of HALS iterations
             'max_iter_snmf': 500,
             'method_init': method_init,    # can be greedy_roi, corr_pnr sparse_nmf, local_NMF
+            'forder_movie_path': None,     # F-order mmap for contiguous frame reads in precompute
             'min_corr': min_corr,
             'min_pnr': min_pnr,
             'nIter': 5,               # number of refinement iterations
@@ -750,6 +758,8 @@ class CNMFParams(object):
             'ssub': ssub,             # spatial downsampling factor
             'ssub_B': ssub_B,
             'tsub': tsub,             # temporal downsampling factor
+            'precomp': None,          # per-patch precomputed filter dict (set by run_CNMF_patches)
+            'precomp_cache': None,    # full-FOV precomp result cached across fit() calls
         }
 
         self.spatial = {

@@ -6,16 +6,42 @@ Functions for implementing parallel scalable segmentation of two photon imaging 
 
 from copy import copy, deepcopy
 import logging
+import multiprocessing
 import numpy as np
 import os
 import scipy
 from sklearn.decomposition import NMF
 import time
 
-from caiman.cluster import extract_patch_coordinates
+from caiman.cluster import (extract_patch_coordinates,
+                             _collect_log_params,
+                             _worker_logging_init,
+                             flush_worker_log)
 from caiman.mmapping import load_memmap
+from caiman.source_extraction.cnmf.initialization import (
+    precompute_corr_pnr_filtered_fov)
 from caiman.shared_memory_utils import ShmHandle, attach_shared_frames
 from caiman.cpu_topology import apply_affinity
+
+def _worker_cuda_reset_if_available() -> None:
+    """Pool initializer: reset CUDA context after fork.
+
+    NOTE: patch pools now use the 'spawn' multiprocessing context so
+    workers start with a clean process and no inherited CUDA state.
+    This function is retained for any legacy fork-based callers.
+    """
+    try:
+        import ctypes, ctypes.util
+        _libcuda = ctypes.CDLL(ctypes.util.find_library('cuda') or 'libcuda.so.1')
+        _libcuda.cuInit(0)
+        _libcuda.cuDevicePrimaryCtxReset(0)
+    except Exception:
+        pass
+    try:
+        import cupy as cp
+        cp.cuda.Device(0).use()
+    except Exception:
+        pass
 
 def cnmf_patches(args_in):
     """Function that is run for each patches
@@ -82,13 +108,16 @@ def cnmf_patches(args_in):
     # re-raised as a plain RuntimeError (always picklable) with the full
     # original traceback embedded as a string.
     try:
-        return _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger)
+        result = _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger)
     except Exception as _e:
         import traceback as _tb
+        flush_worker_log()
         raise RuntimeError(
             f"cnmf_patches failed on patch starting at idx={idx_[0]}:\n"
             + _tb.format_exc()
         ) from None
+    flush_worker_log()
+    return result
 
 
 def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
@@ -251,6 +280,7 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
     dims = shape[:-1]
     d = np.prod(dims)
     T = shape[-1]
+    _method_init = params.get("init", "method_init") or "greedy_roi"
 
     rf = params.get('patch', 'rf')
     if rf is None:
@@ -292,9 +322,107 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
 
     use_shm_for_cnmf = (dview is not None and isinstance(file_name, str))
     if use_shm_for_cnmf:
+        # Guard: only copy the movie into SHM if there is enough headroom in
+        # both RAM and /dev/shm AFTER accounting for:
+        #   - the movie itself (1× movie_bytes in SHM)
+        #   - n_processes worker heaps (~200 MB each)
+        #   - the existing page cache (which the kernel will not evict until
+        #     the last moment, so it must be treated as committed)
+        # Using psutil.virtual_memory().available is not sufficient because
+        # 'available' includes reclaimable page cache that the kernel keeps
+        # warm as long as possible — it disappears only after RAM is already
+        # under pressure, by which point the SHM allocation has already forced
+        # anonymous pages to swap.
+        #
+        # Safer budget: total_ram - used_ram - movie_bytes (page cache)
+        #               minus 2 GB headroom for worker/OS overhead.
+        _movie_bytes  = int(d * T * np.dtype(np.float32).itemsize)
+        try:
+            import psutil as _psu
+            _vm       = _psu.virtual_memory()
+            _free_shm = _psu.disk_usage('/dev/shm').free
+            # Workers reading from SHM access the movie as a shared
+            # mapping — the 27 GB is counted once regardless of how many
+            # workers are running.  Their private RSS is compute buffers
+            # only (~2 GB each, not 3.5 GB).
+            # Correct budget: physical - parent_rss - movie >= worker_compute
+            import os as _os
+            _parent_rss   = _psu.Process(_os.getpid()).memory_info().rss
+            _n_proc       = n_processes or 1
+            _worker_compute = int(_n_proc * 2.0 * 2**30)  # ~2 GB private/worker
+            _overhead       = int(4 * 2**30)              # 4 GB OS headroom
+            # SHM copy allocates movie_bytes NEW anonymous pages.
+            # Must fit: parent_rss + existing_shm + new_shm + workers + overhead
+            # Use vm.available (includes reclaimable cache) minus what we need.
+            _ram_ok   = (_vm.available >=
+                         _movie_bytes + _worker_compute + _overhead)
+            _shm_ok   = _free_shm >= _movie_bytes
+        except Exception:
+            _ram_ok = _shm_ok = True
+            _vm = type('_', (), {'available': -1})()
+            _free_shm = -1
+        if not (_ram_ok and _shm_ok):
+            logger.info(
+                f"run_CNMF_patches: skipping SHM — movie needs "
+                f"{_movie_bytes / 2**30:.1f} GiB but "
+                f"vm.available={_vm.available / 2**30:.1f} GiB, "
+                f"free /dev/shm={_free_shm / 2**30:.1f} GiB; "
+                f"using per-worker mmap (page cache already warm)"
+            )
+            use_shm_for_cnmf = False
+
+    # SHM copy happens AFTER precompute (see below) so precompute's
+    # page cache writes don't stack with the 27 GB SHM allocation.
+
+    # ── corr_pnr precompute: filter full FOV once on GPU ──────────────────
+    # init_neurons_corr_pnr runs a cv2.filter2D loop over all T frames for
+    # every patch (~20 s/patch CPU).  Precomputing on GPU once (~16 s total)
+    # and passing each patch a slice saves ~177 s wall time across 9 rounds.
+    # _precomp_cleanup holds the temp file path for deletion after patching.
+    _precomp_result   = None
+    _precomp_cleanup  = None
+    if (_method_init == 'corr_pnr'
+            and isinstance(file_name, str)):
+        # Reuse cached precomp from a previous fit() if available.
+        _cached_precomp = params.get('init', 'precomp_cache')
+        if (_cached_precomp is not None
+                and _cached_precomp.get('filtered_path')
+                and os.path.exists(_cached_precomp['filtered_path'])):
+            logger.info(
+                f'run_CNMF_patches: reusing cached precomp '
+                f'({_cached_precomp["filtered_path"]})')
+            _precomp_result = _cached_precomp
+            # _precomp_cleanup left as None — caller owns the cache lifetime
+        else:
+            try:
+                _precomp_result = precompute_corr_pnr_filtered_fov(
+                    movie_path        = file_name,
+                    dims              = (dims[0], dims[1], T),
+                    gSig              = list(params.get('init', 'gSig')),
+                    center_psf        = params.get('init', 'center_psf') or True,
+                    chunk_frames      = 3000,
+                    forder_movie_path = params.init.get('forder_movie_path'),
+                )
+                if _precomp_result is not None:
+                    _precomp_cleanup = _precomp_result['filtered_path']
+                    logger.info(
+                        f"run_CNMF_patches: corr_pnr precompute done — "
+                        f"filtered mmap at {_precomp_cleanup}")
+                    # Store for caller (cnmf.fit) — bypass params.set to avoid logging
+                    params.init['precomp_cache'] = _precomp_result
+            except Exception as _pc_exc:
+                logger.warning(
+                    f"run_CNMF_patches: corr_pnr precompute failed ({_pc_exc}) — "
+                    f"workers will filter per-patch")
+                _precomp_result = None
+
+    # ── SHM copy: AFTER precompute so filt_full pages are already evicted ──
+    # At this point: movie is in page cache (warm), filt_full is evicted.
+    # Copying movie → SHM just relabels cache pages → net zero new RAM.
+    # Before precompute: movie cache + SHM copy + filt_full writes = 81 GB OOM.
+    if use_shm_for_cnmf:
         try:
             logger.info("run_CNMF_patches: loading movie into shared memory …")
-            import caiman
             from caiman.shared_memory_utils import SharedMovieBuffer
             _shm_buf = SharedMovieBuffer(file_name, order='C')
             file_name_or_handle = _shm_buf.worker_handle()
@@ -311,18 +439,194 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
     args_in = []
     patch_centers = []
     for id_f, id_2d in zip(idx_flat, idx_2d):
-        args_in.append((file_name_or_handle, id_f, id_2d, params_copy))
+        _p = deepcopy(params_copy)
+        if _precomp_result is not None:
+            # Derive bounding box from idx_flat (sorted F-order pixel indices).
+            # extract_patch_coordinates returns shapes (not meshgrid) as idx_2d.
+            # F-order: pixel p → row = p % d1, col = p // d1
+            _rows = id_f % dims[0]
+            _cols = id_f // dims[0]
+            _x0, _x1 = int(_rows.min()), int(_rows.max()) + 1
+            _y0, _y1 = int(_cols.min()), int(_cols.max()) + 1
+            _patch_precomp = dict(_precomp_result)  # shallow copy of scalars
+            _patch_precomp['x0'] = _x0; _patch_precomp['x1'] = _x1
+            _patch_precomp['y0'] = _y0; _patch_precomp['y1'] = _y1
+            # Slice precomputed sn and data_max to patch extent
+            # sn_full/data_max_full/cn_full/pnr_full are (d1, d2) = (rows, cols)
+            # _x0:_x1 = row range (dim0), _y0:_y1 = col range (dim1)
+            _patch_precomp['sn']       = _precomp_result['sn_full'][_x0:_x1, _y0:_y1]
+            _patch_precomp['data_max'] = _precomp_result['data_max_full'][_x0:_x1, _y0:_y1]
+            if _precomp_result.get('cn_full') is not None:
+                _patch_precomp['cn']  = _precomp_result['cn_full'][_x0:_x1, _y0:_y1]
+                _patch_precomp['pnr'] = _precomp_result['pnr_full'][_x0:_x1, _y0:_y1]
+            # Inject directly into underlying dict to bypass CaImAn's param-change logger
+            _p.init['precomp'] = _patch_precomp
+        # Estimate patch cost for longest-first scheduling.
+        # Use count of pixels above min_pnr threshold from precomp if available;
+        # otherwise use patch size (uniform cost assumption).
+        if _precomp_result is not None and _precomp_result.get('pnr_full') is not None:
+            _rows = id_f % dims[0]
+            _cols = id_f // dims[0]
+            _x0p, _x1p = int(_rows.min()), int(_rows.max()) + 1
+            _y0p, _y1p = int(_cols.min()), int(_cols.max()) + 1
+            _pnr_patch = _precomp_result['pnr_full'][_x0p:_x1p, _y0p:_y1p]
+            _min_pnr   = params.get('init', 'min_pnr') or 1.0
+            _cost      = float((_pnr_patch > _min_pnr).sum())
+        else:
+            _cost = float(len(id_f))  # uniform
+        args_in.append((file_name_or_handle, id_f, id_2d, _p, _cost))
         if del_duplicates:
             foo = np.zeros(d, dtype=bool)
             foo[id_f] = 1
             patch_centers.append(scipy.ndimage.center_of_mass(
                 foo.reshape(dims, order='F')))
+    # Sort patches longest-first so workers finish at similar times.
+    # patch_centers must stay aligned with args_in order.
+    if len(args_in) > 1:
+        _order = sorted(range(len(args_in)), key=lambda i: args_in[i][4], reverse=True)
+        args_in       = [args_in[i][:4] for i in _order]  # strip cost tuple
+        if patch_centers:
+            patch_centers = [patch_centers[i] for i in _order]
+    else:
+        args_in = [a[:4] for a in args_in]
     logger.info(f'Patch size: {id_2d}')
+
+    # ── RAM-safe worker cap ───────────────────────────────────────────────
+    # Each worker allocates ~10× the patch data volume as anon private pages
+    # (HALS intermediates, NMF buffers, scipy sparse ops).  The SHM/mmap
+    # movie is shared, so its cost is paid once.  We compute a safe upper
+    # bound on concurrent workers and silently reduce dview if needed.
+    if dview is not None and 'multiprocessing' in str(type(dview)):
+        try:
+            import psutil as _psu
+            _patch_pixels   = max(
+                int(np.prod([2 * r for r in rfs])),          # 2*rf estimate
+                max((len(f) for f in idx_flat), default=1),  # largest actual patch
+            )
+            K    = params.get("init", "K") or 4
+            _ssub        = params.get("init", "ssub") or 1
+            f32, c64 = 4, 8
+            # Analytical peak RSS — all terms are deterministic given
+            # (patch_pixels, T, K) for a fixed CaImAn version:
+            #   patch_data : Yr loaded into worker
+            #   hals_copy  : Yr copy inside HALS iterations
+            #   nmf_bufs   : gradient + update buffers (~3× patch)
+            #   noise_fft  : rfft output, complex64
+            #   A_mat, C_mat: spatial/temporal components (small)
+            # patch_data is accessed via mmap — shared page cache frames
+            # already resident from the parent's open file.  Workers do
+            # not allocate new physical pages for mmap reads; omitting
+            # this term from the analytical estimate prevents the cap from
+            # being set too conservatively (confirmed empirically: workers
+            # show ~960 MB RSS of which ~560 MB is shared mmap, leaving
+            # only ~400 MB private anonymous).
+            _hals_copy   = _patch_pixels * T * f32
+            _nmf_bufs    = 3 * _patch_pixels * T * f32
+            _noise_fft   = _patch_pixels * (T // 2 + 1) * c64
+            _A_mat       = _patch_pixels * K * f32
+            _C_mat       = K * T * f32
+            _analytical  = (_hals_copy + _nmf_bufs +
+                            _noise_fft + _A_mat + _C_mat)
+            # corr_pnr extra: greedyROI_corr writes a residual mmap
+            # (_groi_B.mmap) of shape (patch_pixels/ssub², T).
+            # parallel_dot_product passes the memmap directly to
+            # SharedMovieBuffer (np.memmap is an ndarray subclass) so
+            # only one copy into SHM occurs — no intermediate heap copy.
+            if _method_init == "corr_pnr":
+                _ds_pixels    = max(1, _patch_pixels // (_ssub ** 2))
+                _groi_B_extra = 1 * _ds_pixels * T * f32
+                _analytical  += _groi_B_extra
+            # overhead_frac × analytical gives the per-worker RSS budget.
+            # Default 1.6 was calibrated empirically; lower (e.g. 1.1) if
+            # workers consistently use less RAM than estimated, raise if OOM.
+            # Exposed in JSON as cluster.worker_overhead_frac.
+            _overhead_frac = float(params.get("patch", "worker_overhead_frac") or 1.6)
+            _worker_bytes = int(_analytical * _overhead_frac)
+            _vm             = _psu.virtual_memory()
+            # Budget: fraction of RAM that is genuinely free for workers.
+            # cnmf.fit() releases the parent images and Yr mmaps before
+            # calling run_CNMF_patches so the 27 GB movie is no longer
+            # pinned by the parent.  Workers open the file independently
+            # and share its pages via the OS page cache.
+            # We no longer subtract movie_bytes from the budget — the
+            # pages are reclaimable once the parent fd is closed.
+            _movie_bytes = 0
+            _ram_frac    = float(params.get("patch", "ram_budget_frac") or 0.75)
+            _budget      = max(0, _vm.available - _movie_bytes) * _ram_frac
+            _safe_workers   = max(1, int(_budget // _worker_bytes))
+            _actual_workers = dview._processes
+            logger.info(
+                f"run_CNMF_patches RAM estimate: "
+                f"patch={_patch_pixels}px  "
+                f"analytical={_analytical/2**30:.2f} GB  "
+                f"overhead={_overhead_frac:.1f}×  "
+                f"worker_est={_worker_bytes/2**30:.2f} GB  "
+                f"movie={_movie_bytes/2**30:.1f} GB  "
+                f"vm.available={_vm.available/2**30:.1f} GB  "
+                f"budget={_budget/2**30:.1f} GB  "
+                f"→ {_safe_workers} workers (requested {_actual_workers})"
+            )
+            if _safe_workers < _actual_workers:
+                logger.warning(
+                    f"run_CNMF_patches: capping workers {_actual_workers} → "
+                    f"{_safe_workers} to avoid OOM — lower worker_overhead_frac "
+                    f"in JSON if workers consistently use less than "
+                    f"{_worker_bytes/2**30:.2f} GB each"
+                )
+                # Replace pool with a smaller one for this run
+                dview.terminate()
+                dview.join()     # reap workers so they don't linger as orphans
+                # Use spawn so workers start with a clean process —
+                # no broken CUDA context inherited from the parent fork.
+                # Pass log params via initargs (spawn workers do not
+                # inherit module-level state from the parent).
+                _lp = _collect_log_params()
+                _lp['blas_threads'] = int(
+                    params.get('patch', 'blas_threads_per_worker') or 1)
+                _spawn_ctx = multiprocessing.get_context('spawn')
+                dview = _spawn_ctx.Pool(
+                    _safe_workers,
+                    initializer = _worker_logging_init,
+                    initargs    = (_lp,),
+                )
+        except Exception as _ram_exc:
+            logger.debug(f"RAM cap check failed ({_ram_exc}); proceeding with original pool")
     st = time.time()
     try:
         if dview is not None:
             if 'multiprocessing' in str(type(dview)):
-                file_res = dview.map_async(cnmf_patches, args_in).get(4294967)
+                # Terminate the pipeline dview pool before spawning the
+                # dedicated patch pool.  Without this, both pools exist
+                # simultaneously — n_proc idle pipeline workers + n_proc
+                # active patch workers — doubling process count and wasting
+                # the RAM those idle workers consume.
+                n_proc = dview._processes
+                dview.terminate()
+                dview.join()
+                logger.info(
+                    f'run_CNMF_patches: spawning dedicated pool '
+                    f'({n_proc} workers, maxtasksperchild=1)'
+                )
+                # spawn context: workers start fresh with no inherited
+                # CUDA state — eliminates cudaErrorInitializationError
+                # in get_noise_fft GPU path without needing a reset.
+                # Pass log params via initargs (spawn does not inherit
+                # module-level state from the parent process).
+                _lp = _collect_log_params()
+                _lp['blas_threads'] = int(
+                    params.get('patch', 'blas_threads_per_worker') or 1)
+                _spawn_ctx = multiprocessing.get_context('spawn')
+                with _spawn_ctx.Pool(
+                    processes       = n_proc,
+                    maxtasksperchild= 1,
+                    initializer     = _worker_logging_init,
+                    initargs        = (_lp,),
+                ) as _patch_pool:
+                    file_res = list(
+                        _patch_pool.imap_unordered(
+                            cnmf_patches, args_in, chunksize=1
+                        )
+                    )
             else:
                 try:
                     file_res = dview.map_sync(cnmf_patches, args_in)
@@ -333,10 +637,40 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 finally:
                     logger.info('Patch processing complete')
         else:
-            file_res = list(map(cnmf_patches, args_in))
+            # dview is None — happens when fit() terminated the pipeline
+            # pool before precompute to save RAM.  Spawn a fresh dedicated
+            # pool using n_processes from params rather than running serially.
+            _n_proc_fallback = params.get('patch', 'n_processes') or 1
+            if _n_proc_fallback > 1:
+                logger.info(
+                    f'run_CNMF_patches: spawning dedicated pool '
+                    f'({_n_proc_fallback} workers, dview was None)')
+                _lp = _collect_log_params()
+                _lp['blas_threads'] = int(
+                    params.get('patch', 'blas_threads_per_worker') or 1)
+                _spawn_ctx = multiprocessing.get_context('spawn')
+                with _spawn_ctx.Pool(
+                    processes       = _n_proc_fallback,
+                    maxtasksperchild= 1,
+                    initializer     = _worker_logging_init,
+                    initargs        = (_lp,),
+                ) as _patch_pool:
+                    file_res = list(
+                        _patch_pool.imap_unordered(
+                            cnmf_patches, args_in, chunksize=1
+                        )
+                    )
+            else:
+                file_res = list(map(cnmf_patches, args_in))
     finally:
         if _shm_buf is not None:
             _shm_buf.close()
+        if _precomp_cleanup is not None:
+            try:
+                os.unlink(_precomp_cleanup)
+                logger.debug(f"run_CNMF_patches: removed precomp mmap {_precomp_cleanup}")
+            except OSError:
+                pass
 
     logger.info('Elapsed time for processing patches: \
                  {0}s'.format(str(time.time() - st).split('.')[0]))
@@ -394,7 +728,7 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
 
     f_tot, bl_tot, c1_tot, neurons_sn_tot, g_tot, idx_tot, id_patch_tot, shapes_tot = [
     ], [], [], [], [], [], [], []
-    patch_id, empty, count_bgr, count = 0, 0, 0, 0
+    patch_id, empty, count_bgr, count, f_bgr_count = 0, 0, 0, 0, 0
     idx_tot_B, idx_tot_A, a_tot, b_tot = [], [], [], []
     idx_ptr_B, idx_ptr_A = [0], [0]
 
@@ -435,7 +769,15 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     # F_tot[patch_id, :] = f[ii, :]
             count_bgr += b.shape[-1]
             if nb_patch >= 0:
-                F_tot[patch_id * nb_patch:(patch_id + 1) * nb_patch] = f
+                # Use f_bgr_count (not patch_id*nb_patch) as the write offset.
+                # patch_id advances for every patch including empty ones, so
+                # patch_id*nb_patch drifts out of sync with count_bgr whenever
+                # a patch returns fewer background components than nb_patch.
+                # f_bgr_count tracks how many rows have actually been written.
+                _f_rows = f.shape[0] if f is not None and hasattr(f, 'shape') else 0
+                if _f_rows > 0:
+                    F_tot[f_bgr_count:f_bgr_count + _f_rows] = f[:_f_rows]
+                f_bgr_count += _f_rows
             else:  # full background per patch
                 F_tot = np.concatenate([F_tot, f])
 
@@ -513,13 +855,24 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
         Bm = (B_tot)
         #f = np.r_[np.atleast_2d(np.mean(F_tot, axis=0)),
         #          np.random.rand(gnb - 1, T)]
-        mdl = NMF(n_components=gnb, verbose=False, init='nndsvdar', tol=1e-10,
-                  max_iter=100, shuffle=False, random_state=1)
-        # Filter out nan components in the bg components
+        # Filter out nan components before NMF
         nan_components = np.any(np.isnan(F_tot), axis=1)
         F_tot = F_tot[~nan_components, :]
-        mdl.fit(np.maximum(F_tot, 0))
         Bm = Bm[:, ~nan_components]
+        # Guard: NMF requires n_components <= min(n_samples, n_features).
+        # During refit some patches may return fewer background rows than gnb
+        # (e.g. patches too small to support the requested nb).  Clamp
+        # n_components to the number of available rows so NMF doesn't crash.
+        _nmf_components = min(gnb, F_tot.shape[0])
+        if _nmf_components < gnb:
+            logger.warning(
+                f'run_CNMF_patches: only {F_tot.shape[0]} background rows available '
+                f'but gnb={gnb}; clamping NMF to {_nmf_components} components'
+            )
+        _nmf_init = 'nndsvdar' if _nmf_components <= min(F_tot.shape) else 'random'
+        mdl = NMF(n_components=_nmf_components, verbose=False, init=_nmf_init,
+                  tol=1e-10, max_iter=100, shuffle=False, random_state=1)
+        mdl.fit(np.maximum(F_tot, 0))
         f = mdl.components_.squeeze()
         f = np.atleast_2d(f)
         for _ in range(100):

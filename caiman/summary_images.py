@@ -393,7 +393,14 @@ def _correlation_pnr_gpu(Y, gSig, center_psf, swap_dim,
             _filter_chunk(chunk, kernel_gpu)
 
         sum_gpu  += chunk.sum(axis=0).astype(_cp.float64)
-        sum2_gpu += (chunk.astype(_cp.float64) ** 2).sum(axis=0)
+        # VRAM fix: original (chunk.astype(float64) ** 2).sum() creates two full
+        # float64 copies of the chunk (astype + squared) = 4+4 GB simultaneously
+        # on top of the 2 GB float32 chunk — 10 GB peak per iteration.  The pool
+        # retains those blocks so rfft can't get its 2 GB output buffer without
+        # exceeding device memory.
+        # Squaring in float32 and only casting the tiny (d1,d2) sum to float64
+        # reduces the per-iteration peak from 10 GB to ~4 GB (chunk + chunk*chunk).
+        sum2_gpu += (chunk * chunk).sum(axis=0).astype(_cp.float64)
         data_max  = _cp.maximum(data_max, chunk.max(axis=0))
 
         # Welch segment: rfft along time axis (C-contiguous, no copy)
