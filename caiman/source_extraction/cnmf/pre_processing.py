@@ -125,6 +125,98 @@ def get_noise_welch(Y, noise_range=[0.25, 0.5], noise_method='logmexp',
     return sn
 
 
+def _get_noise_fft_gpu(Y, noise_range, noise_method, max_num_samples_fft):
+    """GPU-accelerated noise estimation via CuPy batched rfft.
+
+    Replaces the CPU path for large inputs (pixels x T) where:
+      - np.concatenate would allocate a 3+ GB dense array on CPU RAM
+      - The cv2.dft loop iterates 262,144 times serially
+
+    Strategy:
+      1. Build temporal sub-sample indices on CPU (~3072 frames)
+      2. Transfer only the sub-sampled columns to GPU (~3.2 GB H2D, once)
+      3. Run cp.fft.rfft across all pixels in a single batched kernel
+      4. Compute PSD and aggregate (mean/median/logmexp) on GPU
+      5. Pull back only the result vector — (pixels,) float32, ~1 MB D2H
+
+    Returns sn (np.ndarray, CPU) and psdx=None (no caller uses psdx).
+    """
+    import cupy as cp
+    logger = logging.getLogger("caiman")
+
+    T_orig   = Y.shape[-1]
+    n_pixels = int(np.prod(Y.shape[:-1]))
+
+    # ── VRAM pre-check: bail out early if allocation would OOM ─────────────
+    # Y_sub (float32) + rfft output (complex64) ≈ n_pixels × T_sub × 12 bytes.
+    # CUDA_ERROR_ILLEGAL_ADDRESS occurs when the kernel accesses beyond the
+    # allocated region — raise early to trigger the graceful CPU fallback.
+    T_sub = min(max_num_samples_fft, T_orig) if max_num_samples_fft else T_orig
+    _bytes_needed = n_pixels * T_sub * 12  # float32 + complex64
+    try:
+        _free, _total = cp.cuda.Device(0).mem_info
+        if _bytes_needed > _free * 0.85:
+            raise MemoryError(
+                f"precheck: need {_bytes_needed/1e9:.1f} GB, only "
+                f"{_free/1e9:.1f} GB free on GPU — skipping GPU noise FFT"
+            )
+    except Exception as _vram_exc:
+        raise _vram_exc  # propagate so caller falls back to CPU
+
+    # ── Build temporal sub-sample indices (CPU) ───────────────────────────────
+    if T_orig > max_num_samples_fft:
+        n3  = max_num_samples_fft // 3
+        mid = T_orig // 2
+        idx = np.concatenate([
+            np.arange(1, n3 + 1),
+            np.arange(mid - n3 // 2, mid + n3 // 2),
+            np.arange(T_orig - n3, T_orig),
+        ])
+        T = len(idx)
+    else:
+        idx = None
+        T = T_orig
+
+    # ── Frequency mask ────────────────────────────────────────────────────────
+    ff  = np.arange(0, 0.5 + 1.0 / T, 1.0 / T)
+    ind = (ff > noise_range[0]) & (ff <= noise_range[1])
+    ind = ind[:T // 2 + 1]      # trim to rfft output length
+    ind_gpu = cp.asarray(ind)
+
+    # ── Transfer sub-sampled frames to GPU ────────────────────────────────────
+    # Index only the ~3072 selected time points — avoids materialising the
+    # full (pixels, T_orig) array in CPU RAM before the H2D transfer.
+    Y_flat = Y.reshape(n_pixels, T_orig) if Y.ndim > 1 else Y[np.newaxis]
+    Y_sub  = np.ascontiguousarray(
+        Y_flat[:, idx] if idx is not None else Y_flat,
+        dtype=np.float32,
+    )                                               # (pixels, T_sub) — ~3.2 GB
+    Y_gpu  = cp.asarray(Y_sub)
+    del Y_sub                                       # free CPU copy immediately
+
+    # ── Batched rfft + PSD ────────────────────────────────────────────────────
+    xdft  = cp.fft.rfft(Y_gpu, axis=-1)            # (pixels, T//2+1) complex64
+    del Y_gpu
+    psdx  = (2.0 / T) * (xdft.real ** 2 + xdft.imag ** 2)
+    del xdft
+    psdx  = psdx[:, ind_gpu]                       # (pixels, n_freq_bins)
+
+    # ── Aggregate on GPU (mean_psd equivalent) ────────────────────────────────
+    if noise_method == 'mean':
+        sn_gpu = cp.sqrt(cp.mean(psdx / 2.0, axis=-1))
+    elif noise_method == 'median':
+        sn_gpu = cp.sqrt(cp.median(psdx / 2.0, axis=-1))
+    else:   # logmexp
+        sn_gpu = cp.sqrt(cp.exp(cp.mean(cp.log(psdx / 2.0 + 1e-10), axis=-1)))
+    del psdx
+
+    # ── Pull result to CPU ────────────────────────────────────────────────────
+    sn = cp.asnumpy(sn_gpu).reshape(Y.shape[:-1])
+    del sn_gpu
+    logger.debug(f"get_noise_fft GPU: sn shape={sn.shape}, T_sub={T}, n_freq={ind.sum()}")
+    return sn, None   # psdx=None; no caller uses it
+
+
 def get_noise_fft(Y, noise_range=[0.25, 0.5], noise_method='logmexp', max_num_samples_fft=3072,
                   opencv=True):
     """Estimate the noise level for each pixel by averaging the power spectral density.
@@ -147,10 +239,26 @@ def get_noise_fft(Y, noise_range=[0.25, 0.5], noise_method='logmexp', max_num_sa
     Returns:
         sn: np.ndarray
             Noise level for each pixel
+        psdx: np.ndarray or None
+            Power spectral density values (None on GPU path; no caller uses this)
     """
-    T = Y.shape[-1]
-    # Y=np.array(Y,dtype=np.float64)
+    T        = Y.shape[-1]
+    n_pixels = int(np.prod(Y.shape[:-1]))
 
+    # ── GPU path ──────────────────────────────────────────────────────────────
+    # Use when the input is large enough that the CPU concatenation cost
+    # (3+ GB dense alloc) and the serial cv2.dft loop (262k iterations)
+    # are both significant.  For small inputs (patch workers, single pixels)
+    # H2D overhead dominates and the CPU path is faster.
+    if n_pixels > 4096 and T > max_num_samples_fft:
+        try:
+            return _get_noise_fft_gpu(Y, noise_range, noise_method, max_num_samples_fft)
+        except Exception as _gpu_exc:
+            logging.getLogger("caiman").warning(
+                f"get_noise_fft: GPU path failed ({_gpu_exc}); falling back to CPU"
+            )
+
+    # ── CPU path (original) ───────────────────────────────────────────────────
     if T > max_num_samples_fft:
         Y = np.concatenate((Y[..., 1:max_num_samples_fft // 3 + 1],
                             Y[..., int(T // 2 - max_num_samples_fft / 3 / 2)

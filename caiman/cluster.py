@@ -175,6 +175,170 @@ def stop_server(ipcluster: str = 'ipcluster', pdir: str = None, profile: str = N
 
     logger.info("stop_cluster(): done")
 
+# ---------------------------------------------------------------------------
+# Spawn-safe logging for pool workers.
+#
+# Spawned workers start with a clean interpreter — no handlers on the caiman
+# logger.  Rather than opening the shared log file directly (which causes
+# interleaved writes across concurrent workers), each worker accumulates
+# LogRecords in a _WorkerBufferingHandler and flushes atomically at the end
+# of each patch using fcntl.flock for mutual exclusion.
+# ---------------------------------------------------------------------------
+
+class _WorkerBufferingHandler(logging.Handler):
+    """Logging handler that stores records in memory for deferred flushing.
+
+    Attached to the caiman logger inside each spawned worker.  Records
+    accumulate until flush_worker_log() is called at patch completion,
+    at which point they are written to the shared log file atomically
+    under an exclusive flock.
+    """
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+        self.records: list = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def flush_to_file(self, log_file: str, formatter: logging.Formatter) -> None:
+        """Write buffered records to *log_file* under an exclusive flock.
+
+        Blocks until the lock is available, writes all records as a single
+        contiguous block, then releases the lock.  Clears the buffer
+        regardless of whether the write succeeded.
+        """
+        import fcntl
+        records, self.records = self.records, []
+        if not records or not log_file:
+            return
+        lines = "".join(formatter.format(r) + "\n" for r in records)
+        try:
+            with open(log_file, "a") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                try:
+                    fh.write(lines)
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass  # best-effort; never raise inside a pool worker
+
+
+def _worker_logging_init(log_params: dict) -> None:
+    """Pool initializer: set BLAS threads and configure logging.
+
+    Receives log_params via initargs — the module-level approach does not
+    work with spawn because the child re-imports the module fresh and never
+    sees values set on the parent's copy.
+
+    Sets 2 BLAS threads per worker so 8 workers × 2 threads fills all 16
+    cores.  Must be set before any BLAS import in the worker process.
+    Records accumulate in memory and are flushed atomically at patch
+    completion by flush_worker_log().
+    """
+    # Set BLAS thread count using threadpoolctl — works at runtime even
+    # after numpy/scipy have already imported and initialized their thread
+    # pools. Setting env vars here is too late (BLAS already locked pool
+    # during module import, before this initializer runs).
+    _n_blas = log_params.get('blas_threads', 1) if log_params else 1
+    if _n_blas > 1:
+        try:
+            from threadpoolctl import threadpool_limits
+            threadpool_limits(limits=_n_blas)
+        except ImportError:
+            # fallback: set env vars for any BLAS that re-checks them
+            import os as _os_w
+            for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+                         'OPENBLAS_NUM_THREADS'):
+                _os_w.environ[_var] = str(_n_blas)
+    # Stash in module scope so flush_worker_log() can find log_file later.
+    global _worker_log_params
+    _worker_log_params = log_params
+    p = log_params
+    if not p:
+        return
+    log = logging.getLogger("caiman")
+    if any(isinstance(h, _WorkerBufferingHandler) for h in log.handlers):
+        return  # already configured (maxtasksperchild=1 never reuses, but be safe)
+    log.setLevel(p.get("level", logging.INFO))
+    buf = _WorkerBufferingHandler()
+    buf.setFormatter(logging.Formatter(
+        p.get("fmt",     "%(asctime)s %(relativeCreated)12d "
+                         "[%(filename)s:%(funcName)20s():%(lineno)s] "
+                         "[%(process)d] %(message)s"),
+        datefmt=p.get("datefmt", "%Y-%m-%d %H:%M:%S"),
+    ))
+    log.addHandler(buf)
+    # Stderr handler: WARNING+ only, so critical errors surface immediately.
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s/%(process)d] %(message)s",
+        datefmt="%H:%M:%S"))
+    sh.setLevel(logging.WARNING)
+    log.addHandler(sh)
+
+
+_worker_log_params: dict = {}   # stashed by _worker_logging_init in each worker
+
+
+def flush_worker_log() -> None:
+    """Flush buffered log records to the shared log file.
+
+    Call once at the end of each patch job (both success and exception
+    paths).  Locates the _WorkerBufferingHandler on the caiman logger,
+    acquires an exclusive flock on the log file, writes all pending
+    records as a single block, then releases the lock.
+    """
+    log = logging.getLogger("caiman")
+    log_file = _worker_log_params.get("log_file")
+    for h in log.handlers:
+        if isinstance(h, _WorkerBufferingHandler):
+            h.flush_to_file(log_file, h.formatter)
+            return
+
+
+def _collect_log_params() -> dict:
+    """Snapshot the parent caiman logger config for passing to workers."""
+    log = logging.getLogger("caiman")
+    log_file = None
+    fmt      = ("%(asctime)s %(relativeCreated)12d "
+                "[%(filename)s:%(funcName)20s():%(lineno)s] "
+                "[%(process)d] %(message)s")
+    datefmt  = "%Y-%m-%d %H:%M:%S"
+    for h in log.handlers:
+        if isinstance(h, logging.FileHandler):
+            log_file = h.baseFilename
+            if h.formatter:
+                fmt     = h.formatter._fmt    or fmt
+                datefmt = h.formatter.datefmt or datefmt
+            break
+    return {"level": log.level, "log_file": log_file, "fmt": fmt, "datefmt": datefmt}
+
+
+def _worker_cuda_reset() -> None:
+    """Pool worker initializer: reset CUDA context inherited from parent fork.
+
+    cp.cuda.Device().reset() calls cudaDeviceReset() which requires the
+    runtime to be functional — it silently fails when the inherited context
+    is already in cudaErrorInitializationError state.
+
+    Instead we call the CUDA driver API (cuInit + cuDevicePrimaryCtxReset)
+    directly via ctypes, bypassing the broken runtime state entirely.
+    Falls back gracefully if libcuda is unavailable or CuPy not installed.
+    """
+    try:
+        import ctypes, ctypes.util
+        _libcuda = ctypes.CDLL(ctypes.util.find_library('cuda') or 'libcuda.so.1')
+        _libcuda.cuInit(0)
+        _libcuda.cuDevicePrimaryCtxReset(0)
+    except Exception:
+        pass
+    try:
+        import cupy as cp
+        cp.cuda.Device(0).use()  # force CuPy to re-initialise on device 0
+    except Exception:
+        pass
+
+
 def setup_cluster(backend:str = 'multiprocessing',
                   n_processes:Optional[int] = None,
                   single_thread:bool = False,
@@ -231,21 +395,20 @@ def setup_cluster(backend:str = 'multiprocessing',
             else:
                 raise Exception(
                     'A cluster is already running. Terminate with dview.terminate() if you want to restart.')
-        if platform.system() == 'Darwin':
-            try:
-                if 'kernel' in get_ipython().trait_names():        # type: ignore
-                                                                   # If you're on OSX and you're running under Jupyter or Spyder,
-                                                                   # which already run the code in a forkserver-friendly way, this
-                                                                   # can eliminate some setup and make this a reasonable approach.
-                                                                   # Otherwise, setting VECLIB_MAXIMUM_THREADS=1 or using a different
-                                                                   # blas/lapack is the way to avoid the issues.
-                                                                   # See https://github.com/flatironinstitute/CaImAn/issues/206 for more
-                                                                   # info on why we're doing this (for now).
-                    multiprocessing.set_start_method('forkserver', force=True)
-            except:                                                # If we're not running under ipython, don't do anything.
-                pass
+        # Use spawn so workers start with a clean process — no inherited
+        # CUDA state, no vecLib thread-count issues on macOS (supersedes
+        # the old forkserver workaround for Jupyter/Spyder on Darwin).
+        # Pass log params via initargs — module-level vars are not
+        # inherited by spawned workers.
         c = None
-        dview = multiprocessing.Pool(n_processes, maxtasksperchild=maxtasksperchild)
+        _lp = _collect_log_params()
+        _spawn_ctx = multiprocessing.get_context('spawn')
+        dview = _spawn_ctx.Pool(
+            n_processes,
+            maxtasksperchild = maxtasksperchild,
+            initializer      = _worker_logging_init,
+            initargs         = (_lp,),
+        )
 
     elif backend == 'ipyparallel':
         stop_server()

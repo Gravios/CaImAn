@@ -25,6 +25,7 @@ import time
 
 import caiman.mmapping
 import caiman.utils.stats
+import caiman.gpu_spatial as _gpu_spatial
 
 def update_spatial_components(Y, C=None, f=None, A_in=None, sn=None, dims=None,
                               min_size=3, max_size=8, dist=3,
@@ -183,27 +184,52 @@ def update_spatial_components(Y, C=None, f=None, A_in=None, sn=None, dims=None,
         pixel_groups.append([Y_name, C_name, sn, ind2_[(i + n_pixels_per_process):np.prod(dims)], list(
             range(i + n_pixels_per_process, np.prod(dims))), method_ls, cct])
     #A_ = scipy.sparse.lil_matrix((d, nr + np.size(f, 0)))
-    if dview is not None:
-        if 'multiprocessing' in str(type(dview)):
-            parallel_result = dview.map_async(
-                regression_ipyparallel, pixel_groups).get(4294967)
+    # ── GPU gram path ────────────────────────────────────────────────────
+    # Precomputes YC = Y @ Cf_scaled.T on GPU (tiled, stays within VRAM),
+    # then solves each pixel's NNLS using a K_local × K_local gram system
+    # instead of the K_local × T system — ~2700× fewer FLOPs per pixel.
+    # Falls back to the CPU multiprocessing path silently if GPU unavailable.
+    # Only use GPU on full-FOV calls (d > 16384 pixels).
+    # Patch workers are forked subprocesses where CUDA contexts don't
+    # survive fork(), and patch sizes (~900px) are too small to amortise
+    # the H2D transfer overhead anyway.
+    _use_gpu_spatial = (d > 16384 and _gpu_spatial._gpu_available())
+    if _use_gpu_spatial:
+        try:
+            logger.info('update_spatial: using GPU gram path')
+            _Cf = np.vstack([C, f]) if f is not None and np.size(f) > 0 else C
+            data, rows, cols = _gpu_spatial.update_spatial_gpu(
+                Y, _Cf, f, ind2_, sn, nr, d, T, rank_f,
+                method_ls=method_ls, cct=cct,
+                n_pixels_per_process=n_pixels_per_process,
+            )
+        except Exception as _gpu_exc:
+            logger.warning(
+                f'update_spatial: GPU path failed ({_gpu_exc}); falling back to CPU'
+            )
+            _use_gpu_spatial = False
+
+    if not _use_gpu_spatial:
+        if dview is not None:
+            if 'multiprocessing' in str(type(dview)):
+                parallel_result = dview.map_async(
+                    regression_ipyparallel, pixel_groups).get(4294967)
+            else:
+                parallel_result = dview.map_sync(
+                    regression_ipyparallel, pixel_groups)
+                dview.results.clear()
         else:
-            parallel_result = dview.map_sync(
-                regression_ipyparallel, pixel_groups)
-            dview.results.clear()
-    else:
-        parallel_result = list(map(regression_ipyparallel, pixel_groups))
-    data:list = []
-    rows:list = []
-    cols:list = []
-    for chunk in parallel_result:
-        for pars in chunk:
-            px, idxs_, a = pars
-            #A_[px, idxs_] = a
-            nz = np.where(a>0)[0]
-            data.extend(a[nz])
-            rows.extend(len(nz)*[px])
-            cols.extend(idxs_[nz])
+            parallel_result = list(map(regression_ipyparallel, pixel_groups))
+        data = []
+        rows = []
+        cols = []
+        for chunk in parallel_result:
+            for pars in chunk:
+                px, idxs_, a = pars
+                nz = np.where(a > 0)[0]
+                data.extend(a[nz])
+                rows.extend(len(nz) * [px])
+                cols.extend(idxs_[nz])
     A_ = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(d, nr + np.size(f, 0)))
 
     logger.info("thresholding components")
@@ -233,14 +259,27 @@ def update_spatial_components(Y, C=None, f=None, A_in=None, sn=None, dims=None,
     if update_background_components:
         A_ = csr_matrix(A_)
         logger.info("Computing residuals")
-        if 'memmap' in str(type(Y)):
-            bl_siz1 = Y.shape[0] // (num_blocks_per_run_spat - 1)
-            bl_siz2 = psutil.virtual_memory().available // (4*Y.shape[-1]*(num_blocks_per_run_spat + 1))
-            Y_resf = caiman.mmapping.parallel_dot_product(Y, f.T, dview=dview, block_size=min(bl_siz1, bl_siz2), num_blocks_per_run=num_blocks_per_run_spat) - \
-                A_.dot(C[:nr].dot(f.T))
+        # Y @ f.T: use GPU if available (d×nb result, trivial D2H)
+        # Same d > 16384 guard as above — no point on patch-level calls.
+        if d > 16384 and _gpu_spatial._gpu_available() and hasattr(Y, '__len__'):
+            try:
+                import cupy as cp
+                f_gpu   = cp.asarray(np.ascontiguousarray(f, dtype=np.float32))
+                Y_resf  = _gpu_spatial.precompute_YC_gpu(Y, f)   # (d, nb)
+                Y_resf -= A_.dot(C[:nr].dot(f.T))
+            except Exception:
+                Y_resf = None
         else:
-            # Y*f' - A*(C*f')
-            Y_resf = np.dot(Y, f.T) - A_.dot(C[:nr].dot(f.T))
+            Y_resf = None
+        if Y_resf is None:
+            if 'memmap' in str(type(Y)):
+                bl_siz1 = Y.shape[0] // (num_blocks_per_run_spat - 1)
+                bl_siz2 = psutil.virtual_memory().available // (4*Y.shape[-1]*(num_blocks_per_run_spat + 1))
+                Y_resf = caiman.mmapping.parallel_dot_product(Y, f.T, dview=dview, block_size=min(bl_siz1, bl_siz2), num_blocks_per_run=num_blocks_per_run_spat) - \
+                    A_.dot(C[:nr].dot(f.T))
+            else:
+                # Y*f' - A*(C*f')
+                Y_resf = np.dot(Y, f.T) - A_.dot(C[:nr].dot(f.T))
 
         if b_in is None:
             # update baseline based on residual

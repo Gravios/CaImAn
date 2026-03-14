@@ -1,0 +1,633 @@
+"""
+CaImAn pipeline — motion correction + CNMF
+===========================================
+Incorporates all fixes:
+  - CAIMAN_DATA / CAIMAN_TEMP set before import; dirs created if missing
+  - CNN model files bootstrapped from package source if missing
+  - GPU motion correction (no multiprocessing cluster for MC)
+  - No cm.load() of raw tiff into RAM
+  - MC writes F-order mmap; streamed chunk copy converts to C-order for CNMF
+    (+ ADD_BASELINE offset to keep all pixel values > 0 for stable dF/F)
+  - load_memmap used directly (no cm.load of corrected movie)
+  - greedy_roi initialisation — lighter memory footprint than corr_pnr;
+    correct for 2p galvo data with global (low-rank) background model
+  - Patches enabled from the start (rf=15); no ring-model rf=None constraint
+  - CNMF cluster started only when needed, stopped in finally block
+  - Component evaluation counts captured before select_components destroys them
+  - Cn saved to disk for use by plot_traces.py
+"""
+
+# ── 0. Environment — must be set before any caiman import ────────────────────
+import os
+import sys
+import shutil
+from pathlib import Path
+import logging
+import warnings
+
+
+CAIMAN_DATA = "/data/caiman"
+CAIMAN_TEMP = "/data/caiman/temp"
+os.environ["CAIMAN_DATA"] = CAIMAN_DATA
+os.environ["CAIMAN_TEMP"] = CAIMAN_TEMP
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+
+
+for _d in [CAIMAN_DATA, os.path.join(CAIMAN_DATA, "model"), CAIMAN_TEMP]:
+    os.makedirs(_d, exist_ok=True)
+
+_model_dst = os.path.join(CAIMAN_DATA, "model")
+
+def _ensure_model_files() -> bool:
+    needed = ["cnn_model.pkl", "cnn_model_online.pkl"]
+    import importlib.resources
+    try:
+        pkg_root = str(importlib.resources.files("caiman").joinpath(".."))
+    except Exception:
+        pkg_root = ""
+    candidates = [
+        os.path.join(sys.prefix, "share", "caiman", "model"),
+        os.path.join(pkg_root, "model"),
+    ]
+    all_present = True
+    for fname in needed:
+        dst = os.path.join(_model_dst, fname)
+        if os.path.exists(dst):
+            continue
+        copied = False
+        for src_dir in candidates:
+            src = os.path.join(src_dir, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                print(f"[setup] Copied {fname} from {src_dir}")
+                copied = True
+                break
+        if not copied:
+            print(f"[setup] WARNING: {fname} not found — CNN classifier will be disabled")
+            all_present = False
+    return all_present
+
+_cnn_available = _ensure_model_files()
+
+# ── 1. Imports ────────────────────────────────────────────────────────────────
+
+
+# scipy 1.17.0 regression: dia_matrix.transpose() calls `offsets % max_dim`
+# without guarding against max_dim=0.  This fires harmlessly when CNMF patches
+# contain zero accepted components (the resulting (0,0) sparse matrix transposes
+# correctly despite the warning).  Suppress it to keep logs clean.
+warnings.filterwarnings(
+    "ignore",
+    message="divide by zero encountered in remainder",
+    category=RuntimeWarning,
+    module=r"scipy\.sparse\._dia",
+)
+
+import cv2
+import numpy as np
+
+try:
+    cv2.setNumThreads(0)
+except Exception:
+    pass
+
+import caiman as cm
+from caiman.utils.tiff_io import (
+    ensure_multipage_tiff as _ensure_multipage_tiff,
+    fc_convert_parallel   as _fc_convert_parallel,
+    madvise_sequential    as _madvise_sequential,
+)
+import caiman.mmapping
+import caiman.summary_images as csi
+from caiman.motion_correction import MotionCorrect
+from caiman.source_extraction import cnmf
+from caiman.source_extraction.cnmf import params as cnmf_params
+
+# QC figure generation (headless matplotlib, never crashes the pipeline)
+# Ensure pipelines/ is on sys.path so pipeline_qc resolves regardless of cwd.
+# __file__ is undefined when the script is eval'd (e.g. Emacs python-el),
+# so fall back to inspect to locate the source file.
+
+import sys as _sys, inspect as _inspect
+try:
+    _pipelines_dir = str(Path(__file__).resolve().parent)
+except NameError:
+    _pipelines_dir = str(
+        Path(_inspect.getfile(_inspect.currentframe())).resolve().parent
+    )
+_sys.path.insert(0, _pipelines_dir)
+
+import dill as _dill
+import multiprocessing.reduction as _mpr
+_mpr.ForkingPickler.dumps = _dill.dumps
+
+# ── 2. Load parameters from JSON ─────────────────────────────────────────────
+# The JSON file lives next to this script and shares its stem name.
+# Edit pipeline_p2.json to change any parameter; do not hardcode values here.
+import json as _json_loader
+
+datsrc  = Path("/data/src/")
+expsrc  = Path("stroh-sa/stroh-sa-20251222/")
+session = "stroh-sa-2966-20251222-record-0001"
+
+
+import sys as _sys, inspect as _inspect
+try:
+    _params_path = Path(__file__).stem + ".json"
+except NameError:
+    _params_path = Path(_pipelines_dir) / (Path(_inspect.getfile(_inspect.currentframe())).stem + ".json")
+
+
+
+
+with open(_params_path) as _pf:
+    _P = _json_loader.load(_pf)
+
+# ── Session identity ─────────────────────────────────────────────────────────
+datsrc  = Path(_P["session"]["data_root"])
+expsrc  = Path(_P["session"]["experiment"])
+session = _P["session"]["session_id"]
+
+logfile = datsrc / expsrc / f"{session}.log"
+fnames  = str(datsrc / expsrc / f"{session}-raw.tif")
+
+import pipeline_qc as _qc
+_qc_dir = datsrc / expsrc   # figures land next to the log
+
+
+# ── Clear log file and reset all handlers on every run ───────────────────────
+# Ensures each pipeline invocation starts with a fresh log rather than
+# appending to a previous run's output.
+logger = logging.getLogger("caiman")
+logger.setLevel(logging.INFO)
+logfmt = logging.Formatter(
+    "%(asctime)s %(relativeCreated)12d "
+    "[%(filename)s:%(funcName)20s():%(lineno)s] "
+    "[%(process)d] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# Remove any handlers already attached (avoids duplicates on re-runs in the
+# same interpreter session, e.g. Emacs inferior-python or Jupyter).
+for _h in logger.handlers[:]:
+    try: _h.close()
+    except Exception: pass
+    logger.removeHandler(_h)
+
+# Truncate the log file so this run starts at line 1.
+open(logfile, "w").close()
+
+handler = logging.FileHandler(logfile, mode="a")
+handler.setFormatter(logfmt)
+logger.addHandler(handler)
+
+# Also echo INFO+ to stderr so progress is visible in the terminal.
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+_console_handler.setLevel(logging.INFO)
+logger.addHandler(_console_handler)
+
+# ── Timing infrastructure ─────────────────────────────────────────────────────
+import time as _time
+import contextlib as _contextlib
+import psutil as _psutil
+import json as _json
+
+_timing_events: list = []   # accumulates {label, elapsed, rss_start, rss_end, ...}
+
+def _fmt_elapsed(s: float) -> str:
+    m, s = divmod(s, 60)
+    h, m = divmod(int(m), 60)
+    if h:   return f"{h}h {m:02d}m {s:04.1f}s"
+    elif m: return f"{m}m {s:04.1f}s"
+    else:   return f"{s:.2f}s"
+
+def _rss_gb() -> float:
+    return _psutil.Process().memory_info().rss / 2**30
+
+def _shm_gb() -> float:
+    try: return _psutil.disk_usage("/dev/shm").used / 2**30
+    except Exception: return 0.0
+
+def _vram_mb() -> float:
+    try:
+        import cupy as cp
+        pool = cp.get_default_memory_pool()
+        return pool.used_bytes() / 2**20
+    except Exception:
+        return 0.0
+
+@_contextlib.contextmanager
+def _timer(label: str):
+    rss0  = _rss_gb()
+    shm0  = _shm_gb()
+    vram0 = _vram_mb()
+    t0    = _time.perf_counter()
+    logger.info(
+        f"STARTED  {label}  "
+        f"[RSS {rss0:.1f} GB  SHM {shm0:.1f} GB  VRAM {vram0:.0f} MB]"
+    )
+    try:
+        yield
+    finally:
+        elapsed = _time.perf_counter() - t0
+        rss1    = _rss_gb()
+        shm1    = _shm_gb()
+        vram1   = _vram_mb()
+        human   = _fmt_elapsed(elapsed)
+        logger.info(
+            f"DONE     {label}  —  {human}  ({elapsed:.1f} s)  "
+            f"[RSS {rss1:.1f} GB (Δ{rss1-rss0:+.1f})  "
+            f"SHM {shm1:.1f} GB  VRAM {vram1:.0f} MB]"
+        )
+        _timing_events.append({
+            "label":    label,
+            "elapsed":  round(elapsed, 3),
+            "human":    human,
+            "rss_start_gb":  round(rss0, 2),
+            "rss_end_gb":    round(rss1, 2),
+            "rss_delta_gb":  round(rss1 - rss0, 2),
+            "shm_end_gb":    round(shm1, 2),
+            "vram_end_mb":   round(vram1, 1),
+        })
+
+# ── 3. Unpack parameters from JSON ───────────────────────────────────────────
+# Data
+fr           = _P["data"]["fr"]
+decay_time   = _P["data"]["decay_time"]
+ADD_BASELINE = _P["data"]["add_baseline"]
+
+# Motion correction
+max_shifts          = tuple(_P["motion_correction"]["max_shifts"])
+strides             = tuple(_P["motion_correction"]["strides"])
+overlaps            = tuple(_P["motion_correction"]["overlaps"])
+max_deviation_rigid = _P["motion_correction"]["max_deviation_rigid"]
+pw_rigid            = _P["motion_correction"]["pw_rigid"]
+shifts_opencv       = _P["motion_correction"]["shifts_opencv"]
+border_nan          = _P["motion_correction"]["border_nan"]
+
+# CNMF
+p             = _P["cnmf"]["p"]
+gnb           = _P["cnmf"]["gnb"]
+merge_thr     = _P["cnmf"]["merge_thr"]
+rf            = _P["cnmf"]["rf"]
+stride        = _P["cnmf"]["stride"]
+K             = _P["cnmf"]["K"]
+gSig          = _P["cnmf"]["gSig"]
+gSiz          = _P["cnmf"]["gSiz"]
+ssub          = _P["cnmf"]["ssub"]
+tsub          = _P["cnmf"]["tsub"]
+method_init   = _P["cnmf"]["method_init"]
+method_deconv = _P["cnmf"]["method_deconv"]
+
+# Quality
+min_SNR     = _P["quality"]["min_SNR"]
+rval_thr    = _P["quality"]["rval_thr"]
+use_cnn     = _P["quality"]["use_cnn"]
+min_cnn_thr = _P["quality"]["min_cnn_thr"]
+cnn_lowest  = _P["quality"]["cnn_lowest"]
+
+logger_pre = logging.getLogger("caiman")
+logger_pre.info(f"Parameters loaded from {_params_path}")
+
+# ── 6. TIFF format check ─────────────────────────────────────────────────────
+_pipeline_t0 = _time.perf_counter()
+import tifffile as _tifffile
+
+
+with _timer("TIFF format check"):
+    fnames = _ensure_multipage_tiff(fnames)
+
+with _timer("QC: raw sample"):
+    _qc.qc_raw_sample(
+        fnames,
+        str(_qc_dir / f"{session}_qc_01_raw_sample.png"),
+    )
+
+# ── 7. Motion correction (GPU, no cluster) ────────────────────────────────────
+import glob as _glob
+
+_mc_order    = "F"
+_mc_pattern  = os.path.join(CAIMAN_TEMP, f"*{session}*order_{_mc_order}*.mmap")
+_mc_existing = sorted(_glob.glob(_mc_pattern))
+
+if _mc_existing:
+    fname_mc   = _mc_existing[-1]
+    shifts_rig = [(0, 0)]
+    logger.info(f"Reusing existing MC mmap: {fname_mc}")
+    print(f"[MC] Skipped — reusing {fname_mc}")
+else:
+    mc = MotionCorrect(
+        fnames,
+        dview               = None,
+        max_shifts          = max_shifts,
+        strides             = strides,
+        overlaps            = overlaps,
+        max_deviation_rigid = max_deviation_rigid,
+        shifts_opencv       = shifts_opencv,
+        nonneg_movie        = True,
+        border_nan          = border_nan,
+        pw_rigid            = pw_rigid,
+        use_gpu             = True,
+    )
+    with _timer("Motion correction"):
+        mc.motion_correct(save_movie=True)
+    fname_mc   = mc.mmap_file[0]
+    shifts_rig = mc.shifts_rig
+    logger.info(f"Motion correction done. mmap: {fname_mc}")
+    with _timer("QC: motion correction"):
+        _qc.qc_motion_correction(
+            mc,
+            str(_qc_dir / f"{session}_qc_02_motion_correction.png"),
+        )
+    del mc
+
+bord_px = 0 if border_nan == "copy" else int(np.ceil(np.max(np.abs(shifts_rig))))
+
+# ── 8. Convert F-order MC mmap → C-order for CNMF ────────────────────────────
+_cnmf_pattern  = os.path.join(CAIMAN_TEMP, f"*{session}_cnmf*order_C*.mmap")
+_cnmf_existing = sorted(_glob.glob(_cnmf_pattern))
+
+if _cnmf_existing and os.path.getmtime(_cnmf_existing[-1]) >= os.path.getmtime(fname_mc):
+    fname_cnmf = _cnmf_existing[-1]
+    logger.info(f"Reusing existing C-order mmap: {fname_cnmf}")
+    print(f"[mmap] Skipped F→C conversion — reusing {fname_cnmf}")
+    Yr_F, dims, T = cm.mmapping.load_memmap(fname_mc)
+    n_pixels = int(np.prod(dims))
+    del Yr_F
+else:
+    Yr_F, dims, T = cm.mmapping.load_memmap(fname_mc)
+    n_pixels = int(np.prod(dims))
+
+    fname_cnmf = cm.paths.fn_relocated(
+        cm.paths.memmap_frames_filename(session + "_cnmf", dims, T, "C"),
+        force_temp=True,
+    )
+    Yr_C = np.memmap(
+        fname_cnmf, mode="w+", dtype=np.float32,
+        shape=cm.mmapping.prepare_shape((n_pixels, T)), order="C",
+    )
+
+    with _timer("F→C mmap conversion"):
+        _fc_convert_parallel(Yr_F, Yr_C, n_pixels, T, ADD_BASELINE, logger)
+
+    del Yr_C, Yr_F
+    logger.info(f"C-order mmap: {fname_cnmf}")
+
+# ── 9. Load as zero-copy memmap view ─────────────────────────────────────────
+Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+images = np.reshape(Yr.T, [T] + list(dims), order="F")
+images.filename = Yr.filename
+
+logger.info(f"Data shape: {images.shape}, dtype: {images.dtype}")
+
+# ── 10. Flush CuPy pool, compute correlation image ───────────────────────────
+try:
+    import cupy as _cp
+    _cp.get_default_memory_pool().free_all_blocks()
+    _cp.get_default_pinned_memory_pool().free_all_blocks()
+    logger.info("CuPy memory pool flushed before summary-image step")
+except Exception:
+    pass
+
+with _timer("Correlation image (Cn)"):
+    Cn = csi.local_correlations_fft(images[::5], swap_dim=False)
+    Cn[np.isnan(Cn)] = 0
+    np.save(str(datsrc / expsrc / f"{session}_Cn.npy"), Cn)
+
+with _timer("QC: correlation image"):
+    _qc.qc_correlation_image(
+        Cn,
+        str(_qc_dir / f"{session}_qc_03_correlation_image.png"),
+    )
+# Cn kept alive — reused for footprint overlays in fit/refit/eval QC
+
+# ── 11. CNMF parameters object ───────────────────────────────────────────────
+# ── CNMF parameters — pathed API (avoids deprecation warning) ────────────────
+# Each key lives in exactly one named sub-dict that maps to a CNMFParams
+# category.  Using the pathed form opts.set('category', {key: value}) is the
+# current supported API; the flat params_dict form triggers a warning and will
+# eventually be removed.
+opts = cnmf_params.CNMFParams()
+opts.set('data', {
+    'fnames'     : [fname_cnmf],
+    'fr'         : fr,
+    'decay_time' : decay_time,
+    'dims'       : dims,
+})
+opts.set('patch', {
+    # rf=15 > gSiz=13 satisfies CaImAn's rf > gSiz constraint
+    'rf'         : rf,
+    'stride'     : stride,
+    'n_processes': None,
+    'only_init'  : True,
+    'p_patch'    : 0,
+    'nb_patch'   : gnb,
+    'border_pix' : bord_px,
+})
+opts.set('init', {
+    'K'          : K,
+    'gSig'       : gSig,
+    'gSiz'       : gSiz,
+    'method_init': method_init,
+    'ssub'       : ssub,
+    'tsub'       : tsub,
+    'nb'         : gnb,
+})
+opts.set('preprocess', {
+    'p'          : 0,         # p=0 during initial fit (no AR model yet)
+})
+opts.set('merging', {
+    'merge_thr'  : merge_thr,
+})
+opts.set('spatial', {
+    'nb'         : gnb,
+})
+opts.set('temporal', {
+    'nb'         : gnb,
+    'method_deconvolution': method_deconv,
+    'p'          : 0,
+})
+opts.set('quality', {
+    'min_SNR'    : min_SNR,
+    'rval_thr'   : rval_thr,
+    'use_cnn'    : use_cnn and _cnn_available,
+    'min_cnn_thr': min_cnn_thr,
+    'cnn_lowest' : cnn_lowest,
+})
+
+# ── 12. CNMF fit ──────────────────────────────────────────────────────────────
+logger.info("Starting CNMF cluster")
+c, dview, n_processes = cm.cluster.setup_cluster(
+    backend      = "multiprocessing",
+    n_processes  = None,
+    single_thread= False,
+)
+opts.set("patch", {"n_processes": n_processes})
+
+try:
+    cnm = cnmf.CNMF(n_processes, params=opts, dview=dview)
+    with _timer("CNMF fit (greedy_roi init)"):
+        cnm.fit(images)
+
+    with _timer("QC: initial fit"):
+        _qc.qc_cnmf_fit(
+            cnm, Cn,
+            str(_qc_dir / f"{session}_qc_04_fit_footprints.png"),
+        )
+
+    # ── 13. Re-run with full AR model on accepted ROIs ────────────────────────
+    opts.set("preprocess", {"p": p})
+    opts.set("patch",      {"only_init": False, "rf": rf, "stride": stride})
+    with _timer("CNMF refit (full AR)"):
+        cnm2 = cnm.refit(images, dview=dview)
+    del cnm
+
+    # ── 14. Component quality evaluation ─────────────────────────────────────
+    with _timer("Component evaluation"):
+        cnm2.estimates.evaluate_components(images, cnm2.params, dview=dview)
+    del images, Yr
+
+    n_accepted = len(cnm2.estimates.idx_components)
+    n_rejected = len(cnm2.estimates.idx_components_bad)
+    logger.info(f"Components — accepted: {n_accepted}, rejected: {n_rejected}")
+
+    with _timer("QC: refit footprints + evaluation"):
+        _qc.qc_cnmf_refit(
+            cnm2, Cn,
+            str(_qc_dir / f"{session}_qc_05_refit_footprints.png"),
+        )
+        _qc.qc_component_evaluation(
+            cnm2, Cn,
+            str(_qc_dir / f"{session}_qc_06_evaluation.png"),
+        )
+    del Cn   # no longer needed
+
+    cnm2.estimates.select_components(use_object=True)
+
+    # ── 15. dF/F ─────────────────────────────────────────────────────────────
+    with _timer("dF/F computation"):
+        cnm2.estimates.detrend_df_f(
+            quantileMin   = 8,
+            frames_window = 500,
+        )
+
+    # ── 16. Save results ─────────────────────────────────────────────────────
+    with _timer("QC: traces"):
+        _qc.qc_traces(
+            cnm2, fr,
+            str(_qc_dir / f"{session}_qc_07_traces.png"),
+        )
+
+    save_path = str(datsrc / expsrc / f"{session}_results.hdf5")
+    with _timer("Save results"):
+        cnm2.save(save_path)
+    logger.info(f"Saved results to {save_path}")
+
+finally:
+    logger.info("Stopping cluster")
+    cm.stop_server(dview=dview)
+
+_pipeline_elapsed = _time.perf_counter() - _pipeline_t0
+_human = _fmt_elapsed(_pipeline_elapsed)
+logger.info(f"Pipeline complete  —  total wall time: {_human}  ({_pipeline_elapsed:.1f} s)")
+
+# ── Generate timing / resource report ────────────────────────────────────────
+_report_path = str(datsrc / expsrc / f"{session}_report.txt")
+_json_path   = str(datsrc / expsrc / f"{session}_report.json")
+
+def _write_report(events, total_elapsed, report_path, json_path, session):
+    """Write a human-readable timing/resource report and a JSON summary."""
+    import datetime, json
+
+    now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    lines.append("=" * 72)
+    lines.append(f"  CaImAn Pipeline Report")
+    lines.append(f"  Session : {session}")
+    lines.append(f"  Generated : {now}")
+    lines.append(f"  Total wall time : {_fmt_elapsed(total_elapsed)}"
+                 f"  ({total_elapsed:.1f} s)")
+    lines.append("=" * 72)
+    lines.append("")
+
+    # Step table
+    col_w = max(len(e["label"]) for e in events) + 2
+    header = (f"  {'Step':<{col_w}}  {'Time':>10}  {'%':>5}  "
+              f"{'RSS end':>9}  {'ΔRSS':>7}  {'SHM':>6}  {'VRAM':>8}")
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+
+    for e in events:
+        pct   = 100.0 * e["elapsed"] / total_elapsed if total_elapsed > 0 else 0
+        lines.append(
+            f"  {e['label']:<{col_w}}  {e['human']:>10}  {pct:>4.1f}%  "
+            f"{e['rss_end_gb']:>7.1f} GB  "
+            f"{e['rss_delta_gb']:>+6.1f}  "
+            f"{e['shm_end_gb']:>4.1f} GB  "
+            f"{e['vram_end_mb']:>6.0f} MB"
+        )
+
+    lines.append("")
+    lines.append("  " + "-" * (len(header) - 2))
+
+    # Slowest steps
+    top = sorted(events, key=lambda e: e["elapsed"], reverse=True)[:3]
+    lines.append("  Slowest steps:")
+    for i, e in enumerate(top, 1):
+        pct = 100.0 * e["elapsed"] / total_elapsed if total_elapsed > 0 else 0
+        lines.append(f"    {i}. {e['label']}  {e['human']}  ({pct:.1f}%)")
+
+    lines.append("")
+
+    # Peak RSS
+    peak_rss = max(e["rss_end_gb"] for e in events) if events else 0
+    peak_shm = max(e["shm_end_gb"] for e in events) if events else 0
+    peak_vram = max(e["vram_end_mb"] for e in events) if events else 0
+    lines.append(f"  Peak RSS  : {peak_rss:.1f} GB")
+    lines.append(f"  Peak SHM  : {peak_shm:.1f} GB")
+    lines.append(f"  Peak VRAM : {peak_vram:.0f} MB")
+    lines.append("")
+    lines.append("=" * 72)
+
+    report_txt = "\n".join(lines) + "\n"
+    with open(report_path, "w") as fh:
+        fh.write(report_txt)
+
+    # JSON — machine-readable for downstream analysis
+    summary = {
+        "session":        session,
+        "generated":      now,
+        "total_elapsed_s": round(total_elapsed, 3),
+        "steps":          events,
+        "peak_rss_gb":    round(peak_rss, 2),
+        "peak_shm_gb":    round(peak_shm, 2),
+        "peak_vram_mb":   round(peak_vram, 1),
+    }
+    with open(json_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    # Print to terminal
+    print("\n" + report_txt)
+    logger.info(f"Report written to {report_path}")
+    logger.info(f"JSON summary written to {json_path}")
+
+_write_report(_timing_events, _pipeline_elapsed,
+              _report_path, _json_path, session)
+
+# ── 17. What you get ──────────────────────────────────────────────────────────
+# cnm2.estimates.A          — spatial components  (pixels × K) sparse
+# cnm2.estimates.C          — denoised traces     (K × T)
+# cnm2.estimates.S          — deconvolved spikes  (K × T)
+# cnm2.estimates.F_dff      — dF/F traces         (K × T)
+# cnm2.estimates.b          — background spatial  (pixels × gnb)
+# cnm2.estimates.f          — background temporal (gnb × T)
+# cnm2.estimates.idx_components      — accepted component indices
+# cnm2.estimates.idx_components_bad  — rejected component indices
+# cnm2.estimates.SNR_comp   — per-component SNR
+# cnm2.estimates.r_values   — per-component spatial correlation
+# cnm2.estimates.cnn_preds  — per-component CNN score
+# Cn                        — correlation image (d1 × d2)   [saved as .npy]
+# shifts_rig                — per-frame rigid shifts [(row, col), ...]
