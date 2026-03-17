@@ -40,7 +40,6 @@ from caiman.utils.timing import log_call
 # ── Script path resolution ───────────────────────────────────────────────────
 
 def resolve_pipeline_path(
-    suffix: str = "_pipeline",
     argv_index: int = 1,
 ) -> tuple[Path, Path, str]:
     """Resolve the pipeline script path, config path, and session name.
@@ -48,29 +47,42 @@ def resolve_pipeline_path(
     Must be called before any caiman import — it has zero caiman dependencies
     and uses only the Python standard library.
 
-    Resolution order for the script path:
-
+    Resolution order for the script path
+    -------------------------------------
     1. ``__file__`` from the calling frame — set by CPython for normal
        execution and IPython ``%run``.
-    2. ``inspect.getfile`` walking up the call stack — works in Emacs
-       ``python-el`` eval and any ``exec()`` context where ``__file__``
-       is not injected.
+    2. Frame globals walk — works in Emacs ``python-el`` and any ``exec()``
+       context where ``__file__`` is not injected.
     3. ``sys.argv[0]`` if it names an existing ``.py`` file.
     4. ``Path.cwd() / "pipeline.py"`` as a last resort.
 
-    The config path is resolved as:
+    Session name derivation
+    -----------------------
+    The following pipeline suffixes are recognised (dot *and* underscore
+    variants, upper *and* lower case):
 
-    - ``sys.argv[argv_index]`` if that argument is present (explicit override).
-    - Otherwise ``<script_dir>/<script_stem>.json``.
+    ===========================  ===========================
+    Script filename              Session name
+    ===========================  ===========================
+    ``sess_pipeline.py``         ``sess``
+    ``sess.pipeline.py``         ``sess``
+    ``sess_Pipeline.py``         ``sess``
+    ``sess.Pipeline.py``         ``sess``
+    ===========================  ===========================
 
-    The session name is ``script_stem.removesuffix(suffix)``, so
-    ``stroh-ej-20140708-TL2_pipeline.py`` → ``stroh-ej-20140708-TL2``.
+    Config path
+    -----------
+    - ``sys.argv[argv_index]`` when that argument is present (explicit JSON
+      path override).
+    - Otherwise ``<script_dir>/<session>_pipeline.json`` if that file exists.
+    - Otherwise ``<script_dir>/<script_stem>.json`` (legacy dot-naming
+      fallback: ``sess.pipeline.json``).
+
+    If neither JSON file exists a ``FileNotFoundError`` is raised with a
+    message pointing to ``new_session.py``.
 
     Parameters
     ----------
-    suffix
-        Suffix to strip from the script stem to form the session name
-        (default ``"_pipeline"``).
     argv_index
         ``sys.argv`` index to check for an explicit config path override
         (default ``1``).
@@ -97,13 +109,49 @@ def resolve_pipeline_path(
     script_path = _find_script_path()
     script_dir  = script_path.parent
 
-    if len(sys.argv) > argv_index:
+    # ── Session name: strip any recognised pipeline suffix ────────────────
+    # Handles both separators (. and _) and mixed case.
+    stem    = script_path.stem          # e.g. "sess_pipeline" or "sess.pipeline"
+    session = _strip_pipeline_suffix(stem)
+
+    # ── Config path ───────────────────────────────────────────────────────
+    if len(sys.argv) > argv_index and sys.argv[argv_index]:
         config_path = Path(sys.argv[argv_index]).resolve()
     else:
-        config_path = script_dir / (script_path.stem + ".json")
+        # Prefer canonical underscore form; fall back to dot form (legacy).
+        canonical = script_dir / f"{session}_pipeline.json"
+        legacy    = script_dir / f"{stem}.json"
+        if canonical.exists():
+            config_path = canonical
+        elif legacy.exists():
+            config_path = legacy
+        else:
+            raise FileNotFoundError(
+                f"Pipeline config not found.\n"
+                f"  Looked for : {canonical}\n"
+                f"               {legacy}\n"
+                f"  Session    : {session}\n"
+                f"  Script     : {script_path}\n\n"
+                f"Run new_session.py to create the config:\n"
+                f"  python pipelines/new_session.py \\\n"
+                f"      {session} \\\n"
+                f"      {script_dir}/\n"
+                f"\nOr pass the JSON path explicitly:\n"
+                f"  python {script_path.name} /path/to/config.json"
+            )
 
-    session = script_path.stem.removesuffix(suffix)
     return script_path, config_path, session
+
+
+def _strip_pipeline_suffix(stem: str) -> str:
+    """Remove a trailing pipeline marker from a script stem.
+
+    Recognises ``_pipeline``, ``.pipeline``, ``_Pipeline``, ``.Pipeline``
+    and any other capitalisation.  Returns *stem* unchanged if no marker
+    is found.
+    """
+    import re as _re
+    return _re.sub(r'[._][Pp]ipeline$', '', stem)
 
 
 def _find_script_path() -> Path:
@@ -216,7 +264,8 @@ def setup_logging(
     Parameters
     ----------
     logfile
-        Absolute path to the ``.log`` file.  Parent directory must exist.
+        Absolute path to the ``.log`` file.  Parent directory is created
+        if it does not exist.
     file_level
         Logging level for the file handler (default: ``DEBUG`` — verbose,
         includes internal CaImAn debug messages).
@@ -229,6 +278,7 @@ def setup_logging(
         The configured ``"caiman"`` logger.
     """
     logfile = Path(logfile)
+    logfile.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("caiman")
     logger.setLevel(logging.DEBUG)  # handlers filter independently

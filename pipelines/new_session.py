@@ -242,6 +242,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-comments", action="store_true",
         help="Strip _comment keys from the output JSON")
 
+    p.add_argument("--estimate-params", action="store_true",
+        help="Run parameter estimation from the TIF after creating the session "
+             "files and update the JSON with the suggestions (requires caiman)")
+    p.add_argument("--n-frames", type=int, default=500, metavar="N",
+        help="Frames to subsample for parameter estimation (default 500)")
+
     return p
 
 
@@ -334,6 +340,47 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("Done.")
+
+    # ── Optional parameter estimation ────────────────────────────────────
+    if args.estimate_params:
+        tif_path = dest / f"{session}.tif"
+        if not tif_path.exists():
+            print(f"\n  ⚠  Cannot estimate params: {tif_path.name} not found.")
+            print(f"     Place the TIFF and re-run with --estimate-params.")
+        else:
+            print(f"\nEstimating parameters from {tif_path.name}...")
+            try:
+                import logging as _logging
+                _est_logger = _logging.getLogger("caiman")
+                _est_logger.setLevel(_logging.INFO)
+                if not _est_logger.handlers:
+                    _h = _logging.StreamHandler()
+                    _h.setFormatter(_logging.Formatter("%(message)s"))
+                    _est_logger.addHandler(_h)
+                # Find the MC mmap if it exists, else use the raw TIF
+                import glob as _glob
+                _mc = sorted(_glob.glob(str(
+                    dest / f"*{session}*rig*order_F*.mmap")))
+                _caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
+                _mc_temp = sorted(_glob.glob(
+                    os.path.join(_caiman_temp, f"*{session}*rig*order_F*.mmap")))
+                _mc_path = (_mc or _mc_temp)
+                if _mc_path:
+                    from caiman.utils.params_estimator import estimate_params, apply_suggestions
+                    _suggestions = estimate_params(
+                        _mc_path[-1],
+                        n_frames  = args.n_frames,
+                        out_path  = out_json.parent / f"{session}_qc_00_param_estimate.png",
+                        logger    = _est_logger,
+                    )
+                    apply_suggestions(out_json, _suggestions)
+                    print(f"\n  JSON updated with estimated parameters.")
+                else:
+                    print(f"  No MC mmap found for {session} — run motion correction first,"
+                          f" then re-run with --estimate-params.")
+            except Exception as _exc:
+                print(f"  Parameter estimation failed: {_exc}")
+
     print()
     print("Next steps:")
     print(f"  1. Review and tune:  {out_json.name}")
