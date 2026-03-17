@@ -20,6 +20,7 @@ from caiman.utils.tiff_io import (
 )
 from caiman.utils.param_summary import log_params
 from caiman.utils.pipeline_setup import (
+    resolve_pipeline_path,
     ensure_model_files,
     setup_logging,
     clean_stale_shm,

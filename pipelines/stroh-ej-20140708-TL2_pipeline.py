@@ -17,41 +17,17 @@ See docs/ for full parameter reference and troubleshooting guide.
 """
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
-# Path resolution and env application MUST happen before any caiman import so
-# that CAIMAN_DATA / CAIMAN_TEMP are set before CaImAn touches the filesystem.
+# resolve_pipeline_path must come before any caiman import — pipeline_setup.py
+# uses only the standard library so this single import is safe here.
 import os
 import sys
 import json as _j
-import inspect as _i
 from pathlib import Path
 
+from caiman.utils.pipeline_setup import resolve_pipeline_path
 
-def _resolve_script_path() -> Path:
-    """Return this script's absolute path under all invocation styles."""
-    try:
-        p = Path(__file__).resolve()
-        if p.suffix == ".py" and p.exists():
-            return p
-    except NameError:
-        pass
-    try:
-        frame = _i.currentframe()
-        while frame is not None:
-            p = Path(_i.getfile(frame)).resolve()
-            if p.suffix == ".py":
-                return p
-            frame = frame.f_back
-    except (TypeError, OSError):
-        pass
-    return Path.cwd() / "pipeline.py"
-
-
-_SCRIPT_PATH = _resolve_script_path()
-_SCRIPT_DIR  = _SCRIPT_PATH.parent
-_CONFIG_PATH = (
-    Path(sys.argv[1]).resolve() if len(sys.argv) > 1
-    else _SCRIPT_DIR / (_SCRIPT_PATH.stem + ".json")
-)
+_SCRIPT_PATH, _CONFIG_PATH, session = resolve_pipeline_path()
+_SCRIPT_DIR = _SCRIPT_PATH.parent
 
 # Apply env section before any caiman import
 try:
@@ -114,7 +90,6 @@ _mpr.ForkingPickler.dumps = _dill.dumps
 
 # ── Session identity ──────────────────────────────────────────────────────────
 _P      = load_pipeline_params(_CONFIG_PATH)
-session = _SCRIPT_PATH.stem.removesuffix("_pipeline")
 datsrc  = Path(_P.session.data_root)
 expsrc  = Path(_P.session.experiment)
 outdir  = datsrc / expsrc
