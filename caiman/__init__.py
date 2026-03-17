@@ -31,6 +31,7 @@ from caiman.utils.timing import (
     fmt_elapsed,
     log_call,
 )
+from caiman.utils.params_estimator import estimate_params, apply_suggestions
 from caiman.utils.cnmf_runner import CNMFRunner as CnmfRunner
 from caiman.utils.qc import (
     QCRunner,

@@ -15,6 +15,7 @@ pipeline_setup              resolve_pipeline_path, CNN model bootstrap, logging 
 sbx_utils                   Scanbox file I/O
 stats                       Robust statistics (mode, compressive NMF, …)
 tiff_io                     Fast TIFF I/O for large NVMe-backed stacks
+params_estimator            Data-driven estimation of gSig, min_corr, min_pnr, rf
 cnmf_runner                 CNMFRunner: config-driven CNMF orchestrator
 qc                          QC figure generation (raw, MC, Cn, footprints, evaluation, traces)
 timing                      PipelineTimer context manager, step decorator, log_call, write_report
@@ -45,6 +46,7 @@ from caiman.utils.timing import (
     fmt_elapsed,
     log_call,
 )
+from caiman.utils.params_estimator import estimate_params, apply_suggestions
 from caiman.utils.cnmf_runner import CNMFRunner as CnmfRunner
 from caiman.utils.qc import (
     QCRunner,
@@ -85,6 +87,9 @@ __all__ = [
     "write_report",
     "fmt_elapsed",
     "log_call",
+    # params_estimator
+    "estimate_params",
+    "apply_suggestions",
     # cnmf_runner
     "CnmfRunner",
     # qc
