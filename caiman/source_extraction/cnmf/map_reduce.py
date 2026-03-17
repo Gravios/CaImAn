@@ -166,8 +166,18 @@ def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
         # processes opening the same .mmap file in read-only mode will share
         # the underlying physical pages via the OS page cache.  No explicit
         # shared-memory setup is needed here.
-        Yr, dims, timesteps = load_memmap(file_name)
-        images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
+        # Skip loading Yr when tile_path is set — Yr is not used in that path.
+        _precomp_check = params.get('init', 'precomp') or {}
+        if _precomp_check.get('tile_path') is None:
+            Yr, dims, timesteps = load_memmap(file_name)
+            images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
+        else:
+            Yr = None
+            # dims = FULL movie dims (d1, d2) — idx_ are flat indices into
+            # the full FOV, not the tile. tile_shape[1:] is WRONG here.
+            _pc = params.get('init', 'precomp') or {}
+            dims = (_pc['d1'], _pc['d2'])  # full movie spatial dims
+            timesteps = _pc.get('T') or _pc.get('tile_shape', (1,))[0]
 
     # ── Spatial patch slicing ──────────────────────────────────────────────
     # Slice out the spatial patch for this worker (same logic as before).
@@ -179,11 +189,32 @@ def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
     # insert slice for timesteps, equivalent to :
     slices.insert(0, slice(timesteps))
 
-    if not isinstance(file_name, ShmHandle):
+    # Check for tile dispatcher coordinates.
+    # Worker mmaps the /dev/shm tile file and copies its own slice.
+    # No pickle of large arrays — only small coordinate tuples are sent.
+    _precomp_inner = params.get('init', 'precomp') or {}
+    _tile_path  = _precomp_inner.get('tile_path')
+    _tile_shape = _precomp_inner.get('tile_shape')
+    _tile_lx    = _precomp_inner.get('tile_lx')
+    _tile_ly    = _precomp_inner.get('tile_ly')
+    if _tile_path is not None and _tile_shape is not None:
+        # Mmap tile from /dev/shm then copy slice as (d1p, d2p, T) F-order.
+        # This layout makes Y=transpose(images,[1,2,0]) F-contiguous so that
+        # Y.reshape(-1,T,order='F') and the subsequent Yr are zero-copy views.
+        _tile_mm = np.memmap(_tile_path, dtype=np.float32, mode='r',
+                             shape=_tile_shape, order='F')
+        lx0, lx1 = _tile_lx
+        ly0, ly1 = _tile_ly
+        # asfortranarray of the transposed slice → (d1p, d2p, T) F-contiguous
+        _images_f = np.asfortranarray(
+            _tile_mm[:, lx0:lx1, ly0:ly1].transpose(1, 2, 0), dtype=np.float32)
+        del _tile_mm
+        # Wrap as (T, d1p, d2p) view for fit() — Y=transpose([1,2,0]) recovers
+        # _images_f which IS F-contiguous → Y_ds_flat is a zero-copy view.
+        images = _images_f.transpose(2, 0, 1)
+    elif not isinstance(file_name, ShmHandle):
         images = np.reshape(Yr.T, [timesteps] + list(dims), order='F')
-
-    if params.get('patch', 'in_memory'):
-        images = np.array(images[tuple(slices)], dtype=np.float32)
+        images = np.asfortranarray(images[tuple(slices)], dtype=np.float32)
     else:
         images = images[tuple(slices)]
 
@@ -200,14 +231,373 @@ def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
 
         cnm = CNMF(n_processes=1, params=opts)
 
+        logger.warning(f"[patch {idx_[0]}] starting fit")
         cnm.fit(images)
-        return [idx_, shapes, scipy.sparse.coo_matrix(cnm.estimates.A),
-                cnm.estimates.b, cnm.estimates.C, cnm.estimates.f,
-                cnm.estimates.S, cnm.estimates.bl, cnm.estimates.c1,
-                cnm.estimates.neurons_sn, cnm.estimates.g, cnm.estimates.sn,
-                cnm.params.to_dict(), cnm.estimates.YrA]
+        _n_neurons = (cnm.estimates.A.shape[1]
+                      if cnm.estimates.A is not None else 0)
+        logger.warning(
+            f"[patch {idx_[0]}] done — {_n_neurons} neurons"
+        )
+        # Extract result arrays BEFORE deleting cnm to avoid an extra copy.
+        _result = [idx_, shapes, scipy.sparse.coo_matrix(cnm.estimates.A),
+                   cnm.estimates.b, cnm.estimates.C, cnm.estimates.f,
+                   cnm.estimates.S, cnm.estimates.bl, cnm.estimates.c1,
+                   cnm.estimates.neurons_sn, cnm.estimates.g, cnm.estimates.sn,
+                   cnm.params.to_dict(), cnm.estimates.YrA]
+        # Explicitly free all large intermediate arrays so the worker's
+        # RSS drops back before the next patch is assigned.
+        # Python's allocator keeps freed blocks in its arenas by default;
+        # malloc_trim(0) returns them to the OS immediately.
+        del cnm, images
+        try: del _images_f
+        except NameError: pass
+        try: del Yr
+        except NameError: pass
+        import gc as _gc; _gc.collect()
+        try:
+            import ctypes as _ct
+            _ct.cdll.LoadLibrary("libc.so.6").malloc_trim(0)
+        except Exception: pass
+        from caiman.cluster import flush_worker_log
+        flush_worker_log()
+        return _result
     else:
         return None
+
+
+def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
+                   forder_movie_path=None):
+    """Tile-based I/O dispatcher with rolling 2-tile prefetch.
+
+    Two SHM slots (A/B) are used in rotation. While workers process patches
+    from slot A, the dispatcher loads the next tile into slot B in a background
+    thread. When a worker finishes a patch it immediately picks up the next
+    available one — no intra-tile or inter-tile idle time.
+    """
+    import copy as _copy
+    import numpy as _np_td
+    import threading as _thr
+    import os as _os_td
+
+    d1, d2 = dims
+    _shm_dir = _os_td.environ.get('CAIMAN_SHM', '/dev/shm')
+
+    # ── Build patch spatial bounding boxes ──────────────────────────────────
+    patch_boxes = []
+    for _, id_f, id_2d, p in args_in:
+        _rows = id_f % d1
+        _cols = id_f // d1
+        x0, x1 = int(_rows.min()), int(_rows.max()) + 1
+        y0, y1 = int(_cols.min()), int(_cols.max()) + 1
+        patch_boxes.append((x0, x1, y0, y1))
+
+    xs = sorted(set(b[0] for b in patch_boxes))
+    ys = sorted(set(b[2] for b in patch_boxes))
+    stride_x = (xs[1] - xs[0]) if len(xs) > 1 else (patch_boxes[0][1] - patch_boxes[0][0])
+    stride_y = (ys[1] - ys[0]) if len(ys) > 1 else (patch_boxes[0][3] - patch_boxes[0][2])
+    tile_n   = 3
+    tile_dx  = tile_n * stride_x
+    tile_dy  = tile_n * stride_y
+
+    tile_map = {}
+    for i, (x0, x1, y0, y1) in enumerate(patch_boxes):
+        tile_id = (x0 // tile_dx, y0 // tile_dy)
+        tile_map.setdefault(tile_id, []).append(i)
+
+    sorted_tiles = sorted(tile_map.items())  # raster order
+    logger.info(
+        f'TileDispatcher: {len(sorted_tiles)} tiles of ~{tile_n}×{tile_n} patches, '
+        f'tile_dx={tile_dx} tile_dy={tile_dy}')
+
+    # ── Open movie mmap ──────────────────────────────────────────────────────
+    _use_forder = (forder_movie_path is not None
+                   and _os_td.path.exists(forder_movie_path))
+    if _use_forder:
+        _movie_f = _np_td.memmap(forder_movie_path, dtype=_np_td.float32,
+                                  mode='r', shape=(d1, d2, T), order='F')
+        _Yr = None
+    else:
+        from caiman.mmapping import load_memmap as _load_mmap
+        _Yr, _, _ = _load_mmap(file_name, mode='r')
+        _movie_f = None
+
+    _filt_full = None
+    if _precomp_result is not None:
+        _fp = _precomp_result.get('filtered_path')
+        _fd1 = _precomp_result.get('d1', d1)
+        _fd2 = _precomp_result.get('d2', d2)
+        _fdtype = _precomp_result.get('filt_dtype', 'float32')
+        if _fp and _os_td.path.exists(_fp):
+            _filt_full = _np_td.memmap(
+                _fp, dtype=_fdtype, mode='r',
+                shape=(_fd1, _fd2, T), order='F')
+
+    # ── Two SHM slot paths ───────────────────────────────────────────────────
+    _n_slots = int(_os_td.environ.get('CAIMAN_TILE_SLOTS', '2'))
+    _slot_paths = {
+        0: (_os_td.path.join(_shm_dir, '_caiman_tile_A.mmap'),
+            _os_td.path.join(_shm_dir, '_caiman_filt_A.mmap')),
+        1: (_os_td.path.join(_shm_dir, '_caiman_tile_B.mmap'),
+            _os_td.path.join(_shm_dir, '_caiman_filt_B.mmap')),
+        2: (_os_td.path.join(_shm_dir, '_caiman_tile_C.mmap'),
+            _os_td.path.join(_shm_dir, '_caiman_filt_C.mmap')),
+    }
+    _slot_paths = {k: v for k, v in _slot_paths.items() if k < _n_slots}
+
+    def _write_tile(tile_id, patch_indices, slot):
+        """Load one tile from FUSE into SHM slot. Returns tile metadata."""
+        tile_xs = [patch_boxes[i][0] for i in patch_indices]
+        tile_xe = [patch_boxes[i][1] for i in patch_indices]
+        tile_ys = [patch_boxes[i][2] for i in patch_indices]
+        tile_ye = [patch_boxes[i][3] for i in patch_indices]
+        tx0, tx1 = min(tile_xs), max(tile_xe)
+        ty0, ty1 = min(tile_ys), max(tile_ye)
+
+        tile_path, filt_path = _slot_paths[slot]
+        tile_shape = (T, tx1-tx0, ty1-ty0)
+
+        tm = _np_td.memmap(tile_path, dtype=_np_td.float32,
+                           mode='w+', shape=tile_shape, order='F')
+        if _use_forder:
+            tm[:] = _np_td.transpose(
+                _np_td.asarray(_movie_f[tx0:tx1, ty0:ty1, :], dtype=_np_td.float32),
+                (2, 0, 1))
+        else:
+            _px_idx = _np_td.array(
+                [(x * d2 + y) for x in range(tx0, tx1) for y in range(ty0, ty1)],
+                dtype=_np_td.int64)
+            tm[:] = _Yr[_px_idx, :].reshape(tx1-tx0, ty1-ty0, T).transpose(2, 0, 1)
+        tm.flush(); del tm
+        # Drop movie pages from kernel page cache after each tile read.
+        # Without this, FUSE pages accumulate to 40+ GB of Cached RAM,
+        # crowding out worker SHM pages → workers go D-state.
+        _FADV_DONTNEED = 4
+        try:
+            import os as _os_fv
+            if _use_forder:
+                _os_fv.posix_fadvise(_movie_f._mmap.fileno(), 0, 0, _FADV_DONTNEED)
+            elif _Yr is not None and hasattr(_Yr, '_mmap'):
+                _os_fv.posix_fadvise(_Yr._mmap.fileno(), 0, 0, _FADV_DONTNEED)
+        except (AttributeError, OSError): pass
+
+        filt_shape = None
+        if _filt_full is not None:
+            filt_shape = (tx1-tx0, ty1-ty0, T)
+            fm = _np_td.memmap(filt_path, dtype=_np_td.float16,
+                               mode='w+', shape=filt_shape, order='F')
+            fm[:] = _filt_full[tx0:tx1, ty0:ty1, :]
+            fm.flush(); del fm
+            try:
+                _os_fv.posix_fadvise(
+                    _filt_full._mmap.fileno(), 0, 0, _FADV_DONTNEED)
+            except (AttributeError, OSError, NameError): pass
+
+        mb = int(_np_td.prod(tile_shape) * 4 // 2**20)
+        try:
+            import shutil as _sh_tl
+            _du_tl = _sh_tl.disk_usage('/dev/shm')
+            logger.info(
+                f'TileDispatcher: tile {tile_id} ({tx0}:{tx1},{ty0}:{ty1}) '
+                f'→ {len(patch_indices)} patches, {mb} MB written to SHM slot {slot} '
+                f'| SHM {_du_tl.used/2**30:.2f}/{_du_tl.total/2**30:.1f}GB '
+                f'free={_du_tl.free/2**30:.2f}GB')
+        except Exception:
+            logger.info(
+                f'TileDispatcher: tile {tile_id} ({tx0}:{tx1},{ty0}:{ty1}) '
+                f'→ {len(patch_indices)} patches, {mb} MB written to SHM slot {slot}')
+        return tile_path, filt_path, tile_shape, filt_shape, (tx0, tx1, ty0, ty1)
+
+    def _build_patch_args(patch_indices, tile_path, filt_path,
+                          tile_shape, filt_shape, tile_extents):
+        tx0, tx1, ty0, ty1 = tile_extents
+        patch_args = []
+        for i in patch_indices:
+            fn, id_f, id_2d, p = args_in[i]
+            x0, x1, y0, y1 = patch_boxes[i]
+            lx0, lx1 = x0 - tx0, x1 - tx0
+            ly0, ly1 = y0 - ty0, y1 - ty0
+            _p = _copy.copy(p)
+            _pc = dict(_p.init.get('precomp') or {})
+            _pc['tile_path']  = tile_path
+            _pc['tile_shape'] = tile_shape
+            _pc['tile_lx']    = (lx0, lx1)
+            _pc['tile_ly']    = (ly0, ly1)
+            if filt_path and filt_shape:
+                _pc['filt_tile_path']  = filt_path
+                _pc['filt_tile_shape'] = filt_shape
+                _pc['filt_tile_lx']    = (lx0, lx1)
+                _pc['filt_tile_ly']    = (ly0, ly1)
+            _p.init['precomp'] = _pc
+            patch_args.append((fn, id_f, id_2d, _p))
+        return patch_args
+
+    # ── Callback-driven streaming dispatch ─────────────────────────────────
+    # apply_async(callback=) fires in the pool's result-handler thread the
+    # instant a worker result arrives. The callback decrements the slot count
+    # and — if the slot is now free — immediately submits the next tile's
+    # patches. Workers never see an empty queue as long as tiles remain.
+    # The main thread only waits on a completion Event, never polls.
+    _lock        = _thr.Lock()
+    _done_event  = _thr.Event()
+    _errors      = []
+    file_res     = []
+    total        = sum(len(v) for _, v in sorted_tiles)
+
+    n             = len(sorted_tiles)
+    _slot_meta    = [None] * _n_slots
+    _slot_err     = [None] * _n_slots
+    _slot_count   = [0]    * _n_slots
+    _next_load    = [0]     # next tile index to load into SHM
+    _next_submit  = [0]     # next tile index to submit to pool
+    _load_threads = {}      # k_tile → Thread
+
+    def _load_slot(k_tile, slot):
+        tid, pidx = sorted_tiles[k_tile]
+        try:
+            _slot_meta[slot] = _write_tile(tid, pidx, slot)
+        except Exception as e:
+            _slot_err[slot] = e
+
+    def _try_submit(slot):
+        """Submit the next pending tile into `slot` if it is ready. Must hold _lock."""
+        k = _next_submit[0]
+        if k >= n:
+            return
+        if _slot_meta[slot] is None:
+            return   # load not finished yet
+        if _slot_err[slot] is not None:
+            _errors.append(RuntimeError(f"tile load failed: {_slot_err[slot]}"))
+            _done_event.set()
+            return
+        _, pidx = sorted_tiles[k]
+        patch_args = _build_patch_args(pidx, *_slot_meta[slot])
+        _slot_count[slot] = len(patch_args)
+        _next_submit[0] += 1
+        _slot_meta[slot] = None   # mark slot as in-use
+        logger.info(f'TileDispatcher: submitted {len(patch_args)} patches '                    f'from tile {sorted_tiles[k][0]} slot {slot}')
+        for pa in patch_args:
+            pool.apply_async(cnmf_patches, (pa,),
+                             callback=lambda r, s=slot: _on_result(r, s),
+                             error_callback=lambda e, s=slot: _on_error(e, s))
+
+    def _on_result(result, slot):
+        """Fires in pool result-handler thread when a worker completes."""
+        try:
+            _start_load_thread = None
+            with _lock:
+                file_res.append(result)
+                _slot_count[slot] -= 1
+                _n_done = len(file_res)
+                if _slot_count[slot] == 0:
+                    # Slot freed — start loading next tile into it.
+                    # All state reads/writes under _lock to prevent two
+                    # simultaneous callbacks both seeing count==0.
+                    nk = _next_load[0]
+                    if nk < n:
+                        _next_load[0] += 1
+                        t = _thr.Thread(target=_load_and_submit,
+                                        args=(nk, slot), daemon=True)
+                        _load_threads[nk] = t
+                        _start_load_thread = t   # start after releasing lock
+                    elif _next_submit[0] >= n and len(file_res) >= total:
+                        _done_event.set()
+                if len(file_res) >= total:
+                    _done_event.set()
+            if _start_load_thread is not None:
+                _start_load_thread.start()
+            try:
+                import shutil as _sh_cb
+                _du_cb = _sh_cb.disk_usage('/dev/shm')
+                logger.info(
+                    f'TileDispatcher: result {len(file_res)}/{total} '
+                    f'SHM={_du_cb.used/2**30:.2f}GB free={_du_cb.free/2**30:.2f}GB')
+            except Exception: pass
+        except Exception as _cb_exc:
+            logger.error(f"TileDispatcher: _on_result callback failed: {_cb_exc}")
+            with _lock:
+                _errors.append(_cb_exc)
+                _done_event.set()
+
+    def _on_error(exc, slot):
+        try:
+            with _lock:
+                _errors.append(exc)
+                _done_event.set()
+        except Exception as _cb_exc2:
+            logger.error(f"TileDispatcher: _on_error callback failed: {_cb_exc2}")
+            _done_event.set()
+
+    def _load_and_submit(k_tile, slot):
+        """Background: load tile k_tile into slot, then submit immediately."""
+        _load_slot(k_tile, slot)
+        with _lock:
+            if _slot_err[slot] is not None:
+                _errors.append(RuntimeError(f"tile load failed: {_slot_err[slot]}"))
+                _done_event.set()
+                return
+            _try_submit(slot)
+
+    # ── Clean stale tile files from previous runs ────────────────────────────
+    for _s_idx in range(_n_slots):
+        for _stale_f in _slot_paths[_s_idx]:
+            try:
+                if _os_td.path.exists(_stale_f): _os_td.unlink(_stale_f)
+            except OSError: pass
+
+    # ── Bootstrap: load first 2 tiles, submit first 2 ──────────────────────
+    # Set _next_load BEFORE starting background thread to avoid race where
+    # _on_result fires before main increments _next_load and tries to reload
+    # tile 1 a second time.
+    _load_slot(0, 0)
+    with _lock:
+        _next_load[0] = 1         # set under lock before bg thread can read it
+        _try_submit(0)
+        for _s in range(1, _n_slots):
+            if n > _s:
+                _next_load[0] = _s + 1
+                _bgt = _thr.Thread(target=_load_and_submit, args=(_s, _s), daemon=True)
+                _load_threads[_s] = _bgt
+                _bgt.start()
+
+    # Guard: if no patches at all, unblock immediately
+    if total == 0:
+        _done_event.set()
+
+    # Main thread waits — workers run freely, callbacks drive all submissions.
+    # Watchdog: if a worker is OOM-killed its result never arrives and
+    # _done_event never fires. Poll every 60s and check pool worker pids.
+    import os as _os_wd
+    _timeout_s = 120   # seconds between liveness checks
+    while not _done_event.wait(timeout=_timeout_s):
+        # Check whether any pool workers have died unexpectedly
+        try:
+            _alive = []
+            for _w in pool._pool:
+                try:
+                    _os_wd.kill(_w.pid, 0)  # signal 0 = liveness check
+                    _alive.append(_w.pid)
+                except (ProcessLookupError, PermissionError):
+                    pass  # process gone
+            _n_expected = pool._processes
+            if len(_alive) < _n_expected and len(file_res) < total:
+                _dead = _n_expected - len(_alive)
+                _msg = (f"TileDispatcher watchdog: {_dead} of {_n_expected} "
+                        f"workers died (OOM-kill?). Aborting.")
+                logger.error(_msg)
+                with _lock:
+                    _errors.append(RuntimeError(_msg))
+                    _done_event.set()
+        except Exception as _wd_exc:
+            logger.warning(f"TileDispatcher watchdog check failed: {_wd_exc}")
+    if _errors:
+        raise _errors[0]
+
+    if _Yr is not None: del _Yr
+    if _movie_f is not None: del _movie_f
+    if _filt_full is not None: del _filt_full
+
+    return file_res
+
 
 def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                      memory_fact=1, border_pix=0, low_rank_background=True,
@@ -320,7 +710,10 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
     _shm_buf = None
     file_name_or_handle = file_name   # default: pass path string to workers
 
-    use_shm_for_cnmf = (dview is not None and isinstance(file_name, str))
+    # SHM causes OOM: 8 workers × 27 GB SHM mapped = 232 GB apparent RSS.
+    # Linux OOM killer counts POSIX SHM in every process that maps it.
+    # Use warm file-backed page cache instead — same DRAM speed, no OOM.
+    use_shm_for_cnmf = False
     if use_shm_for_cnmf:
         # Guard: only copy the movie into SHM if there is enough headroom in
         # both RAM and /dev/shm AFTER accounting for:
@@ -384,7 +777,60 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
     if (_method_init == 'corr_pnr'
             and isinstance(file_name, str)):
         # Reuse cached precomp from a previous fit() if available.
+        # Pre-populate from persistent file on disk if in-memory cache is absent.
         _cached_precomp = params.get('init', 'precomp_cache')
+        if _cached_precomp is None or not os.path.exists(
+                _cached_precomp.get('filtered_path', '')):
+            # Derive persistent filename from movie path
+            import re as _re_mb
+            _mb = os.path.splitext(os.path.basename(file_name))[0]
+            _mb = _re_mb.sub(r'[_-]d1_\d+.*$', '', _mb)
+            _mb = _re_mb.sub(r'[_-](cnmf|raw_mp|rig).*$', '', _mb)
+            from caiman.paths import get_tempdir as _get_td
+            _fname_filt = (f"{_mb}_precomp_filt"
+                           f"_d1_{dims[0]}_d2_{dims[1]}_d3_1"
+                           f"_order_F_frames_{T}_f16.mmap")
+            # Check /dev/shm first (written there when CAIMAN_SHM is set)
+            _shm_dir = os.environ.get('CAIMAN_SHM', '')
+            _pers_path = None
+            for _td in [_shm_dir, _get_td()]:
+                if _td and os.path.isdir(_td):
+                    _cand = os.path.join(_td, _fname_filt)
+                    if os.path.exists(_cand):
+                        _pers_path = _cand
+                        break
+            if _pers_path is None:
+                _pers_path = os.path.join(_get_td(), _fname_filt)  # fallback
+            if os.path.exists(_pers_path):
+                logger.info(
+                    f'run_CNMF_patches: reusing persistent precomp '
+                    f'({_pers_path})')
+                # filt_full kept on NVMe (CAIMAN_TEMP) — not copied to /dev/shm.
+                # Copying 14.5 GB to tmpfs adds swappable pressure that fills
+                # the 27 GB swap partition. posix_fadvise(DONTNEED) after each
+                # tile read keeps FUSE page cache clean instead.
+                _cached_precomp = {'filtered_path': _pers_path,
+                                   'filt_dtype':    'float16',
+                                   'd1': dims[0], 'd2': dims[1], 'T': T,
+                                   'filt_order': 'C'}
+                # Load companion arrays (sn_full, pnr_full etc.) so
+                # workers skip NaN scan and noise FFT.
+                _npz_path = os.path.splitext(_pers_path)[0] + '_meta.npz'
+                if os.path.exists(_npz_path):
+                    try:
+                        import numpy as _np_npz
+                        _npz = _np_npz.load(_npz_path, allow_pickle=False)
+                        _cached_precomp['sn_full']       = _npz['sn_full']
+                        _cached_precomp['data_max_full'] = _npz['data_max_full']
+                        _cached_precomp['cn_full']  = (
+                            _npz['cn_full'] if _npz['cn_full'].size > 0
+                            else None)
+                        _cached_precomp['pnr_full']      = _npz['pnr_full']
+                        logger.info(
+                            'run_CNMF_patches: loaded companion sn/Cn/PNR arrays')
+                    except Exception as _npz_exc:
+                        logger.debug(f'companion npz load failed: {_npz_exc}')
+                params.init['precomp_cache'] = _cached_precomp
         if (_cached_precomp is not None
                 and _cached_precomp.get('filtered_path')
                 and os.path.exists(_cached_precomp['filtered_path'])):
@@ -416,6 +862,9 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     f"workers will filter per-patch")
                 _precomp_result = None
 
+    # Tile dispatcher reads data per-tile on demand.
+    # No full C-order warm — that wastes 27 GB of RAM that workers need.
+
     # ── SHM copy: AFTER precompute so filt_full pages are already evicted ──
     # At this point: movie is in page cache (warm), filt_full is evicted.
     # Copying movie → SHM just relabels cache pages → net zero new RAM.
@@ -424,7 +873,11 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
         try:
             logger.info("run_CNMF_patches: loading movie into shared memory …")
             from caiman.shared_memory_utils import SharedMovieBuffer
-            _shm_buf = SharedMovieBuffer(file_name, order='C')
+            # Pass F-order mmap path so streaming uses contiguous frame reads
+            # (~14 GB/s) instead of scattered C-order reads (~700 MB/s).
+            _forder_path = params.init.get('forder_movie_path')
+            _shm_src = _forder_path if _forder_path else file_name
+            _shm_buf = SharedMovieBuffer(_shm_src, order='C')
             file_name_or_handle = _shm_buf.worker_handle()
             logger.info(
                 f"run_CNMF_patches: movie in SHM '{file_name_or_handle.name}'"
@@ -454,8 +907,12 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             # Slice precomputed sn and data_max to patch extent
             # sn_full/data_max_full/cn_full/pnr_full are (d1, d2) = (rows, cols)
             # _x0:_x1 = row range (dim0), _y0:_y1 = col range (dim1)
-            _patch_precomp['sn']       = _precomp_result['sn_full'][_x0:_x1, _y0:_y1]
-            _patch_precomp['data_max'] = _precomp_result['data_max_full'][_x0:_x1, _y0:_y1]
+            # sn_full/data_max_full may be absent if precomp was loaded from
+            # a persistent file without a companion npz (old run or npz missing).
+            if _precomp_result.get('sn_full') is not None:
+                _patch_precomp['sn'] = _precomp_result['sn_full'][_x0:_x1, _y0:_y1]
+            if _precomp_result.get('data_max_full') is not None:
+                _patch_precomp['data_max'] = _precomp_result['data_max_full'][_x0:_x1, _y0:_y1]
             if _precomp_result.get('cn_full') is not None:
                 _patch_precomp['cn']  = _precomp_result['cn_full'][_x0:_x1, _y0:_y1]
                 _patch_precomp['pnr'] = _precomp_result['pnr_full'][_x0:_x1, _y0:_y1]
@@ -543,16 +1000,20 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             _overhead_frac = float(params.get("patch", "worker_overhead_frac") or 1.6)
             _worker_bytes = int(_analytical * _overhead_frac)
             _vm             = _psu.virtual_memory()
-            # Budget: fraction of RAM that is genuinely free for workers.
-            # cnmf.fit() releases the parent images and Yr mmaps before
-            # calling run_CNMF_patches so the 27 GB movie is no longer
-            # pinned by the parent.  Workers open the file independently
-            # and share its pages via the OS page cache.
-            # We no longer subtract movie_bytes from the budget — the
-            # pages are reclaimable once the parent fd is closed.
-            _movie_bytes = 0
-            _ram_frac    = float(params.get("patch", "ram_budget_frac") or 0.75)
-            _budget      = max(0, _vm.available - _movie_bytes) * _ram_frac
+            # Budget: tile dispatcher reads movie one tile at a time.
+            # Workers never map the full movie — only the dispatcher holds
+            # one tile (tile_d² × T × 4 bytes) + filt tile at a time.
+            # Reserve dispatcher overhead + filt_full SHM + parent_rss.
+            _tile_d        = 3 * int(params.get("patch", "stride") or 18) + \
+                             2 * int(params.get("patch", "rf") or 36) + 1
+            _tile_bytes    = int(_tile_d * _tile_d * T * 4)       # images tile
+            _filt_tile_b   = int(_tile_d * _tile_d * T * 2)       # filt tile f16
+            _filt_full_b   = int(d * T * np.dtype(np.float16).itemsize)  # filt_full SHM
+            _movie_bytes   = _tile_bytes + _filt_tile_b + _filt_full_b
+            _ram_frac      = float(params.get("patch", "ram_budget_frac") or 0.75)
+            _parent_rss    = _psu.Process(_os.getpid()).memory_info().rss
+            _budget        = max(0, (_vm.total - _movie_bytes - _parent_rss)
+                                  * _ram_frac)
             _safe_workers   = max(1, int(_budget // _worker_bytes))
             _actual_workers = dview._processes
             logger.info(
@@ -566,6 +1027,17 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 f"budget={_budget/2**30:.1f} GB  "
                 f"→ {_safe_workers} workers (requested {_actual_workers})"
             )
+            # Warn if /dev/shm is too full for workers
+            try:
+                import shutil as _shu
+                _shm_stat = _shu.disk_usage('/dev/shm')
+                _shm_pct  = _shm_stat.used / _shm_stat.total * 100
+                if _shm_pct > 70:
+                    logger.warning(
+                        f"/dev/shm {_shm_stat.used/2**30:.1f}/{_shm_stat.total/2**30:.1f} GB "
+                        f"({_shm_pct:.0f}% used) — worker SHM files may cause SIGBUS. "
+                        f"Run: rm -f /dev/shm/tmp*.mmap /dev/shm/_caiman_*.mmap")
+            except Exception: pass
             if _safe_workers < _actual_workers:
                 logger.warning(
                     f"run_CNMF_patches: capping workers {_actual_workers} → "
@@ -605,7 +1077,7 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 dview.join()
                 logger.info(
                     f'run_CNMF_patches: spawning dedicated pool '
-                    f'({n_proc} workers, maxtasksperchild=1)'
+                    f'({n_proc} workers)'
                 )
                 # spawn context: workers start fresh with no inherited
                 # CUDA state — eliminates cudaErrorInitializationError
@@ -618,15 +1090,14 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 _spawn_ctx = multiprocessing.get_context('spawn')
                 with _spawn_ctx.Pool(
                     processes       = n_proc,
-                    maxtasksperchild= 1,
+                    maxtasksperchild= None,  # workers persist across tiles
                     initializer     = _worker_logging_init,
                     initargs        = (_lp,),
                 ) as _patch_pool:
-                    file_res = list(
-                        _patch_pool.imap_unordered(
-                            cnmf_patches, args_in, chunksize=1
-                        )
-                    )
+                    file_res = _tile_dispatch(
+                        _patch_pool, args_in, file_name,
+                        dims, T, _precomp_result, logger,
+                        forder_movie_path=params.init.get('forder_movie_path'))
             else:
                 try:
                     file_res = dview.map_sync(cnmf_patches, args_in)
@@ -641,6 +1112,30 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             # pool before precompute to save RAM.  Spawn a fresh dedicated
             # pool using n_processes from params rather than running serially.
             _n_proc_fallback = params.get('patch', 'n_processes') or 1
+            # Apply same movie-cache budget cap as the dview path.
+            try:
+                import psutil as _psu_fb
+                _vm_fb = _psu_fb.virtual_memory()
+                # Same tile-aware budget as the dview path above
+                _stride_fb = int(params.get('patch', 'stride') or 18)
+                _rf_fb     = int(params.get('patch', 'rf') or 36)
+                _td_fb     = 3 * _stride_fb + 2 * _rf_fb + 1
+                _movie_fb  = int(_td_fb*_td_fb*T*4 + _td_fb*_td_fb*T*2 + d*T*2)
+                import os as _os_fb2
+                _parent_fb = _psu_fb.Process(_os_fb2.getpid()).memory_info().rss
+                _per_worker_fb = int(2.5 * 2**30)  # analytical estimate at tsub=2
+                _ram_frac_fb = float(params.get('patch', 'ram_budget_frac') or 0.75)
+                _budget_fb = max(0, (_vm_fb.total - _movie_fb - _parent_fb)
+                                   * _ram_frac_fb)
+                _safe_fb = max(1, int(_budget_fb // _per_worker_fb))
+                if _safe_fb < _n_proc_fallback:
+                    logger.warning(
+                        f'run_CNMF_patches: capping workers '
+                        f'{_n_proc_fallback} → {_safe_fb} '
+                        f'(movie cache reservation)')
+                    _n_proc_fallback = _safe_fb
+            except Exception:
+                pass
             if _n_proc_fallback > 1:
                 logger.info(
                     f'run_CNMF_patches: spawning dedicated pool '
@@ -651,15 +1146,14 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 _spawn_ctx = multiprocessing.get_context('spawn')
                 with _spawn_ctx.Pool(
                     processes       = _n_proc_fallback,
-                    maxtasksperchild= 1,
+                    maxtasksperchild= None,  # workers persist across tiles
                     initializer     = _worker_logging_init,
                     initargs        = (_lp,),
                 ) as _patch_pool:
-                    file_res = list(
-                        _patch_pool.imap_unordered(
-                            cnmf_patches, args_in, chunksize=1
-                        )
-                    )
+                    file_res = _tile_dispatch(
+                        _patch_pool, args_in, file_name,
+                        dims, T, _precomp_result, logger,
+                        forder_movie_path=params.init.get('forder_movie_path'))
             else:
                 file_res = list(map(cnmf_patches, args_in))
     finally:

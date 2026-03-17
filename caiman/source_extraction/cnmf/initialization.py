@@ -1212,6 +1212,19 @@ def hals(Y, A, C, b, f, bSiz=3, maxIter=5):
 
 
 @profile
+def _worker_mlog(logger, label):
+    """Compact memory checkpoint: RSS + /dev/shm usage at each phase."""
+    try:
+        import os as _os_wml, shutil as _sh_wml, psutil as _psu_wml
+        _rss  = _psu_wml.Process(_os_wml.getpid()).memory_info().rss / 2**30
+        _du   = _sh_wml.disk_usage('/dev/shm')
+        logger.warning(
+            f'[pid {_os_wml.getpid()}] {label} '
+            f'RSS={_rss:.2f}GB SHM={_du.used/2**30:.2f}GB free={_du.free/2**30:.2f}GB')
+    except Exception:
+        pass
+
+
 def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=True,
                    min_corr=None, min_pnr=None, seed_method='auto',
                    min_pixel=3, bd=0, thresh_init=2, ring_size_factor=None, nb=1, options=None,
@@ -1285,18 +1298,24 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
     _B_tmpfiles = []   # collect all temp mmap paths for cleanup in finally block
 
     def _make_B_mmap(Y_flat, A_in, C_in):
-        """Helper: write Y_flat - A_in.dot(C_in) to a new temp F-order mmap."""
-        _fd, _fname = tempfile.mkstemp(suffix='_groi_B.mmap')
-        os.close(_fd)
-        _B_tmpfiles.append(_fname)
-        return _write_residual_mmap(Y_flat, A_in, C_in, _fname, chunk_t=_chunk_t)
+        """Helper: compute Y_flat - A_in.dot(C_in) as an anonymous array.
+        Process-local — no /dev/shm consumed.
+        """
+        _px, _T = Y_flat.shape[0], Y_flat.shape[1]
+        B = np.empty((_px, _T), dtype=np.float32, order='F')
+        for _t0 in range(0, _T, _chunk_t):
+            _t1 = min(_t0 + _chunk_t, _T)
+            B[:, _t0:_t1] = (np.array(Y_flat[:, _t0:_t1], dtype=np.float32)
+                             - A_in.dot(C_in[:, _t0:_t1]))
+        return B
 
     def _add_Y_inplace_chunked(B_mmap, Y_flat):
         """B_mmap[:, :] += Y_flat  in time chunks to avoid loading full Y."""
         for _t0 in range(0, B_mmap.shape[1], _chunk_t):
             _t1 = min(_t0 + _chunk_t, B_mmap.shape[1])
             B_mmap[:, _t0:_t1] += np.array(Y_flat[:, _t0:_t1], dtype=np.float32)
-        B_mmap.flush()
+        if hasattr(B_mmap, 'flush'):
+            B_mmap.flush()
 
     try:
         import psutil as _psutil
@@ -1310,21 +1329,18 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
             # Y_ds is not F-contiguous — reshape forced a 14 GB copy.
             # Write it to a temp F-order mmap, then drop the dense copy.
             logger.info('[mem] Y_ds_flat is a COPY — writing to mmap and freeing source')
-            _fd, _ydsf_fname = tempfile.mkstemp(suffix='_groi_Ydsflat.mmap')
-            os.close(_fd)
-            _B_tmpfiles.append(_ydsf_fname)
-            _Y_ds_mmap = np.memmap(_ydsf_fname, dtype=np.float32, mode='w+',
-                                   shape=(d1 * d2, total_frames), order='F')
+            # Process-local — anonymous array, no /dev/shm.
+            _Y_ds_anon = np.empty((d1 * d2, total_frames), dtype=np.float32, order='F')
             for _t0 in range(0, total_frames, _chunk_t):
                 _t1 = min(_t0 + _chunk_t, total_frames)
-                _Y_ds_mmap[:, _t0:_t1] = Y_ds_flat[:, _t0:_t1].astype(np.float32)
-            _Y_ds_mmap.flush()
-            del Y_ds_flat   # drop the 14 GB in-memory copy
-            Y_ds_flat = _Y_ds_mmap
+                _Y_ds_anon[:, _t0:_t1] = Y_ds_flat[:, _t0:_t1].astype(np.float32)
+            del Y_ds_flat
+            Y_ds_flat = _Y_ds_anon
         else:
             logger.info('[mem] Y_ds_flat is a zero-copy view of Y_ds')
 
         logger.info(f'[mem] after Y_ds_flat: {_rss_gb():.1f} GB RSS')
+        _worker_mlog(logger, 'B alloc start')
         B = _make_B_mmap(Y_ds_flat, A, C)
         logger.info(f'[mem] after first B mmap written: {_rss_gb():.1f} GB RSS')
 
@@ -1334,6 +1350,7 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
             # chunk_t triggers the low-memory mmap path inside compute_W
             W, b0 = compute_W(Y_ds_flat, A, C, (d1, d2), ring_size_factor * gSiz,
                                ssub=ssub_B, chunk_t=_chunk_t)
+            logger.warning(f'[pid {__import__("os").getpid()}] compute_W done')
             logger.info(f'[mem] after compute_W: {_rss_gb():.1f} GB RSS')
 
             # compute_B equivalent — applied in-place on B mmap in time chunks
@@ -1425,15 +1442,12 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
             if nb > 0 or nb == -1:
                 # Snapshot background as +B0 into a separate temp mmap so we
                 # can hand it to NMF later without keeping both B and B0 live.
-                _b0fd, _b0_fname = tempfile.mkstemp(suffix='_groi_B0.mmap')
-                os.close(_b0fd)
-                _B_tmpfiles.append(_b0_fname)
-                B0 = np.memmap(_b0_fname, dtype=np.float32, mode='w+',
-                               shape=B.shape, order='F')
+                # B0 = -B snapshot → /dev/shm (file-backed, OOM-safe)
+                # Process-local snapshot — anonymous array, no /dev/shm.
+                B0 = np.empty(B.shape, dtype=np.float32, order='F')
                 for _t0 in range(0, B.shape[1], _chunk_t):
                     _t1 = min(_t0 + _chunk_t, B.shape[1])
-                    B0[:, _t0:_t1] = -B[:, _t0:_t1]   # B0 = +background
-                B0.flush()
+                    B0[:, _t0:_t1] = -B[:, _t0:_t1]
 
             if ssub > 1:
                 B_arr = np.reshape(np.array(B), (d1, d2, -1), order='F')
@@ -1454,12 +1468,14 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
                 dview=None, thr=options['merging']['merge_thr'], mx=np.inf, fast_merge=True)[:2]
             A = A.astype(np.float32)
             C = C.astype(np.float32)
+            logger.warning(f'[pid {__import__("os").getpid()}] update_spatial start')
             logger.info('Updating spatial components')
             options['spatial']['se'] = np.ones((1,) * len((d1, d2)), dtype=np.uint8)
             A, _, C, _ = caiman.source_extraction.cnmf.spatial.update_spatial_components(
                 B, C=C, f=np.zeros((0, T), np.float32), A_in=A, sn=sn,
                 b_in=np.zeros((np.prod(dims), 0), np.float32),
                 dview=None, dims=dims, **options['spatial'])
+            logger.warning(f'[pid {__import__("os").getpid()}] update_temporal start')
             logger.info('Updating temporal components')
             C, A, b__, f__, S, bl, c1, neurons_sn, g1, YrA, lam__ = \
                 caiman.source_extraction.cnmf.temporal.update_temporal_components(
@@ -1470,7 +1486,8 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
 
             A = A.toarray()
             if nb > 0 or nb == -1:
-                B = B0   # switch to background mmap for NMF
+                del B    # free 564 MB before B0 NMF step
+                B = B0   # B0 becomes the background for NMF
 
         use_NMF = True
         if nb == -1:
@@ -1486,22 +1503,36 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
                 np.clip(B, 0, None, out=B)
                 if hasattr(B, 'flush'):
                     B.flush()
-                model = NMF(n_components=nb, init='nndsvdar')
+                _worker_mlog(logger, 'NMF start')
+                # n_jobs=1: prevent sklearn/joblib from creating psm_* shared
+                # memory segments (564 MB each on /dev/shm, not in our budget).
+                model = NMF(n_components=nb, init='nndsvdar', max_iter=500)
                 b_in = model.fit_transform(B)
                 f_in = np.linalg.lstsq(b_in, B)[0]
             else:
                 b_in, s_in, f_in = spr.linalg.svds(B, k=nb)
                 f_in *= s_in[:, np.newaxis]
-        else:
-            b_in = np.empty((A.shape[0], 0))
-            f_in = np.empty((0, T))
-            if nb == 0:
-                logger.info('Returning background as b0 and W')
-                return (A, C, center.T, b_in.astype(np.float32), f_in.astype(np.float32),
-                        (S.astype(np.float32), bl, c1, neurons_sn, g1, YrA, lam__,
-                         W, b0))
-            else:
-                logger.info("Not returning background")
+        # Free B AND B0 after NMF — neither needed by compute_W.
+        # B = B0 (same object after swap). Our earlier fix clears B's name
+        # but B0 variable still holds the fd → pages NOT freed until finally.
+        # At full T (ring_size_factor path), B0 = 0.55 GB per worker.
+        # 9 workers × 0.55 GB = 4.95 GB freed here vs in finally → 5 GB headroom.
+        _worker_mlog(logger, 'B/B0 freed after NMF')
+        _B_after_nmf = B
+        B = None
+        try: B0
+        except NameError: pass
+        else: B0 = None  # closes fd for the B0 mmap (same file as B was)
+        try:
+            _bfn2 = getattr(_B_after_nmf, 'filename', None)
+            del _B_after_nmf
+            import gc as _gc_b; _gc_b.collect()
+            if _bfn2:
+                try: __import__('os').unlink(_bfn2)
+                except OSError: pass
+                try: _B_tmpfiles.remove(_bfn2)
+                except ValueError: pass
+        except Exception: pass
         return (A, C, center.T, b_in.astype(np.float32), f_in.astype(np.float32),
                 None if ring_size_factor is None else
                 (S.astype(np.float32), bl, c1, neurons_sn, g1, YrA, lam__))
@@ -1600,11 +1631,13 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
     # OS pages them in/out on demand; only ~1 frame (1 MB) is hot in RAM per step.
     _incp_tmpfiles = []
     def _make_incp_mmap(suffix):
-        _fd, _fname = tempfile.mkstemp(suffix=suffix)
-        os.close(_fd)
-        _incp_tmpfiles.append(_fname)
-        return np.memmap(_fname, dtype=np.float32, mode='w+',
-                         shape=(total_frames, d1, d2), order='C')
+        # Write to /dev/shm (tmpfs) not CAIMAN_TEMP (ntfs-3g FUSE).
+        # tmpfs: RAM speed, no FUSE D-state stalls, AND file-backed so
+        # the OOM killer ignores these pages (unlike np.empty anonymous).
+        # np.empty was causing OOM kills: 9 workers × 3 × 564 MB = 15 GB
+        # of anonymous RAM that the OOM scorer counted against workers.
+        # Process-local — anonymous array, no /dev/shm.
+        return np.zeros((total_frames, d1, d2), dtype=np.float32, order='C')
 
     # ── Build data_filtered: filtered copy of data_raw ───────────────────────
     # Pre-compute filter kernel once (avoids recomputing per frame).
@@ -1642,14 +1675,37 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
         x0, x1 = precomp['x0'], precomp['x1']
         y0, y1 = precomp['y0'], precomp['y1']
         _fd_d1 = precomp['d1'];  _fd_d2 = precomp['d2'];  _fd_T = precomp['T']
-        _filt_full = np.memmap(precomp['filtered_path'], dtype=np.float32,
-                               mode='r', shape=(_fd_d1, _fd_d2, _fd_T), order='F')
-        # filt_full[x0:x1, y0:y1, :] → (d1p, d2p, T); transpose → (T, d1p, d2p)
-        _patch_slice = np.transpose(
-            np.asarray(_filt_full[x0:x1, y0:y1, :], dtype=np.float32), (2, 0, 1))
-        del _filt_full
-        data_filtered[:] = _patch_slice
-        del _patch_slice
+        logger.warning(f'[pid {__import__("os").getpid()}] reading filt patch')
+        _worker_mlog(logger, 'filt read start')
+        if precomp.get('filt_tile_path') is not None:
+            # Read from dispatcher-written SHM tile — zero filt_full page faults.
+            _fp  = precomp['filt_tile_path']
+            _fts = precomp['filt_tile_shape']   # (dx, dy, T)
+            _flx = precomp['filt_tile_lx']      # (lx0, lx1)
+            _fly = precomp['filt_tile_ly']      # (ly0, ly1)
+            _ftm = np.memmap(_fp, dtype=np.float16, mode='r',
+                             shape=_fts, order='F')
+            _flx0, _flx1 = _flx;  _fly0, _fly1 = _fly
+            _filt_raw = np.transpose(
+                np.asarray(_ftm[_flx0:_flx1, _fly0:_fly1, :], dtype=np.float32),
+                (2, 0, 1))  # (T_full, d1p, d2p)
+            del _ftm
+            # Apply tsub to match data_filtered shape (total_frames, d1p, d2p).
+            # total_frames = T//tsub; _fd_T = T (full). Downsample by slicing.
+            _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
+            data_filtered[:] = _filt_raw[::_ftsub]
+            del _filt_raw
+        else:
+            # Fallback: read directly from filt_full on /dev/shm
+            _filt_dtype = precomp.get('filt_dtype', 'float32')
+            _filt_full  = np.memmap(precomp['filtered_path'], dtype=_filt_dtype,
+                                    mode='r', shape=(_fd_d1, _fd_d2, _fd_T), order='F')
+            _filt_raw = np.transpose(
+                np.asarray(_filt_full[x0:x1, y0:y1, :], dtype=np.float32), (2, 0, 1))
+            del _filt_full
+            _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
+            data_filtered[:] = _filt_raw[::_ftsub]
+            del _filt_raw
         # Use precomputed sn, data_max, pnr (no filter loop, no get_noise_fft)
         noise_pixel = precomp['sn']             # (d1p, d2p)
         data_max    = precomp['data_max']        # (d1p, d2p)
@@ -2028,6 +2084,21 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
                         logger.info(f'{num_neurons - 1} neurons have been initialized')
 
     logger.info(f'In total, {num_neurons} neurons were initialized.')
+    _worker_mlog(logger, 'greedy loop done')
+    # Free data_filtered and data_raw immediately after the greedy seed loop.
+    # They're not needed for B creation, update_spatial or compute_W.
+    # Freeing them here (vs in the finally) saves 2×282 MB per worker × 10 workers
+    # = 5.6 GB of /dev/shm before _make_B_mmap is called, preventing ENOSPC.
+    import gc as _gc_early
+    data_filtered = None; data_raw = None  # noqa: E702
+    _worker_mlog(logger, 'incp freed')
+    _gc_early.collect()
+    for _fname in list(_incp_tmpfiles):
+        try:
+            os.unlink(_fname)
+            _incp_tmpfiles.remove(_fname)
+        except Exception:
+            pass
     # A = np.reshape(Ain[:num_neurons], (-1, d1 * d2)).transpose()
     try:
         A = np.reshape(Ain[:num_neurons], (-1, d1 * d2), order='F').transpose()
@@ -2180,7 +2251,10 @@ def _write_X_mmap(Y, A, C, b0, dims, ssub, fname, chunk_t=2000):
         A_ds   = A
 
     pixels_out = d1_out * d2_out
-    X = np.memmap(fname, dtype=np.float32, mode='w+', shape=(pixels_out, T), order='F')
+    if fname is None:
+        # Process-local — anonymous array, no /dev/shm consumed.
+        _x_fname_shm = None
+        X = np.empty((pixels_out, T), dtype=np.float32, order='F')
 
     for t0 in range(0, T, chunk_t):
         t1 = min(t0 + chunk_t, T)
@@ -2195,7 +2269,8 @@ def _write_X_mmap(Y, A, C, b0, dims, ssub, fname, chunk_t=2000):
         X[:, t0:t1] = Yc                                # contiguous write (F-order)
         del Yc
 
-    X.flush()
+    if hasattr(X, 'flush'):
+        X.flush()
     return X
 
 
@@ -2325,13 +2400,12 @@ def compute_W(Y, A, C, dims, radius, data_fits_in_memory=True, ssub=1, tsub=1,
     # allows callers to opt out if memory is not a concern.
     if chunk_t is not None:
         # _write_X_mmap handles both ssub=1 and ssub>1 cases.
-        _fd, _x_fname = tempfile.mkstemp(suffix='_W_X.mmap')
-        os.close(_fd)
+        # Use in-RAM array instead of mmap — avoids NVMe writes.
+        # _x_fname kept as None so cleanup block is a no-op.
+        _x_fname = None
         try:
-            # Note: tsub > 1 is not yet chunked here (rare in practice for corr_pnr
-            # pipelines).  Fall back to pre-decimating C rather than Y.
             C_ts = decimate_last_axis(C, tsub) if tsub > 1 else C
-            X = _write_X_mmap(Y, A, C_ts, b0, dims, ssub, _x_fname, chunk_t=chunk_t)
+            X = _write_X_mmap(Y, A, C_ts, b0, dims, ssub, None, chunk_t=chunk_t)
             # X: (pixels_ds, T_ts) F-order mmap.  Per-pixel reads are single rows.
 
             def process_pixel(p):
@@ -2361,7 +2435,9 @@ def compute_W(Y, A, C, dims, radius, data_fits_in_memory=True, ssub=1, tsub=1,
                 # Workers attach zero-copy; no second copy crosses the IPC boundary.
                 _shm_buf = SharedMovieBuffer(np.array(X), order='C')
                 _handle  = _shm_buf.worker_handle()
-                _nprocs  = _mp.cpu_count()
+                # Cap sub-workers: each inherits full worker RSS (~3.6 GB).
+                # 16 forks × 3.6 GB = 58 GB → OOM on 60 GB machine.
+                _nprocs  = min(_mp.cpu_count(), 4)
                 try:
                     with _cf.ProcessPoolExecutor(
                         max_workers=_nprocs,
@@ -2377,11 +2453,11 @@ def compute_W(Y, A, C, dims, radius, data_fits_in_memory=True, ssub=1, tsub=1,
             else:
                 Q = list(map(process_pixel, range(d1 * d2)))
         finally:
-            del X  # close mmap handle before unlinking
-            try:
-                os.unlink(_x_fname)
-            except Exception:
-                pass
+            try: del X  # close mmap handle before unlinking
+            except UnboundLocalError: pass
+            for _xf in filter(None, [_x_fname, locals().get('_x_fname_shm')]):
+                try: os.unlink(_xf)
+                except Exception: pass
 
         indices, data = np.array(Q, dtype=object).T
         indptr  = np.concatenate([[0], np.cumsum(list(map(len, indices)))])
@@ -2618,11 +2694,24 @@ def precompute_corr_pnr_filtered_fov(
     # Pass 2 and workers both read from cache (DRAM speed), not NVMe.
     # Keeping pages warm (no MADV_DONTNEED on filt_full) lets workers
     # read their patch slices from cache without NVMe re-reads.
+    # Precomp mmap goes to CAIMAN_SHM (/dev/shm, tmpfs) if set,
+    # else falls back to CAIMAN_TEMP (NVMe). tmpfs gives RAM-speed
+    # reads with no FUSE overhead — workers access it like anon memory.
     import caiman.paths as _cpaths
-    _fd, filt_path = tempfile.mkstemp(
-        suffix='_precomp_filtered.mmap', dir=_cpaths.get_tempdir())
-    os.close(_fd)
-    filt_full = np.memmap(filt_path, dtype=np.float32, mode='w+',
+    import re as _re_mb
+    _shm_dir = os.environ.get('CAIMAN_SHM', '')
+    _precomp_dir = _shm_dir if (_shm_dir and os.path.isdir(_shm_dir)) \
+        else _cpaths.get_tempdir()
+    _movie_base = os.path.splitext(os.path.basename(movie_path))[0]
+    _movie_base = _re_mb.sub(r'[_-]d1_\d+.*$', '', _movie_base)
+    _movie_base = _re_mb.sub(r'[_-](cnmf|raw_mp|rig).*$', '', _movie_base)
+    filt_path = os.path.join(
+        _precomp_dir,
+        f"{_movie_base}_precomp_filt"
+        f"_d1_{d1}_d2_{d2}_d3_1_order_F_frames_{T}_f16.mmap")
+    # float16 halves filt_full from 29 GB to 14.5 GB — fits in page cache
+    # alongside worker RSS, eliminating NVMe re-reads.
+    filt_full = np.memmap(filt_path, dtype=np.float16, mode='w+',
                           shape=(d1, d2, T), order='F')
 
     # ── Two-pass precompute: filter → mean-subtract+sn+Cn → evict ──────────
@@ -2696,11 +2785,10 @@ def precompute_corr_pnr_filtered_fov(
                 # cp.asarray handles F-contiguous directly — no CPU copy at all.
                 # ascontiguousarray would transpose 3.1 GB C→F = ~29s wasted.
                 batch_gpu = cp.asarray(
-                    movie_f[:, :, t0:t1].astype(np.float32))  # (d1, d2, bsz) F-order
+                    movie_f[:, :, t0:t1])  # (d1, d2, bsz) F-contiguous, already float32
             else:
                 # C-order: Yr[:,t0:t1] is (pixels, bsz); reshape on GPU.
-                _chunk_pT  = np.ascontiguousarray(Yr[:, t0:t1], dtype=np.float32)
-                _chunk_gpu = cp.asarray(_chunk_pT);  del _chunk_pT
+                _chunk_gpu = cp.asarray(Yr[:, t0:t1], dtype=np.float32)
                 batch_gpu  = _chunk_gpu.reshape(d1, d2, _bsz)  # free C-order view
                 del _chunk_gpu
             # Evict movie chunk from page cache after GPU has it
@@ -2719,7 +2807,7 @@ def precompute_corr_pnr_filtered_fov(
                     pass
             result_gpu = _apply_filter(batch_gpu);  del batch_gpu
             result_np  = cp.asnumpy(result_gpu);    del result_gpu
-            filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) matches filt_full slice
+            filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) → F-order slice
             mean_acc += result_np.sum(axis=2)   # bsz is axis 2
             del result_np
             if (t0 // chunk_frames) % 3 == 0:
@@ -2769,34 +2857,43 @@ def precompute_corr_pnr_filtered_fov(
     except Exception:
         pass
 
-    # ── Pass 2: mean-subtract + sn + data_max + Cn + evict (all from DRAM) ──
-    logger.info('precompute_corr_pnr_filtered_fov: computing sn, data_max and Cn')
-    Y2_acc   = np.zeros((d1, d2), dtype=np.float64)
-    dmax_acc = np.full((d1, d2), -np.inf, dtype=np.float32)
-    YYc_acc  = cp.zeros((d1, d2), dtype=cp.float32)
+    # ── Pass 2: all accumulations on GPU, single D2H at end ─────────────────
+    # Y2_acc was computed on CPU (float64): chunk (d1,d2,bsz) → D2H → **2 → sum
+    # = 3.1 GB D2H + 3.9T float64 MACs per chunk = dominant 4-min bottleneck.
+    # Fix: accumulate Y2 and dmax on GPU in float32 (sufficient precision for
+    # noise estimation), stay entirely on GPU until end of loop.
+    # Final D2H: 3 arrays of (d1,d2) = 3 MB — negligible.
+    logger.info('precompute_corr_pnr_filtered_fov: computing sn, data_max and Cn (GPU)')
+    Y2_acc_gpu   = cp.zeros((d1, d2), dtype=cp.float32)
+    dmax_acc_gpu = cp.full((d1, d2), -cp.inf, dtype=cp.float32)
+    YYc_acc      = cp.zeros((d1, d2), dtype=cp.float32)
 
     for t0 in range(0, T, chunk_frames):
         t1  = min(t0 + chunk_frames, T)
-        bsz = t1 - t0
-        # Read from warm DRAM page cache (filt_full pages not yet evicted)
-        chunk_np  = np.ascontiguousarray(filt_full[:, :, t0:t1], dtype=np.float32)
-        chunk_gpu = cp.asarray(chunk_np) - mean_gpu[:, :, cp.newaxis]
-        del chunk_np
-        chunk_np2 = cp.asnumpy(chunk_gpu)
-        Y2_acc   += (chunk_np2.astype(np.float64) ** 2).sum(axis=2)
-        np.maximum(dmax_acc, chunk_np2.max(axis=2), out=dmax_acc)
-        del chunk_np2
+        # Read filt_full chunk from DRAM cache — one H2D transfer
+        # filt_full on /dev/shm — pass F-order slice directly to cp.asarray.
+        # np.ascontiguousarray was making a 3 GB C-order CPU copy per chunk
+        # before H2D transfer — completely unnecessary.
+        chunk_gpu = cp.asarray(
+            filt_full[:, :, t0:t1].astype(np.float32)
+        ) - mean_gpu[:, :, cp.newaxis]
+        # All stats computed on GPU — zero D2H until end of loop
+        Y2_acc_gpu   += (chunk_gpu ** 2).sum(axis=2)
+        cp.maximum(dmax_acc_gpu, chunk_gpu.max(axis=2), out=dmax_acc_gpu)
         _Yconv   = _cpnd.convolve(chunk_gpu, _sz3, mode='constant')
         YYc_acc += (chunk_gpu * _Yconv).sum(axis=2)
-        del chunk_gpu, _Yconv
-        # Write mean-subtracted chunk back to filt_full for workers
-        # then immediately evict
-        filt_full[:, :, t0:t1] -= mean_full[:, :, np.newaxis]
-        # Keep filt_full pages in cache — workers read patch slices from here
-        # at DRAM speed. Evicting would force 27 GB of NVMe re-reads.
+        # Write mean-subtracted data back to float16 mmap directly from
+        # chunk_gpu (already has mean subtracted). Avoids a separate mmap
+        # read-modify-write cycle and gives clean float16 output.
+        _msub = cp.asnumpy(chunk_gpu).astype(np.float16)
+        filt_full[:, :, t0:t1] = _msub
+        del _msub, chunk_gpu, _Yconv
 
     filt_full.flush()
     del mean_gpu
+    # Single small D2H: (d1,d2) float32 arrays = 1 MB each
+    Y2_acc   = cp.asnumpy(Y2_acc_gpu);   del Y2_acc_gpu
+    dmax_acc = cp.asnumpy(dmax_acc_gpu); del dmax_acc_gpu
 
     # ── Derive sn and data_max ────────────────────────────────────────────────
     sn_full       = np.sqrt(np.maximum(Y2_acc / T, 1e-10)).astype(np.float32)
@@ -2815,21 +2912,18 @@ def precompute_corr_pnr_filtered_fov(
                        f'workers will compute Cn per-patch')
         cn_full = None
 
-    # Re-warm filt_full into page cache now that all computation is done.
-    # Pass 2 reads (27 GB) under 28 GB parent RSS pressure likely evicted
-    # most filt_full pages. Workers reading patch slices need them in cache.
+    # Evict filt_full from page cache so C-order mmap warm (27 GB) fits
+    # alongside worker RSS without cache pressure.
+    # Workers read their 295 MB filt_full patch slices from NVMe on demand
+    # (~21ms at sequential NVMe throughput — acceptable).
     try:
         import os as _os_rw; import ctypes as _ct_rw
         _libc_rw = _ct_rw.cdll.LoadLibrary('libc.so.6')
-        _fd_rw = _os_rw.open(filt_path, _os_rw.O_RDONLY)
-        _libc_rw.posix_fadvise(_fd_rw, 0, 0, _ct_rw.c_int(2))  # SEQUENTIAL
-        _blk_rw = 128 * 2**20
-        _buf_rw = bytearray(_blk_rw)
-        _mv_rw  = memoryview(_buf_rw)
-        while _os_rw.readv(_fd_rw, [_mv_rw]) > 0:
-            pass
-        _os_rw.close(_fd_rw)
-        logger.info('precompute_corr_pnr_filtered_fov: filt_full re-warmed for workers')
+        _fd_ev = _os_rw.open(filt_path, _os_rw.O_RDONLY)
+        _libc_rw.posix_fadvise(_fd_ev, 0, 0,
+                               _ct_rw.c_int(4))  # POSIX_FADV_DONTNEED
+        _os_rw.close(_fd_ev)
+        logger.info('precompute_corr_pnr_filtered_fov: filt_full evicted (cache headroom for C-order)')
     except Exception:
         pass
 
@@ -2837,9 +2931,21 @@ def precompute_corr_pnr_filtered_fov(
                          out=np.zeros_like(data_max_full),
                          where=sn_full > 0).astype(np.float32)
 
+    # Save companion arrays alongside filt_full for cross-session reuse.
+    # Enables check_nan skip and sn injection on pipeline restart.
+    _npz_path = os.path.splitext(filt_path)[0] + '_meta.npz'
+    try:
+        np.savez(_npz_path, sn_full=sn_full, data_max_full=data_max_full,
+                 cn_full=cn_full if cn_full is not None else np.array([]),
+                 pnr_full=pnr_full)
+    except Exception as _npz_exc:
+        logger.debug(f'precompute: could not save companion npz: {_npz_exc}')
+        _npz_path = None
+
     logger.info(f'precompute_corr_pnr_filtered_fov: done → {filt_path}')
     return {
         'filtered_path': filt_path,
+        'filt_dtype':    'float16',   # workers must cast on load
         'd1': d1, 'd2': d2, 'T': T,
         'sn_full':       sn_full,
         'data_max_full': data_max_full,

@@ -242,14 +242,30 @@ def _worker_logging_init(log_params: dict) -> None:
     _n_blas = log_params.get('blas_threads', 1) if log_params else 1
     if _n_blas > 1:
         try:
-            from threadpoolctl import threadpool_limits
+            from threadpoolctl import threadpool_limits, threadpool_info
             threadpool_limits(limits=_n_blas)
-        except ImportError:
-            # fallback: set env vars for any BLAS that re-checks them
+            _active = [p['num_threads'] for p in threadpool_info()]
+            import logging as _log
             import os as _os_w
+            _log.getLogger("caiman").warning(
+                f"[worker {_os_w.getpid()}] BLAS threads set to {_n_blas} "
+                f"via threadpoolctl — active: {_active}")
+        except ImportError:
+            import logging as _log, os as _os_w
             for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS',
                          'OPENBLAS_NUM_THREADS'):
                 _os_w.environ[_var] = str(_n_blas)
+            _log.getLogger("caiman").warning(
+                f"[worker {_os_w.getpid()}] threadpoolctl not found — "
+                f"set env vars for {_n_blas} BLAS threads")
+    # Disable GPU noise FFT in workers — N parallel CUDA calls exhaust VRAM.
+    import os as _os_gpu_w
+    _os_gpu_w.environ['CAIMAN_NO_GPU_NOISE'] = '1'
+    # Prevent joblib/loky from spawning sub-processes inside workers.
+    # sklearn NMF uses joblib internally, which creates psm_* shared memory
+    # segments (564 MB each on /dev/shm) that are not in our SHM budget.
+    _os_gpu_w.environ['LOKY_MAX_CPU_COUNT'] = '1'
+    _os_gpu_w.environ['NUMEXPR_NUM_THREADS'] = '1'
     # Stash in module scope so flush_worker_log() can find log_file later.
     global _worker_log_params
     _worker_log_params = log_params
@@ -275,6 +291,16 @@ def _worker_logging_init(log_params: dict) -> None:
         datefmt="%H:%M:%S"))
     sh.setLevel(logging.WARNING)
     log.addHandler(sh)
+    # Background thread: flush buffered records to log file every 30s
+    # so INFO logs appear even if a patch runs for many minutes.
+    import threading as _thr
+    def _periodic_flush():
+        import time as _time
+        while True:
+            _time.sleep(30)
+            flush_worker_log()
+    _t = _thr.Thread(target=_periodic_flush, daemon=True)
+    _t.start()
 
 
 _worker_log_params: dict = {}   # stashed by _worker_logging_init in each worker
