@@ -1666,7 +1666,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
                                         sigmaY=gSig[1], borderType=1)
 
     data_filtered = _make_incp_mmap('_incp_df.mmap')
-    if precomp is not None:
+    if precomp is not None and 'sn' in precomp:
         # ── Use precomputed full-FOV filtered movie ────────────────────
         # Parent filtered the full FOV on GPU once.  Copy this patch's
         # slice into a writable local mmap (fast NVMe read, ~76 ms) vs

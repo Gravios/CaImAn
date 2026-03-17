@@ -422,6 +422,10 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _pc['tile_shape'] = tile_shape
             _pc['tile_lx']    = (lx0, lx1)
             _pc['tile_ly']    = (ly0, ly1)
+            _pc['d1'] = d1   # full FOV dims — absent when precomp failed/skipped
+            _pc['d2'] = d2   # always needed by _cnmf_patches_inner tile path
+            _pc['x0'] = x0;  _pc['x1'] = x1  # patch FOV extents in full-movie coords
+            _pc['y0'] = y0;  _pc['y1'] = y1
             if filt_path and filt_shape:
                 _pc['filt_tile_path']  = filt_path
                 _pc['filt_tile_shape'] = filt_shape
@@ -820,14 +824,21 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     try:
                         import numpy as _np_npz
                         _npz = _np_npz.load(_npz_path, allow_pickle=False)
-                        _cached_precomp['sn_full']       = _npz['sn_full']
-                        _cached_precomp['data_max_full'] = _npz['data_max_full']
-                        _cached_precomp['cn_full']  = (
-                            _npz['cn_full'] if _npz['cn_full'].size > 0
-                            else None)
-                        _cached_precomp['pnr_full']      = _npz['pnr_full']
-                        logger.info(
-                            'run_CNMF_patches: loaded companion sn/Cn/PNR arrays')
+                        _sn_candidate = _npz['sn_full']
+                        if _sn_candidate.shape == (dims[0], dims[1]):
+                            _cached_precomp['sn_full']       = _sn_candidate
+                            _cached_precomp['data_max_full'] = _npz['data_max_full']
+                            _cached_precomp['cn_full']  = (
+                                _npz['cn_full'] if _npz['cn_full'].size > 0
+                                else None)
+                            _cached_precomp['pnr_full']      = _npz['pnr_full']
+                            logger.info(
+                                'run_CNMF_patches: loaded companion sn/Cn/PNR arrays')
+                        else:
+                            logger.warning(
+                                f'run_CNMF_patches: companion npz shape '
+                                f'{_sn_candidate.shape} != movie dims '
+                                f'{(dims[0], dims[1])} — ignoring stale npz')
                     except Exception as _npz_exc:
                         logger.debug(f'companion npz load failed: {_npz_exc}')
                 params.init['precomp_cache'] = _cached_precomp
@@ -850,7 +861,10 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     forder_movie_path = params.init.get('forder_movie_path'),
                 )
                 if _precomp_result is not None:
-                    _precomp_cleanup = _precomp_result['filtered_path']
+                    # _precomp_cleanup intentionally NOT set here:
+                    # params.init['precomp_cache'] transfers ownership
+                    # to cnmf.fit() → self._precomp_cache → refit().
+                    # Deletion is the pipeline's responsibility.
                     logger.info(
                         f"run_CNMF_patches: corr_pnr precompute done — "
                         f"filtered mmap at {_precomp_cleanup}")
