@@ -422,10 +422,6 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _pc['tile_shape'] = tile_shape
             _pc['tile_lx']    = (lx0, lx1)
             _pc['tile_ly']    = (ly0, ly1)
-            _pc['d1'] = d1   # full FOV dims — absent when precomp failed/skipped
-            _pc['d2'] = d2   # always needed by _cnmf_patches_inner tile path
-            _pc['x0'] = x0;  _pc['x1'] = x1  # patch FOV extents in full-movie coords
-            _pc['y0'] = y0;  _pc['y1'] = y1
             if filt_path and filt_shape:
                 _pc['filt_tile_path']  = filt_path
                 _pc['filt_tile_shape'] = filt_shape
@@ -857,14 +853,12 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     dims              = (dims[0], dims[1], T),
                     gSig              = list(params.get('init', 'gSig')),
                     center_psf        = params.get('init', 'center_psf') or True,
-                    chunk_frames      = 3000,
+                    chunk_frames      = int(
+                        params.get('init', 'precompute_chunk_frames') or 1000),
                     forder_movie_path = params.init.get('forder_movie_path'),
                 )
                 if _precomp_result is not None:
-                    # _precomp_cleanup intentionally NOT set here:
-                    # params.init['precomp_cache'] transfers ownership
-                    # to cnmf.fit() → self._precomp_cache → refit().
-                    # Deletion is the pipeline's responsibility.
+                    _precomp_cleanup = _precomp_result['filtered_path']
                     logger.info(
                         f"run_CNMF_patches: corr_pnr precompute done — "
                         f"filtered mmap at {_precomp_cleanup}")
@@ -927,7 +921,16 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 _patch_precomp['sn'] = _precomp_result['sn_full'][_x0:_x1, _y0:_y1]
             if _precomp_result.get('data_max_full') is not None:
                 _patch_precomp['data_max'] = _precomp_result['data_max_full'][_x0:_x1, _y0:_y1]
-            if _precomp_result.get('cn_full') is not None:
+            # cn/pnr from full-FOV npz are sliced by patch FOV coords, giving shape
+            # (_x1-_x0, _y1-_y0).  In the tile path the worker's image data comes
+            # from a tile whose column range may be clipped at the movie boundary,
+            # so tile_cols < _y1-_y0 for boundary patches → ind_search.shape !=
+            # ind_bd.shape inside init_neurons_corr_pnr → IndexError.
+            # Only inject cn/pnr when the full filtered mmap exists (precompute
+            # succeeded), because in that case workers read their slice directly
+            # from the un-clipped filt_full mmap and dimensions always match.
+            _filt_ok = bool(_precomp_result.get('filtered_path'))
+            if _precomp_result.get('cn_full') is not None and _filt_ok:
                 _patch_precomp['cn']  = _precomp_result['cn_full'][_x0:_x1, _y0:_y1]
                 _patch_precomp['pnr'] = _precomp_result['pnr_full'][_x0:_x1, _y0:_y1]
             # Inject directly into underlying dict to bypass CaImAn's param-change logger

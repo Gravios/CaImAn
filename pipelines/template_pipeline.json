@@ -1,0 +1,84 @@
+{
+    "_comment": "CaImAn pipeline template. Copy alongside <session>_pipeline.py and rename both. The session name is derived from the script filename — do not add session_id here.",
+
+    "env": {
+        "_comment": "Applied before any caiman import. CAIMAN_* vars are forced; thread counts use setdefault so shell values take precedence.",
+        "CAIMAN_TILE_SLOTS": "3",
+        "CAIMAN_DATA":        "/data/caiman",
+        "CAIMAN_TEMP":        "/data/caiman/temp",
+        "CAIMAN_SHM":         "/dev/shm",
+        "MKL_NUM_THREADS":    "1",
+        "OMP_NUM_THREADS":    "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS":  "1",
+        "MPLBACKEND":         "Agg"
+    },
+
+    "session": {
+        "_comment": "session_id is intentionally absent — it is the script filename stem minus _pipeline. Only structural paths live here.",
+        "data_root":  "/data/src/",
+        "experiment": "<lab>/<experiment>/<date>/"
+    },
+
+    "data": {
+        "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f≈0.4, GCaMP6s≈1.0). add_baseline: constant added to all pixels during F→C conversion to keep values >0 for stable dF/F.",
+        "fr":           30,
+        "decay_time":   1.0,
+        "add_baseline": 100.0
+    },
+
+    "motion_correction": {
+        "_comment": "pw_rigid: piecewise-rigid MC (false=rigid, recommended for most 2P). max_shifts: [row, col] px. border_nan: 'copy' replicates border pixels; 'min' fills with movie minimum.",
+        "max_shifts":           [6, 6],
+        "strides":              [64, 64],
+        "overlaps":             [32, 32],
+        "max_deviation_rigid":  3,
+        "pw_rigid":             false,
+        "shifts_opencv":        true,
+        "border_nan":           "copy"
+    },
+
+    "cnmf": {
+        "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor × gSiz[0] must be < rf.",
+        "p":                1,
+        "gnb":              2,
+        "merge_thr":        0.7,
+        "rf":               36,
+        "stride":           18,
+        "K":                15,
+        "gSig":             [9, 9],
+        "gSiz":             [37, 37],
+        "ring_size_factor": 0.9,
+        "min_corr":         0.6,
+        "min_pnr":          7,
+        "ssub":             1,
+        "tsub":             2,
+        "method_init":      "corr_pnr",
+        "method_deconv":    "oasis",
+        "method_ls":        "lasso_lars",
+        "dff_quantile_min": 8,
+        "dff_frames_window": 500
+    },
+
+    "quality": {
+        "_comment": "Components must pass all enabled criteria. use_cnn is auto-disabled if model files are missing.",
+        "min_SNR":     1.5,
+        "rval_thr":    0.6,
+        "use_cnn":     true,
+        "min_cnn_thr": 0.6,
+        "cnn_lowest":  0.1
+    },
+
+    "cluster": {
+        "_comment": "n_processes: null=auto (all CPUs). Reduce ram_budget_frac if workers OOM. Lower worker_overhead_frac if actual worker RAM < estimated.",
+        "n_processes":            null,
+        "ram_budget_frac":        0.85,
+        "worker_overhead_frac":   1.1,
+        "blas_threads_per_worker": 1
+    },
+
+    "gpu": {
+        "_comment": "precompute_chunk_frames: frames per GPU filter chunk. Peak VRAM ≈ 2 × frames × d1 × d2 × 4 bytes. Reduce if GPU OOM during precompute.",
+        "precompute_chunk_frames": 500
+    }
+}

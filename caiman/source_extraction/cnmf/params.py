@@ -728,6 +728,7 @@ class CNMFParams(object):
             'SC_nnn': 20,                # number of nearest neighbors to use
             'alpha_snmf': alpha_snmf,
             'center_psf': center_psf,
+            'precompute_chunk_frames': 500,   # GPU filter chunk size — 500×516×512×4=528 MB/chunk, safe for 16 GB GPU
             'gSig': gSig,
             # size of bounding box
             'gSiz': gSiz,
