@@ -561,6 +561,18 @@ class CNMF(object):
                     f'fit(): terminated pipeline pool ({_n_proc_saved} workers) '
                     f'before precompute — run_CNMF_patches will respawn after')
 
+            # Flush CuPy memory pool so precompute can use full VRAM.
+            # MC + Cn steps leave ~12 GB parked in the pool; without flushing
+            # the 3 GB chunk alloc for the GPU filter OOMs and workers fall
+            # back to slow per-patch CPU filtering with no cn/pnr precomp.
+            try:
+                import cupy as _cp
+                _cp.get_default_memory_pool().free_all_blocks()
+                _cp.get_default_pinned_memory_pool().free_all_blocks()
+                logger.info('fit(): CuPy memory pool flushed before precompute')
+            except Exception:
+                pass
+
             # Pass any cached precomp from a previous fit() to run_CNMF_patches.
             # Also pass the F-order mmap path so precompute reads frames as
             # contiguous 1MB blocks instead of 262K scattered reads.
