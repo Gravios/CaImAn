@@ -19,5 +19,34 @@ from caiman.utils.tiff_io import (
     madvise_sequential,
 )
 from caiman.utils.param_summary import log_params
+from caiman.utils.pipeline_setup import (
+    ensure_model_files,
+    setup_logging,
+    clean_stale_shm,
+)
+from caiman.utils.timing import (
+    PipelineTimer,
+    write_report,
+    fmt_elapsed,
+    log_call,
+)
+from caiman.utils.cnmf_runner import CNMFRunner as CnmfRunner
+from caiman.utils.qc import (
+    QCRunner,
+    qc_raw_sample,
+    qc_motion_correction,
+    qc_correlation_image,
+    qc_pnr_image,
+    qc_cnmf_fit,
+    qc_cnmf_refit,
+    qc_component_evaluation,
+    qc_traces,
+    save_all_post_cnmf,
+)
+from caiman.utils.memory import (
+    malloc_trim,
+    madvise_dontneed,
+    cupy_flush,
+)
 
 __version__ = importlib.metadata.version('caiman')

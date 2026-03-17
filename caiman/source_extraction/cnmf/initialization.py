@@ -1666,7 +1666,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
                                         sigmaY=gSig[1], borderType=1)
 
     data_filtered = _make_incp_mmap('_incp_df.mmap')
-    if precomp is not None and 'sn' in precomp:
+    if precomp is not None:
         # ── Use precomputed full-FOV filtered movie ────────────────────
         # Parent filtered the full FOV on GPU once.  Copy this patch's
         # slice into a writable local mmap (fast NVMe read, ~76 ms) vs
@@ -1722,10 +1722,16 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
 
     # remove small values and only keep pixels with large fluorescence signals
     _thresh = thresh_init * noise_pixel   # (d1, d2) — small, stays in RAM
-    if precomp is not None and precomp.get('cn') is not None:
+    _precomp_cn = precomp.get('cn') if precomp is not None else None
+    if (_precomp_cn is not None
+            and _precomp_cn.shape == (d1, d2)):
         # Precomputed Cn and PNR from full-FOV GPU pass — skip tmp_data
         # creation (548 MB mmap write) and local_correlations_fft (~0.6 s).
-        cn  = precomp['cn'].copy()   # writable local copy (updated in greedy loop)
+        # Shape guard: a stale precomp from a run with different movie dims
+        # (e.g. 512×512 vs current 516×512) would pass a (49,13)-shaped
+        # slice that mismatches the (d1=49, d2=49) data → IndexError at
+        # ind_search[ind_bd].  Fall through to local compute if shapes differ.
+        cn  = _precomp_cn.copy()     # writable local copy (updated in greedy loop)
         pnr = precomp['pnr'].copy()
     else:
         # Write thresholded copy to a second mmap frame-by-frame instead of np.copy.
@@ -2602,7 +2608,7 @@ def precompute_corr_pnr_filtered_fov(
         gSig,
         center_psf:    bool = True,
         background_filter: str = 'disk',
-        chunk_frames:  int = 200,
+        chunk_frames:  int = 1000,
         forder_movie_path: str = None,   # F-order mmap for contiguous frame reads
 ) -> dict | None:
     """Precompute the corr_pnr filtered movie on the full FOV using the GPU.
@@ -2807,6 +2813,10 @@ def precompute_corr_pnr_filtered_fov(
                     pass
             result_gpu = _apply_filter(batch_gpu);  del batch_gpu
             result_np  = cp.asnumpy(result_gpu);    del result_gpu
+            # Return VRAM immediately — _apply_filter peaks at 4×batch_size.
+            # Without this free the pool retains all chunks across the loop
+            # and the second chunk OOMs on a 16 GB GPU (4×3 GB + 3 GB MC).
+            cp.get_default_memory_pool().free_all_blocks()
             filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) → F-order slice
             mean_acc += result_np.sum(axis=2)   # bsz is axis 2
             del result_np

@@ -1,0 +1,76 @@
+{
+    "env": {
+        "CAIMAN_TILE_SLOTS": "3",
+        "CAIMAN_DATA": "/data/caiman",
+        "CAIMAN_TEMP": "/data/caiman/temp",
+        "CAIMAN_SHM": "/dev/shm",
+        "MKL_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "MPLBACKEND": "Agg"
+    },
+
+    "_comment": "Parameters for <session>_pipeline.py — session name is derived from the script filename; edit here, not in the script.",
+
+    "session": {
+        "_comment": "session_id is intentionally absent — it is derived from the script filename stem (strip _pipeline suffix). Only structural paths live here.",
+        "data_root":  "/data/src/",
+        "experiment": "stroh-ej/RawDataSel_AD_Project/G1_B6J/08072014/"
+    },
+
+    "data": {
+        "fr": 30,
+        "decay_time": 1.0,
+        "add_baseline": 100.0
+    },
+
+    "motion_correction": {
+        "max_shifts": [6, 6],
+        "strides":   [64, 64],
+        "overlaps":  [32, 32],
+        "max_deviation_rigid": 3,
+        "pw_rigid": false,
+        "shifts_opencv": true,
+        "border_nan": "copy"
+    },
+
+    "cnmf": {
+        "p": 1,
+        "gnb": 2,
+        "merge_thr": 0.7,
+        "rf": 24,
+        "stride": 12,
+        "K": 15,
+        "gSig": [6, 6],
+        "gSiz": [24, 24],
+        "ring_size_factor": 0.9,
+        "min_corr": 0.5,
+        "min_pnr": 6,
+        "ssub": 1,
+        "tsub": 2,
+        "method_init": "corr_pnr",
+        "method_deconv": "oasis",
+        "method_ls": "lasso_lars"
+    },
+
+    "quality": {
+        "min_SNR": 1.5,
+        "rval_thr": 0.6,
+        "use_cnn": true,
+        "min_cnn_thr": 0.6,
+        "cnn_lowest": 0.1
+    },
+
+    "cluster": {
+        "n_processes": 16,
+        "ram_budget_frac": 0.85,
+        "worker_overhead_frac": 1.1,
+        "blas_threads_per_worker": 1
+    },
+
+    "gpu": {
+        "_comment": "precompute_chunk_frames: chunk_bytes = frames × d1 × d2 × 4. Peak VRAM ≈ 2× chunk_bytes. Reduce if GPU OOM during precompute.",
+        "precompute_chunk_frames": 500
+    }
+}

@@ -562,14 +562,26 @@ class CNMF(object):
                     f'before precompute — run_CNMF_patches will respawn after')
 
             # Flush CuPy memory pool so precompute can use full VRAM.
-            # MC + Cn steps leave ~12 GB parked in the pool; without flushing
-            # the 3 GB chunk alloc for the GPU filter OOMs and workers fall
-            # back to slow per-patch CPU filtering with no cn/pnr precomp.
+            # free_all_blocks() only returns *free* blocks to CUDA; any live
+            # arrays from MC / Cn still pin VRAM.  Force GC first so Python
+            # reference counts drop and CuPy releases those arrays into the
+            # free-list, then flush, then clear the FFT plan cache (cuFFT
+            # holds its own CUDA allocations outside the MemoryPool).
             try:
+                import gc as _gc_pre; _gc_pre.collect()
                 import cupy as _cp
+                try:
+                    _cp.fft.config.get_plan_cache().clear()
+                except Exception:
+                    pass
                 _cp.get_default_memory_pool().free_all_blocks()
                 _cp.get_default_pinned_memory_pool().free_all_blocks()
-                logger.info('fit(): CuPy memory pool flushed before precompute')
+                _cp.cuda.Device().synchronize()
+                _free_mb = _cp.get_default_memory_pool().free_bytes() // 2**20
+                _used_mb = _cp.get_default_memory_pool().used_bytes() // 2**20
+                logger.info(
+                    f'fit(): CuPy pool flushed before precompute '
+                    f'(pool free={_free_mb} MB  used={_used_mb} MB)')
             except Exception:
                 pass
 
@@ -896,8 +908,10 @@ class CNMF(object):
         estim = self.estimates
         if (self.params.get('init', 'method_init') == 'corr_pnr' and
                 self.params.get('init', 'ring_size_factor') is not None):
+            _INIT_EXCLUDE = ('precomp', 'precomp_cache', 'forder_movie_path',
+                             'precompute_chunk_frames')
             _init_kwargs = {k: v for k, v in self.params.get_group('init').items()
-                           if k not in ('precomp', 'precomp_cache', 'forder_movie_path')}
+                           if k not in _INIT_EXCLUDE}
             estim.A, estim.C, estim.b, estim.f, estim.center, \
                 extra_1p = initialize_components(
                     Y, sn=estim.sn, options_total=self.params.to_dict(),
@@ -909,8 +923,10 @@ class CNMF(object):
                 estim.S, estim.bl, estim.c1, estim.neurons_sn, \
                     estim.g, estim.YrA, estim.lam, estim.W, estim.b0 = extra_1p
         else:
+            _INIT_EXCLUDE = ('precomp', 'precomp_cache', 'forder_movie_path',
+                             'precompute_chunk_frames')
             _init_kwargs = {k: v for k, v in self.params.get_group('init').items()
-                           if k not in ('precomp', 'precomp_cache', 'forder_movie_path')}
+                           if k not in _INIT_EXCLUDE}
             estim.A, estim.C, estim.b, estim.f, estim.center =\
                 initialize_components(Y, sn=estim.sn, options_total=self.params.to_dict(),
                                       **_init_kwargs)
