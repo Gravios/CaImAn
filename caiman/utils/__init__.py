@@ -11,7 +11,7 @@ memory                      malloc_trim / madvise_dontneed / cupy_flush
 nn_models                   Neural network model components
 param_summary               Formatted parameter table logger
 params_io                   JSON parameter loading with dot-access (ParamBag)
-pipeline_setup              CNN model bootstrap, logging setup, stale SHM cleanup
+pipeline_setup              resolve_pipeline_path, CNN model bootstrap, logging setup, stale SHM cleanup
 sbx_utils                   Scanbox file I/O
 stats                       Robust statistics (mode, compressive NMF, …)
 tiff_io                     Fast TIFF I/O for large NVMe-backed stacks
@@ -34,6 +34,7 @@ from caiman.utils.tiff_io import (
 )
 from caiman.utils.param_summary import log_params
 from caiman.utils.pipeline_setup import (
+    resolve_pipeline_path,
     ensure_model_files,
     setup_logging,
     clean_stale_shm,
@@ -75,6 +76,7 @@ __all__ = [
     # param_summary
     "log_params",
     # pipeline_setup
+    "resolve_pipeline_path",
     "ensure_model_files",
     "setup_logging",
     "clean_stale_shm",

@@ -1,14 +1,21 @@
 """
 caiman/utils/pipeline_setup.py
 ===============================
-One-time pipeline infrastructure: CNN model bootstrapping, logger
-construction, and stale shared-memory cleanup.
+One-time pipeline infrastructure: path resolution, CNN model bootstrapping,
+logger construction, and stale shared-memory cleanup.
 
-All three functions are imported near the top of every pipeline script,
-immediately after the env-bootstrap block sets CAIMAN_DATA and CAIMAN_TEMP.
+``resolve_pipeline_path`` is the very first call in every pipeline script —
+it must be importable before any caiman import (it has no caiman dependencies).
 
 Usage
 -----
+    # ── Must come before any caiman import ─────────────────────────────────
+    # The import itself is safe because pipeline_setup only uses stdlib.
+    from caiman.utils.pipeline_setup import resolve_pipeline_path
+
+    _SCRIPT_PATH, _CONFIG_PATH, session = resolve_pipeline_path()
+
+    # ── After caiman import ─────────────────────────────────────────────────
     from caiman.utils.pipeline_setup import ensure_model_files, setup_logging, clean_stale_shm
 
     _cnn_available = ensure_model_files(os.path.join(CAIMAN_DATA, "model"))
@@ -18,6 +25,7 @@ Usage
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import re
@@ -27,6 +35,104 @@ from pathlib import Path
 from typing import Union
 
 from caiman.utils.timing import log_call
+
+
+# ── Script path resolution ───────────────────────────────────────────────────
+
+def resolve_pipeline_path(
+    suffix: str = "_pipeline",
+    argv_index: int = 1,
+) -> tuple[Path, Path, str]:
+    """Resolve the pipeline script path, config path, and session name.
+
+    Must be called before any caiman import — it has zero caiman dependencies
+    and uses only the Python standard library.
+
+    Resolution order for the script path:
+
+    1. ``__file__`` from the calling frame — set by CPython for normal
+       execution and IPython ``%run``.
+    2. ``inspect.getfile`` walking up the call stack — works in Emacs
+       ``python-el`` eval and any ``exec()`` context where ``__file__``
+       is not injected.
+    3. ``sys.argv[0]`` if it names an existing ``.py`` file.
+    4. ``Path.cwd() / "pipeline.py"`` as a last resort.
+
+    The config path is resolved as:
+
+    - ``sys.argv[argv_index]`` if that argument is present (explicit override).
+    - Otherwise ``<script_dir>/<script_stem>.json``.
+
+    The session name is ``script_stem.removesuffix(suffix)``, so
+    ``stroh-ej-20140708-TL2_pipeline.py`` → ``stroh-ej-20140708-TL2``.
+
+    Parameters
+    ----------
+    suffix
+        Suffix to strip from the script stem to form the session name
+        (default ``"_pipeline"``).
+    argv_index
+        ``sys.argv`` index to check for an explicit config path override
+        (default ``1``).
+
+    Returns
+    -------
+    tuple[Path, Path, str]
+        ``(script_path, config_path, session)``
+
+        - *script_path* — absolute path of the pipeline ``.py`` file.
+        - *config_path* — absolute path of the JSON config.
+        - *session*     — session identifier string.
+
+    Examples
+    --------
+    Place this at the very top of every pipeline script, before any
+    ``import caiman``::
+
+        from caiman.utils.pipeline_setup import resolve_pipeline_path
+
+        _SCRIPT_PATH, _CONFIG_PATH, session = resolve_pipeline_path()
+        _SCRIPT_DIR = _SCRIPT_PATH.parent
+    """
+    script_path = _find_script_path()
+    script_dir  = script_path.parent
+
+    if len(sys.argv) > argv_index:
+        config_path = Path(sys.argv[argv_index]).resolve()
+    else:
+        config_path = script_dir / (script_path.stem + ".json")
+
+    session = script_path.stem.removesuffix(suffix)
+    return script_path, config_path, session
+
+
+def _find_script_path() -> Path:
+    """Return the absolute path of the calling pipeline script.
+
+    Walks the call stack to find the outermost ``.py`` file that is not
+    this module itself.  Internal helper for :func:`resolve_pipeline_path`.
+    """
+    _this_file = Path(__file__).resolve()
+
+    # 1. __file__ from direct execution or IPython %run
+    # Walk the call stack — __file__ is available on the frame globals.
+    frame = inspect.currentframe()
+    while frame is not None:
+        fname = frame.f_globals.get("__file__")
+        if fname:
+            p = Path(fname).resolve()
+            if p.suffix == ".py" and p.exists() and p != _this_file:
+                return p
+        frame = frame.f_back
+
+    # 2. sys.argv[0] — set when run as `python script.py`
+    if sys.argv and sys.argv[0]:
+        p = Path(sys.argv[0]).resolve()
+        if p.suffix == ".py" and p.exists():
+            return p
+
+    # 3. Last resort
+    return Path.cwd() / "pipeline.py"
 
 
 # Module-level logger used by @log_call decorators on the public functions.
