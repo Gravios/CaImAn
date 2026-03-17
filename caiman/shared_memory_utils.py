@@ -157,15 +157,36 @@ class SharedMovieBuffer:
             src_shape = src_arr.shape
             src_nbytes = src_arr.nbytes
         else:
-            # .mmap path: load_memmap returns a zero-copy np.memmap backed by
-            # the file.  No data is read until we copy into SHM below.
+            # .mmap path: detect F-order mmap for fast sequential reads.
+            # F-order (d1,d2,T): movie_f[:,:,t0:t1] is contiguous per chunk
+            # → reads at full NVMe sequential throughput (~14 GB/s).
+            # C-order Yr (pixels,T): reshape to (T,d1,d2) is non-contiguous
+            # → astype() triggers 262K random 110KB-stride reads → 700 MB/s.
             from caiman.mmapping import load_memmap as _load_memmap
-            _Yr, _dims, _T = _load_memmap(fname)
-            # _Yr is (pixels, T) in the file's native order.
-            # Reconstruct (T, d1, d2) C-order view — still zero-copy.
-            src_arr = np.reshape(_Yr.T, [_T] + list(_dims), order="F")
-            src_shape  = src_arr.shape
-            src_nbytes = int(np.prod(src_shape)) * actual_dtype.itemsize
+            _fname_str = str(fname)
+            _is_forder = ('order_F' in _fname_str)
+            if _is_forder:
+                # F-order mmap: open as (d1, d2, T)
+                import re as _re
+                _m = _re.search(r'd1_(\d+)_d2_(\d+).*frames_(\d+)', _fname_str)
+                if _m:
+                    _fd1, _fd2, _fT = int(_m[1]), int(_m[2]), int(_m[3])
+                    _forder_mmap = np.memmap(_fname_str, dtype=np.float32,
+                                             mode='r', order='F',
+                                             shape=(_fd1, _fd2, _fT))
+                    # Transpose to (T, d1, d2) for SHM layout
+                    src_arr    = _forder_mmap.transpose(2, 0, 1)  # non-contig view
+                    src_shape  = src_arr.shape
+                    src_nbytes = _fd1 * _fd2 * _fT * actual_dtype.itemsize
+                    _forder_buf = _forder_mmap  # keep ref for streaming
+                else:
+                    _is_forder = False
+            if not _is_forder:
+                _Yr, _dims, _T = _load_memmap(_fname_str)
+                src_arr = np.reshape(_Yr.T, [_T] + list(_dims), order="F")
+                src_shape  = src_arr.shape
+                src_nbytes = int(np.prod(src_shape)) * actual_dtype.itemsize
+                _forder_buf = None
             logger.info(
                 f"SharedMovieBuffer: streaming {fname!r} into SHM "
                 f"({src_nbytes / 2**30:.2f} GiB, order={order}) …"
@@ -194,16 +215,31 @@ class SharedMovieBuffer:
         if isinstance(fname, np.ndarray):
             np.copyto(self._arr, src_arr)
         else:
-            # self._arr is (T, d1, d2); chunk along the time axis.
-            T_total   = src_shape[0]
+            T_total     = src_shape[0]
             frame_bytes = src_nbytes // T_total
-            t_chunk   = max(1, int(256 * 1024 * 1024 // frame_bytes))
-            dst_flat  = self._arr.reshape(T_total, -1)   # (T, pixels) view
-            src_flat  = src_arr.reshape(T_total, -1)
-            for t0 in range(0, T_total, t_chunk):
-                t1 = min(t0 + t_chunk, T_total)
-                np.copyto(dst_flat[t0:t1], src_flat[t0:t1].astype(actual_dtype))
-            del dst_flat, src_flat, src_arr, _Yr
+            t_chunk     = max(1, int(256 * 1024 * 1024 // frame_bytes))
+            if _is_forder and _forder_buf is not None:
+                # F-order fast path: _forder_buf is (d1, d2, T)
+                # _forder_buf[:,:,t0:t1] is a contiguous (d1,d2,chunk) block
+                # → sequential NVMe read at ~14 GB/s per chunk
+                # self._arr is (T, d1, d2) C-order
+                for t0 in range(0, T_total, t_chunk):
+                    t1 = min(t0 + t_chunk, T_total)
+                    # Read contiguous F-order chunk, transpose to (chunk,d1,d2)
+                    _chunk = np.ascontiguousarray(
+                        _forder_buf[:, :, t0:t1].transpose(2, 0, 1),
+                        dtype=actual_dtype)
+                    self._arr[t0:t1] = _chunk
+                    del _chunk
+                del _forder_buf
+            else:
+                # C-order fallback path
+                dst_flat = self._arr.reshape(T_total, -1)
+                src_flat = src_arr.reshape(T_total, -1)
+                for t0 in range(0, T_total, t_chunk):
+                    t1 = min(t0 + t_chunk, T_total)
+                    np.copyto(dst_flat[t0:t1], src_flat[t0:t1].astype(actual_dtype))
+                del dst_flat, src_flat, src_arr
 
         self._handle = ShmHandle(
             name=self._shm.name,

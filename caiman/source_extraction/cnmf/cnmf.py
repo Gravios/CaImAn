@@ -15,6 +15,7 @@ See Also:
 """
 
 from copy import deepcopy
+import multiprocessing
 import cv2
 import glob
 import inspect
@@ -289,13 +290,19 @@ class CNMF(object):
         cnm.estimates = estimates
         cnm.mmap_file = self.mmap_file
         # Transfer precomp cache so refit skips the GPU filter pass
+        import logging as _logging_refit
+        _refit_log = _logging_refit.getLogger('caiman')
         if hasattr(self, '_precomp_cache') and self._precomp_cache is not None:
             _fp = self._precomp_cache.get('filtered_path')
             if _fp and os.path.exists(_fp):
                 cnm._precomp_cache = self._precomp_cache
-                logger.info(f'refit(): reusing precomp cache {_fp}')
+                _refit_log.info(f'refit(): reusing precomp cache {_fp}')
             else:
-                logger.debug('refit(): precomp cache file missing — will recompute')
+                _refit_log.debug('refit(): precomp cache file missing — will recompute')
+        # Transfer F-order mmap path so precompute (if re-run) uses
+        # fast sequential frame reads instead of scattered C-order reads.
+        if hasattr(self, '_forder_movie_path') and self._forder_movie_path:
+            cnm._forder_movie_path = self._forder_movie_path
         cnm.fit(images)
         return cnm
 
@@ -355,11 +362,22 @@ class CNMF(object):
                     raise ValueError(f"mmap shape mismatch: {Yr.shape}")
                 # load_memmap returns (pixels, T) C-order np.memmap — no copy.
             except Exception as _e:
-                logger.debug(f"fit(): mmap Yr shortcut failed ({_e}), falling back to reshape copy")
+                logger.debug(f"fit(): mmap Yr shortcut failed ({_e}), falling back")
                 Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
         else:
-            Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
+            # When images is stored as (d1p,d2p,T).T (tile dispatcher layout),
+            # Y=transpose(images,[1,2,0]) is F-contiguous and Y.reshape(-1,T,F)
+            # is a zero-copy view. Yr = that view — no 548 MB anon copy.
+            _Y_flat = Y.reshape((-1, T), order='F')
+            if np.shares_memory(_Y_flat, Y):
+                Yr = _Y_flat  # zero-copy: (pixels, T) view of images memory
+            else:
+                Yr = np.transpose(np.reshape(images, (T, -1), order='F'))
 
+        # Guarantee C-order — some numpy reshape/transpose paths produce
+        # F-contiguous arrays depending on input strides and memory layout.
+        if not Yr.flags['C_CONTIGUOUS']:
+            Yr = np.ascontiguousarray(Yr)
         if np.isfortran(Yr):
             raise Exception('The file is in F order, it should be in C order (see save_memmap function)')
 
@@ -400,9 +418,14 @@ class CNMF(object):
                 self.estimates.sn = _precomp['sn'].flatten(order='F')
             logger.info('preprocessing ...')
             Yr = self.preprocess(Yr)
+            logger.warning(f'[pid {os.getpid()}] preprocess done')
             if self.estimates.A is None:
                 logger.info('initializing ...')
                 self.initialize(Y)
+                _n_found = (self.estimates.A.shape[1]
+                            if self.estimates.A is not None else 0)
+                logger.warning(
+                    f'[pid {os.getpid()}] init done — {_n_found} components')
 
             if self.params.get('patch', 'only_init'):  # only return values after initialization
                 if not (self.params.get('init', 'method_init') == 'corr_pnr' and
@@ -436,8 +459,13 @@ class CNMF(object):
                 self.estimates.normalize_components()
                 return
 
+            # Diagnostic: log component count at each global update stage.
+            logger.info(f'fit(): A.shape after patch assembly = {self.estimates.A.shape}')
+            logger.info(f'fit(): method_ls = {self.params.get("spatial", "method_ls")}')
             logger.info('update spatial ...')
             self.update_spatial(Yr, use_init=True)
+            logger.warning(f'[pid {os.getpid()}] update_spatial done')
+            logger.info(f'fit(): A.shape after update_spatial = {self.estimates.A.shape}')
 
             logger.info('update temporal ...')
             if not self.skip_refinement:
@@ -502,6 +530,15 @@ class CNMF(object):
 
             # ── Release parent mmap before spawning patch workers ────────
             _mmap_filename = images.filename
+            # Drop C-order mmap pages before workers start.
+            # images is a reshape view of Yr; the fd lives on Yr.
+            try:
+                import os as _os_fv2
+                _fv_target = Yr if hasattr(Yr, '_mmap') else images
+                if hasattr(_fv_target, '_mmap'):
+                    _os_fv2.posix_fadvise(
+                        _fv_target._mmap.fileno(), 0, 0, 4)  # DONTNEED
+            except Exception: pass
             del images, Yr
             import gc as _gc; _gc.collect()
 
@@ -594,6 +631,7 @@ class CNMF(object):
             # receives None and skips the S[good_neurons] indexing safely.
             self.estimates.S = None
             self.estimates.lam = None
+            logger.info(f"fit(): A.shape before merge = {self.estimates.A.shape}")
             logger.info("Merging")
             self.estimates.merged_ROIs = [0]
 
@@ -608,6 +646,7 @@ class CNMF(object):
                     self.update_temporal(Yr, use_init=False)
 
                     self.params.set('spatial', {'se': np.ones((1,) * len(self.dims), dtype=np.uint8)})
+                    logger.info(f'fit(): A.shape after merge = {self.estimates.A.shape}')
                     logger.info('update spatial ...')
                     self.update_spatial(Yr, use_init=False)
 
@@ -637,6 +676,17 @@ class CNMF(object):
                 self.update_temporal(Yr, use_init=False)
 
         self.estimates.normalize_components()
+
+        # Clean up the pool that was respawned for global updates.
+        # fit() spawns its own dedicated pool after run_CNMF_patches;
+        # always terminate it here so workers don't leak after refit().
+        if self.dview is not None and 'multiprocessing' in str(type(self.dview)):
+            try:
+                self.dview.terminate()
+                self.dview.join()
+                self.dview = None
+            except Exception:
+                pass
 
     def save(self, filename):
         '''save object in hdf5 file format
@@ -874,6 +924,12 @@ class CNMF(object):
         _sn_hint = self.estimates.sn if self.estimates.sn is not None else None
         _preproc_kwargs = {k: v for k, v in self.params.get_group('preprocess').items()
                            if k != 'sn'}  # sn passed explicitly to skip noise FFT
+        # Skip NaN scan when precomp sn is injected — data was already
+        # successfully filtered during GPU precompute (no NaNs possible).
+        # interpolate_missing_data reads the entire Yr mmap (~590 MB per
+        # worker patch) causing NVMe page faults → I/O bound at 6% CPU.
+        if _sn_hint is not None:
+            _preproc_kwargs['check_nan'] = False
         Yr, self.estimates.sn, self.estimates.g, self.estimates.psx = preprocess_data(
             Yr, sn=_sn_hint, dview=self.dview, **_preproc_kwargs)
         return Yr

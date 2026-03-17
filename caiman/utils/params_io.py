@@ -238,13 +238,20 @@ def build_cnmf_opts(
     })
 
     opts.set("init", {
-        "K"          : c.K,
-        "gSig"       : c.gSig,
-        "gSiz"       : c.gSiz,
-        "method_init": c.method_init,
-        "ssub"       : c.ssub,
-        "tsub"       : c.tsub,
-        "nb"         : c.gnb,
+        "K"              : c.K,
+        "gSig"           : c.gSig,
+        "gSiz"           : c.gSiz,
+        "method_init"    : c.method_init,
+        "ssub"           : c.ssub,
+        "tsub"           : c.tsub,
+        "nb"             : c.gnb,
+        # center_psf=True is required for corr_pnr to route the post-patch
+        # flow through: merge→update_temporal→update_spatial→update_temporal.
+        # With center_psf=False the update_spatial step is skipped entirely.
+        "center_psf"     : c.method_init == "corr_pnr",
+        # ring_size_factor: neuropil background ring model radius.
+        # None disables the ring model; 1.5 is standard for 2P cortical data.
+        "ring_size_factor": float(getattr(c, "ring_size_factor", 1.5)),
         **({"min_corr": c.min_corr} if hasattr(c, "min_corr") else {}),
         **({"min_pnr":  c.min_pnr}  if hasattr(c, "min_pnr")  else {}),
     })
@@ -259,6 +266,10 @@ def build_cnmf_opts(
 
     opts.set("spatial", {
         "nb"         : c.gnb,
+        # nnls_L0 (LAPACK active-set) is 3-5× faster than lasso_lars
+        # for sparse patch-sized problems (d=5329). lasso_lars computes
+        # the full regularization path which is expensive at patch scale.
+        "method_ls"  : str(getattr(c, "method_ls", "nnls_L0")),
     })
 
     opts.set("temporal", {

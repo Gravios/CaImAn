@@ -17,26 +17,80 @@ Incorporates all fixes:
   - Cn saved to disk for use by plot_traces.py
 """
 
-# ── 0. Environment — must be set before any caiman import ────────────────────
+# ── 0. Path resolution — before everything else ─────────────────────────────
+# Resolves the script's own directory and JSON config path robustly under:
+#   normal execution  : python pipeline_p2.py [config.json]
+#   IPython / %run     : __file__ may be relative or unavailable
+#   Emacs python-el    : __file__ is undefined; use inspect fallback
+#   sys.argv[1]        : explicit config path always wins
 import os
 import sys
 import shutil
+import json as _json_env
+import inspect as _inspect
+from pathlib import Path
 
-CAIMAN_DATA = "/data/caiman"
-CAIMAN_TEMP = "/data/caiman/temp"
-os.environ["CAIMAN_DATA"] = CAIMAN_DATA
-os.environ["CAIMAN_TEMP"] = CAIMAN_TEMP
+def _resolve_script_path() -> Path:
+    """Return the absolute path of this script file regardless of how it was invoked."""
+    # 1. Explicit argument: python pipeline_p2.py /path/to/config.json
+    #    (argv[1] override handled separately for config only)
+    # 2. __file__ — set by CPython for normal file execution and IPython %run
+    try:
+        p = Path(__file__).resolve()
+        if p.suffix == ".py" and p.exists():
+            return p
+    except NameError:
+        pass
+    # 3. inspect.getfile on the calling frame — works in Emacs python-el eval
+    #    and any other exec() context where __file__ is not injected
+    try:
+        frame = _inspect.currentframe()
+        while frame is not None:
+            fname = _inspect.getfile(frame)
+            p = Path(fname).resolve()
+            if p.suffix == ".py" and "pipeline_p2" in p.stem:
+                return p
+            frame = frame.f_back
+    except (TypeError, OSError):
+        pass
+    # 4. Last resort: use cwd / pipeline_p2.py
+    return Path.cwd() / "pipeline_p2.py"
 
-# BLAS: restrict each worker to one thread so that n_processes workers
-# use n_processes cores rather than n_processes × n_cores threads.
-os.environ.setdefault("MKL_NUM_THREADS",       "1")
-os.environ.setdefault("OMP_NUM_THREADS",       "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS",  "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS",   "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS","1")  # macOS Accelerate
+_SCRIPT_PATH    = _resolve_script_path()
+_PIPELINES_DIR  = _SCRIPT_PATH.parent          # directory containing this script
+_CONFIG_PATH    = (
+    Path(sys.argv[1]).resolve() if len(sys.argv) > 1
+    else _PIPELINES_DIR / (_SCRIPT_PATH.stem + ".json")
+)
 
-# Matplotlib: headless Agg backend — no display required.
-os.environ.setdefault("MPLBACKEND", "Agg")
+# ── 1. Environment — must be set before any caiman import ────────────────────
+# Loaded from the "env" section of the JSON config so that all tuning
+# knobs (CAIMAN_TILE_SLOTS, thread counts, paths) live in one place.
+try:
+    _env_cfg = _json_env.load(open(_CONFIG_PATH)).get("env", {})
+except Exception as _env_exc:
+    _env_cfg = {}
+    import warnings
+    warnings.warn(f"pipeline_p2: could not load env from {_CONFIG_PATH}: {_env_exc}")
+
+# Apply env vars from config. Variables that control CaImAn internals
+# (CAIMAN_DATA, CAIMAN_TEMP, CAIMAN_SHM, CAIMAN_TILE_SLOTS) are set
+# unconditionally; thread-count knobs use setdefault so a value already
+# present in the shell environment takes precedence.
+_FORCE_SET = {"CAIMAN_DATA", "CAIMAN_TEMP", "CAIMAN_SHM", "CAIMAN_TILE_SLOTS"}
+for _k, _v in _env_cfg.items():
+    if _k in _FORCE_SET:
+        os.environ[_k] = str(_v)
+    else:
+        os.environ.setdefault(_k, str(_v))
+
+# Derive convenience constants from the now-set env vars.
+CAIMAN_DATA = os.environ.get("CAIMAN_DATA", "/data/caiman")
+CAIMAN_TEMP = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
+CAIMAN_SHM  = os.environ.get("CAIMAN_SHM",  "/dev/shm")
+
+# Ensure VECLIB_MAXIMUM_THREADS is also set (macOS Accelerate fallback).
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 for _d in [CAIMAN_DATA, os.path.join(CAIMAN_DATA, "model"), CAIMAN_TEMP]:
     os.makedirs(_d, exist_ok=True)
@@ -77,7 +131,6 @@ _cnn_available = _ensure_model_files()
 # ── 1. Imports ────────────────────────────────────────────────────────────────
 import logging
 import warnings
-from pathlib import Path
 
 # scipy 1.17.0 regression: dia_matrix.transpose() calls `offsets % max_dim`
 # without guarding against max_dim=0.  This fires harmlessly when CNMF patches
@@ -112,16 +165,7 @@ from caiman.source_extraction.cnmf import params as cnmf_params
 
 # QC figure generation (headless matplotlib, never crashes the pipeline)
 # Ensure pipelines/ is on sys.path so pipeline_qc resolves regardless of cwd.
-# __file__ is undefined when the script is eval'd (e.g. Emacs python-el),
-# so fall back to inspect to locate the source file.
-import sys as _sys, inspect as _inspect
-try:
-    _pipelines_dir = str(Path(__file__).resolve().parent)
-except NameError:
-    _pipelines_dir = str(
-        Path(_inspect.getfile(_inspect.currentframe())).resolve().parent
-    )
-_sys.path.insert(0, _pipelines_dir)
+sys.path.insert(0, str(_PIPELINES_DIR))
 # pipeline_qc import is deferred until after JSON is loaded so that
 # _qc_dir (which depends on datsrc/expsrc from the JSON) is available.
 
@@ -130,25 +174,12 @@ import multiprocessing.reduction as _mpr
 _mpr.ForkingPickler.dumps = _dill.dumps
 
 # ── 2. Load parameters from JSON ─────────────────────────────────────────────
-# The JSON file lives next to this script and shares its stem name.
+# The JSON file path was resolved at the top of this script (_CONFIG_PATH).
 # Edit pipeline_p2.json to change any parameter; do not hardcode values here.
-# Guard prevents execution when imported as a module (e.g. by tests).
 from caiman.utils.params_io import load_pipeline_params, build_cnmf_opts
 from caiman.utils.param_summary import log_params
 
-if __name__ != "__main__":
-    raise ImportError(
-        "pipeline_p2.py is a script and must be run directly, not imported."
-    )
-
-# Derive JSON name from the script's own stem — works under both normal
-# execution and Emacs eval where __file__ may be undefined.
-_params_path = (
-    Path(_pipelines_dir)
-    / (Path(_inspect.getfile(_inspect.currentframe())).stem + ".json")
-)
-
-_P = load_pipeline_params(_params_path)
+_P = load_pipeline_params(_CONFIG_PATH)
 
 # ── Session identity ─────────────────────────────────────────────────────────
 datsrc  = Path(_P.session.data_root)
@@ -300,7 +331,8 @@ with _timer("QC: raw sample"):
 import glob as _glob
 
 _mc_order    = "F"
-_mc_pattern  = os.path.join(CAIMAN_TEMP, f"*{session}*order_{_mc_order}*.mmap")
+# Exclude precomp mmap from MC search — it contains order_F but is not a movie
+_mc_pattern  = os.path.join(CAIMAN_TEMP, f"*{session}*rig*order_{_mc_order}*.mmap")
 _mc_existing = sorted(_glob.glob(_mc_pattern))
 
 if _mc_existing:
@@ -394,6 +426,26 @@ with _timer("QC: correlation image"):
     )
 # Cn kept alive — reused for footprint overlays in fit/refit/eval QC
 
+# ── 10b. Release correlation image RSS before CNMF ───────────────────────────
+# local_correlations_fft loads images[::5] into anonymous memory (~31 GB RSS).
+# Holding this through precompute means 32 GB parent RSS competes with
+# 27 GB filt_full writes for page cache, evicting filt_full pages and
+# forcing NVMe re-reads in pass 2 and by workers.
+# Re-open as a zero-copy mmap view — RSS drops back to ~1 GB.
+del images, Yr
+import gc as _gc; _gc.collect()
+# Force Python allocator to return freed pages to OS immediately.
+# Without this, RSS stays elevated (~5 GB) despite del+gc, causing
+# the worker budget check to cap at 6 workers instead of 8.
+try:
+    import ctypes as _ct_mt
+    _ct_mt.cdll.LoadLibrary('libc.so.6').malloc_trim(0)
+except Exception:
+    pass
+Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+images = np.reshape(Yr.T, [T] + list(dims), order="F")
+images.filename = Yr.filename
+
 # ── 11. CNMF parameters object ───────────────────────────────────────────────
 # Cluster first so n_processes is available for build_cnmf_opts.
 
@@ -411,6 +463,43 @@ for _shm in _glob.glob('/dev/shm/psm_*'):
     try:
         os.unlink(_shm)
         logger.info(f"Cleared stale CaImAn SHM segment: {_shm}")
+    except OSError:
+        pass
+
+# Clean up stale worker intermediate mmaps and tile buffers
+# Clean stale worker SHM files from crashed runs.
+# caiman_{pid}_* files: PID liveness check before deleting.
+# psm_*, sem.loky-*, __KMP_REGISTERED_LIB_*: always delete (all transient).
+import re as _re_cl
+_caiman_files = (
+    _glob.glob(os.path.join(CAIMAN_SHM, 'caiman_*.mmap')) +
+    _glob.glob(os.path.join(CAIMAN_SHM, '_caiman_tile_*.mmap')) +
+    _glob.glob(os.path.join(CAIMAN_SHM, '_caiman_filt_*.mmap')) +
+    _glob.glob(os.path.join(CAIMAN_TEMP, 'caiman_*.mmap')))
+_transient_files = (
+    _glob.glob(os.path.join(CAIMAN_SHM, 'psm_*')) +
+    _glob.glob(os.path.join(CAIMAN_SHM, 'sem.loky-*')) +
+    _glob.glob(os.path.join(CAIMAN_SHM, '__KMP_REGISTERED_LIB_*')))
+for _stale in _caiman_files:
+    _m = _re_cl.search(r'caiman_(\d+)_', os.path.basename(_stale))
+    if _m:
+        _pid = int(_m.group(1))
+        try:
+            os.kill(_pid, 0)
+            continue          # process alive — leave file alone
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            continue
+    try:
+        os.unlink(_stale)
+        logger.info(f"Cleared stale worker mmap: {_stale}")
+    except OSError:
+        pass
+for _stale in _transient_files:
+    try:
+        os.unlink(_stale)
+        logger.info(f"Cleared stale SHM file: {_stale}")
     except OSError:
         pass
     
@@ -433,6 +522,40 @@ opts = build_cnmf_opts(
 try:
     cnm = cnmf.CNMF(n_processes, params=opts, dview=dview)
     cnm._forder_movie_path = fname_mc   # ← required for F-order frame reads
+    # Drop C-order mmap pages from page cache before spawning workers.
+    # The Cn step faults in ~22 GB of clean mmap pages into parent RSS.
+    # Those compete with worker /dev/shm files (tmpfs, swappable) and
+    # fill the 27 GB swap partition. Evicting them here frees ~22 GB
+    # before any worker allocation begins.
+    try:
+        import ctypes as _ctypes
+        _ctypes.CDLL('libc.so.6').malloc_trim(0)  # release freed heap
+        # Drop C-order mmap pages using madvise(MADV_DONTNEED) on the
+        # mapped memory region directly. posix_fadvise on a file descriptor
+        # is unreliable on FUSE filesystems (ntfs-3g ignores it); madvise
+        # on the mapped VA range is handled by the kernel directly and
+        # evicts pages immediately regardless of the underlying filesystem.
+        _mmap_target = Yr if hasattr(Yr, '_mmap') else None
+        if _mmap_target is None and hasattr(images, '_mmap'):
+            _mmap_target = images
+        if _mmap_target is not None:
+            _mm  = _mmap_target._mmap          # the underlying mmap.mmap object
+            _libc = _ctypes.CDLL('libc.so.6', use_errno=True)
+            # madvise(addr, length, MADV_DONTNEED=4) — evicts pages from
+            # the kernel page cache via the mapped VA, bypassing FUSE.
+            _buf  = (_ctypes.c_char * 1).from_buffer(_mm)  # get VA of mapping
+            _addr = _ctypes.c_void_p(_ctypes.addressof(_buf))
+            _len  = _ctypes.c_size_t(len(_mm))
+            _rc   = _libc.madvise(_addr, _len, 4)  # MADV_DONTNEED
+            if _rc == 0:
+                logger.info(f"Released C-order mmap page cache via madvise(MADV_DONTNEED) ({len(_mm)//2**30:.1f} GB)")
+            else:
+                logger.warning(f"madvise(MADV_DONTNEED) returned {_rc}, errno={_ctypes.get_errno()} — falling back to posix_fadvise")
+                import os as _os_fv
+                _os_fv.posix_fadvise(_mmap_target._mmap.fileno(), 0, 0, 4)
+                logger.info("Released C-order mmap page cache via posix_fadvise (fallback)")
+    except Exception as _fv_exc:
+        logger.debug(f"madvise page release failed: {_fv_exc}")
     with _timer("CNMF fit (greedy_roi init)"):
         cnm.fit(images)
 

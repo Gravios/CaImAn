@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python
 
 """ A set of pre-processing operations in the input dataset:
@@ -250,7 +251,10 @@ def get_noise_fft(Y, noise_range=[0.25, 0.5], noise_method='logmexp', max_num_sa
     # (3+ GB dense alloc) and the serial cv2.dft loop (262k iterations)
     # are both significant.  For small inputs (patch workers, single pixels)
     # H2D overhead dominates and the CPU path is faster.
-    if n_pixels > 4096 and T > max_num_samples_fft:
+    # CAIMAN_NO_GPU_NOISE is set in patch workers to prevent concurrent
+    # GPU access from multiple worker processes exhausting VRAM.
+    _no_gpu = os.environ.get('CAIMAN_NO_GPU_NOISE', '') not in ('', '0')
+    if not _no_gpu and n_pixels > 4096 and T > max_num_samples_fft:
         try:
             return _get_noise_fft_gpu(Y, noise_range, noise_method, max_num_samples_fft)
         except Exception as _gpu_exc:
