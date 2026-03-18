@@ -1707,9 +1707,25 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             data_filtered[:] = _filt_raw[::_ftsub]
             del _filt_raw
         # Use precomputed sn, data_max, pnr (no filter loop, no get_noise_fft)
-        noise_pixel = precomp['sn']             # (d1p, d2p)
-        data_max    = precomp['data_max']        # (d1p, d2p)
-        pnr         = np.divide(data_max, noise_pixel + 1e-10)
+        # Shape guard: sn/data_max are sliced from the full-FOV npz using
+        # patch FOV coords (x0:x1, y0:y1), giving shape (d1, d2).  In the
+        # tile path the worker receives fewer columns when the patch sits at
+        # a tile boundary (tile clipped to the movie edge), so
+        # data_filtered.shape[1:] = (d1, d2_tile) ≠ (d1, d2).
+        # If shapes mismatch, fall through to local noise estimation.
+        _sn_candidate = precomp.get('sn')
+        if (_sn_candidate is not None
+                and _sn_candidate.shape == (d1, d2)):
+            noise_pixel = _sn_candidate
+            data_max    = precomp['data_max']
+            pnr         = np.divide(data_max, noise_pixel + 1e-10)
+        else:
+            # sn shape mismatch (stale npz or tile boundary clip) —
+            # compute noise locally from the already-filtered data.
+            data_filtered -= data_filtered.mean(axis=0)
+            data_max    = np.max(data_filtered, axis=0)
+            noise_pixel = get_noise_fft(data_filtered.T, noise_method='mean')[0].T
+            pnr         = np.divide(data_max, noise_pixel + 1e-10)
     else:
         for _idx in range(total_frames):
             _src = np.asarray(data_raw[_idx], dtype=np.float32)
