@@ -237,8 +237,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Behaviour
     p.add_argument("--dry-run", action="store_true",
         help="Print what would be done without writing any files")
-    p.add_argument("--force", action="store_true",
-        help="Overwrite existing pipeline files without prompting")
+    p.add_argument("-y", "--force", action="store_true",
+        help="Overwrite existing pipeline files without prompting (useful in batch scripts)")
     p.add_argument("--no-comments", action="store_true",
         help="Strip _comment keys from the output JSON")
 
