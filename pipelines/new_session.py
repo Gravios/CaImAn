@@ -242,6 +242,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-comments", action="store_true",
         help="Strip _comment keys from the output JSON")
 
+    p.add_argument("--run-mc", action="store_true",
+        help="Run GPU motion correction before parameter estimation if no MC mmap "
+             "exists yet. Uses conservative defaults for 512×512 stacks. "
+             "Implies --estimate-params.")
+
     p.add_argument("--estimate-params", action="store_true",
         help="Run parameter estimation from the TIF after creating the session "
              "files and update the JSON with the suggestions (requires caiman)")
@@ -249,6 +254,62 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Frames to subsample for parameter estimation (default 500)")
 
     return p
+
+
+
+def _run_motion_correction(
+    tif_path: Path,
+    session:  str,
+    caiman_temp: str,
+    logger,
+) -> tuple:
+    """Run GPU rigid motion correction with conservative 512×512 defaults.
+
+    Writes the F-order mmap to ``caiman_temp`` and returns
+    ``(fname_mc, mc_object)`` so that the caller can inspect shifts
+    for better MC parameter suggestions, then delete the mmap.
+    Returns ``(None, None)`` on failure.
+
+    Default parameters are tuned for 512×512 galvo 2P stacks:
+    - ``max_shifts = [6, 6]`` — ±6 px per axis, catches typical brain motion
+    - ``strides / overlaps`` — standard piecewise-rigid tile size (unused for
+      rigid MC, included for forward-compatibility)
+    - ``border_nan = "copy"`` — no black borders after shift
+    - ``pw_rigid = False`` — rigid-only; faster and sufficient for most cases
+    """
+    try:
+        from caiman.motion_correction import MotionCorrect as _MC
+        import numpy as _np
+
+        logger.info(f"MC: rigid GPU correction on {tif_path}")
+        mc = _MC(
+            [str(tif_path)],
+            dview               = None,
+            max_shifts          = [6, 6],
+            strides             = [64, 64],
+            overlaps            = [32, 32],
+            max_deviation_rigid = 3,
+            shifts_opencv       = True,
+            nonneg_movie        = True,
+            border_nan          = "copy",
+            pw_rigid            = False,
+            use_gpu             = True,
+        )
+        mc.motion_correct(save_movie=True)
+        fname_mc = mc.mmap_file[0]
+
+        shifts = _np.array(mc.shifts_rig)
+        mag    = _np.hypot(shifts[:, 0], shifts[:, 1])
+        logger.info(
+            f"MC done: {fname_mc}  "
+            f"(median shift {_np.median(mag):.2f} px, "
+            f"max {mag.max():.2f} px)"
+        )
+        return fname_mc, mc
+
+    except Exception as exc:
+        logger.warning(f"MC failed: {exc}")
+        return None, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -341,14 +402,14 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Done.")
 
-    # ── Optional parameter estimation ────────────────────────────────────
-    if args.estimate_params:
+    # ── Optional motion correction + parameter estimation ────────────────
+    _do_estimate = args.estimate_params or args.run_mc
+    if _do_estimate:
         tif_path = dest / f"{session}.tif"
         if not tif_path.exists():
-            print(f"\n  ⚠  Cannot estimate params: {tif_path.name} not found.")
-            print(f"     Place the TIFF and re-run with --estimate-params.")
+            print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
+            print(f"     Place the TIFF and re-run.")
         else:
-            print(f"\nEstimating parameters from {tif_path.name}...")
             try:
                 import logging as _logging
                 _est_logger = _logging.getLogger("caiman")
@@ -357,35 +418,96 @@ def main(argv: list[str] | None = None) -> int:
                     _h = _logging.StreamHandler()
                     _h.setFormatter(_logging.Formatter("%(message)s"))
                     _est_logger.addHandler(_h)
-                # Find the MC mmap if it exists, else use the raw TIF
+
                 import glob as _glob
+                _caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
                 _mc = sorted(_glob.glob(str(
                     dest / f"*{session}*rig*order_F*.mmap")))
-                _caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
                 _mc_temp = sorted(_glob.glob(
                     os.path.join(_caiman_temp, f"*{session}*rig*order_F*.mmap")))
                 _mc_path = (_mc or _mc_temp)
-                if _mc_path:
-                    from caiman.utils.params_estimator import estimate_params, apply_suggestions
-                    _suggestions = estimate_params(
-                        _mc_path[-1],
-                        n_frames  = args.n_frames,
-                        out_path  = out_json.parent / f"{session}_qc_00_param_estimate.png",
-                        logger    = _est_logger,
+
+                # ── Run MC if requested and not already done ──────────────
+                # Track whether we created the MC mmap so we can delete it.
+                _mc_created = False
+                _mc_obj     = None
+                if args.run_mc and not _mc_path:
+                    print(f"\nRunning motion correction on {tif_path.name}...")
+                    _new_mc, _mc_obj = _run_motion_correction(
+                        tif_path, session, _caiman_temp, _est_logger)
+                    if _new_mc:
+                        _mc_path   = [_new_mc]
+                        _mc_created = True   # we own it — delete after use
+                elif args.run_mc and _mc_path:
+                    print(f"\n  MC mmap already exists — skipping motion correction.")
+                    print(f"  ({_mc_path[-1]})")
+
+                # ── MC parameter suggestions from shifts ──────────────────
+                # Only when we ran MC ourselves: derive better max_shifts
+                # from the actual shift distribution rather than using the
+                # conservative [6,6] default.
+                if _mc_created and _mc_obj is not None:
+                    import numpy as _np_mc
+                    _shifts = _np_mc.array(_mc_obj.shifts_rig)   # (T, 2)
+                    _mag    = _np_mc.hypot(_shifts[:, 0], _shifts[:, 1])
+                    # Suggested max_shifts = 99th-percentile magnitude per
+                    # axis, rounded up to the next even integer, minimum 4.
+                    _p99_r  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 0]), 99))
+                    _p99_c  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 1]), 99))
+                    _ms_r   = max(4, int(_np_mc.ceil(_p99_r / 2)) * 2)
+                    _ms_c   = max(4, int(_np_mc.ceil(_p99_c / 2)) * 2)
+                    _mc_overrides = {"max_shifts": [_ms_r, _ms_c]}
+                    _est_logger.info(
+                        f"MC shift analysis: p99 row={_p99_r:.2f} col={_p99_c:.2f} px "
+                        f"→ max_shifts=[{_ms_r}, {_ms_c}]"
                     )
-                    apply_suggestions(out_json, _suggestions)
-                    print(f"\n  JSON updated with estimated parameters.")
-                else:
-                    print(f"  No MC mmap found for {session} — run motion correction first,"
-                          f" then re-run with --estimate-params.")
+                    del _mc_obj
+                    # Write shift-derived MC params into the JSON now,
+                    # before parameter estimation (which may also update json).
+                    from caiman.utils.params_estimator import apply_suggestions as _apply
+                    _apply(out_json, {f"motion_correction.{k}": v
+                                      for k, v in _mc_overrides.items()})
+                    print(f"  MC parameter update: max_shifts={[_ms_r, _ms_c]}")
+
+                # ── Parameter estimation ──────────────────────────────────
+                try:
+                    if _mc_path and _mc_path[-1]:
+                        print(f"\nEstimating parameters...")
+                        from caiman.utils.params_estimator import estimate_params, apply_suggestions
+                        _suggestions = estimate_params(
+                            _mc_path[-1],
+                            n_frames  = args.n_frames,
+                            out_path  = out_json.parent / f"{session}_qc_00_param_estimate.png",
+                            logger    = _est_logger,
+                        )
+                        apply_suggestions(out_json, _suggestions)
+                        print(f"\n  JSON updated with estimated parameters.")
+                    elif not args.run_mc:
+                        print(f"  No MC mmap found for {session}.")
+                        print(f"  Re-run with --run-mc to run motion correction first.")
+                finally:
+                    # Delete the MC mmap only if we created it.
+                    # Pre-existing mmaps are always left untouched.
+                    if _mc_created and _mc_path and _mc_path[-1]:
+                        try:
+                            import os as _os_del
+                            _os_del.unlink(_mc_path[-1])
+                            _est_logger.info(f"Deleted temporary MC mmap: {_mc_path[-1]}")
+                            print(f"  Deleted temporary MC mmap: {Path(_mc_path[-1]).name}")
+                        except OSError as _del_exc:
+                            _est_logger.warning(f"Could not delete MC mmap: {_del_exc}")
+
             except Exception as _exc:
-                print(f"  Parameter estimation failed: {_exc}")
+                import traceback as _tb
+                print(f"  Failed: {_exc}")
+                _tb.print_exc()
 
     print()
     print("Next steps:")
     print(f"  1. Review and tune:  {out_json.name}")
     print(f"  2. Place TIFF:       {dest}/{session}.tif")
-    print(f"  3. Run:              python {out_py.name}")
+    print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
+    print(f"  4. Run:              python {out_py.name}")
     print()
 
     return 0
