@@ -19,3 +19,5 @@ scipy
 tifffile
 tqdm
 zarr
+myst-parser
+sphinx-autodoc-typehints

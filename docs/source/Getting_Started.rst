@@ -357,3 +357,94 @@ faster on C-order arrays vs F-order arrays. For motion correction, which needs t
 frames (often in the middle of the movie), it is much more efficient to read and write in F order. On the other 
 hand, when it comes to CNMF, you need to access individual pixels across the entire movie, so Caiman saves the 
 motion-corrected movie in C-order before running CNMF.
+
+
+.. _pipeline-framework:
+
+Pipeline Framework (Gravios fork)
+----------------------------------
+
+The Gravios fork adds a structured pipeline framework on top of the standard
+CaImAn API.  Instead of writing a new script from scratch for each session,
+you copy a template, rename it, and edit a JSON config file.
+
+Quick start
+~~~~~~~~~~~
+
+.. code:: bash
+
+    # 1. Prepare a session (runs MC + estimates parameters)
+    python pipelines/new_session.py \
+        stroh-ej-20140708-TL2 \
+        /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/08072014/ \
+        -y --run-mc --estimate-params
+
+    # 2. Review stroh-ej-20140708-TL2_pipeline.json, then run
+    python stroh-ej-20140708-TL2_pipeline.py
+
+The session name is derived from the script filename by stripping the
+``_pipeline`` suffix — rename both files together and everything else
+(log, QC figures, results, report) follows automatically.
+
+For a complete reference see :doc:`pipeline_framework`, :doc:`configuration`,
+and :doc:`session_management`.
+
+Orchestrator objects
+~~~~~~~~~~~~~~~~~~~~
+
+The fork provides two orchestrator objects that replace manual
+fit/refit/evaluate/QC calls:
+
+- ``CNMFRunner``: wraps ``fit → refit → evaluate → select → detrend_dff → save``,
+  pulling all parameters from the JSON config via ``ParamBag``.
+
+- ``QCRunner``: saves headless PNG figures at each pipeline stage, resolving
+  output paths and parameter values (``fr``, ``min_corr``, ``min_pnr``) from
+  the config automatically.
+
+.. code:: python
+
+    from caiman.utils.cnmf_runner import CNMFRunner
+    from caiman.utils.qc import QCRunner
+
+    qc     = QCRunner(_P, session, outdir)
+    runner = CNMFRunner(_P, session, outdir,
+                        fname_mc=fname_mc, fname_cnmf=fname_cnmf,
+                        dims=dims, bord_px=bord_px,
+                        dview=dview, n_processes=n_processes,
+                        cnn_available=_cnn_available)
+
+    cnm2 = runner.run_all(images, Yr=Yr, qc=qc, Cn=Cn, timer=timer)
+
+Multiprocessing guard
+~~~~~~~~~~~~~~~~~~~~~
+
+All pipeline scripts must wrap the pipeline body in
+``if __name__ == "__main__":``.  Without this guard, multiprocessing
+``spawn`` re-imports the script as ``__main__`` in each worker, causing the
+entire pipeline to execute once per worker process.
+
+.. code:: python
+
+    # Bootstrap — runs in every process (env vars only)
+    from caiman.utils.pipeline_setup import resolve_pipeline_path
+    _SCRIPT_PATH, _CONFIG_PATH, session = resolve_pipeline_path()
+    # ... apply env section from JSON ...
+
+    # Pipeline body — parent process only
+    if __name__ == "__main__":
+        import caiman as cm
+        ...
+
+Simplified logging
+~~~~~~~~~~~~~~~~~~
+
+The ``setup_logging`` utility replaces the manual logger setup shown above::
+
+    from caiman.utils.pipeline_setup import setup_logging
+    logger = setup_logging(outdir / f"{session}.log")
+
+This configures the ``"caiman"`` logger with a file handler (DEBUG level) and
+a console handler (INFO level), truncates the log on each run, creates parent
+directories, and removes stale handlers so re-runs in the same interpreter
+session do not produce duplicate output.

@@ -1,7 +1,4 @@
-.. CaImAn documentation master file, created by
-   sphinx-quickstart on Thu Dec 24 01:22:58 2015.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+.. CaImAn documentation master file
 
 **CaImAn**  documentation
 ===================================================
@@ -10,15 +7,49 @@ Contents:
 
 .. toctree::
    :maxdepth: 3
+   :caption: Overview
 
    Overview
    CaImAn_features_and_references
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Setup
+
    Installation
    Getting_Started
-   Handling_Movies
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Pipeline Framework
+
+   pipeline_framework
+   configuration
+   session_management
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Performance
+
    performance_guide
+   gpu_acceleration
+   memory_management
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Reference
+
    CaImAn_Tips
+   Handling_Movies
    file_formats
+   core_functions
+   utilities_api
+
+.. toctree::
+   :maxdepth: 3
+   :caption: Development
+
    GUI
    cluster
-   core_functions
+   modernization_targets
+   troubleshooting

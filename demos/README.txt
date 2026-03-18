@@ -1,27 +1,46 @@
-The demos serve a few purposes:
-1) They demonstrate use of the Caiman software with some sample data either
-    bundled or automatically fetchable
-2) They act as a template for you to write your own analysis
-3) They can be directly used if they already do almost exactly what you need
-    to do with Caiman.
+CaImAn Demo Scripts
+===================
 
-There are two types of demos, each in their own folder:
-* Jupyter demos are meant to be run interactively, in Jupyter or potentially
-    one of its variants or something else compatible with Jupyter notebooks.
-    They run in a cell-oriented way, allowing you to step through each part of
-    the Caiman pipeline, seeing results and possibly changing things (values of
-    parameters, files to work on, similar) between them.
-* CLI demos are meant to be run from the commandline of your operating system
-    (Powershell or CMD on Windows, Bash/Zsh inside a Terminal on Linux or OSX).
-    When running Caiman this way, you might or might not want to see
-    visualisations, and the arguments you provide to these demos control their
-    behaviour.
+demos/general/
+--------------
 
-The CLI demos used to have a different intended use case, also being meant for
-cell-based interactive use, but in an IPython-based IDE like Spyder; this usage
-is no longer supported (use something compatible with Jupyter notebook formats
-for that). The earlier form of the demos is available in our use_cases repo in
-this directory:
+Updated for the Gravios fork.  All demos use CNMFRunner, QCRunner, and
+PipelineTimer from caiman.utils instead of manual fit/refit/evaluate calls.
 
-https://github.com/flatironinstitute/caiman_use_cases/tree/main/use_cases/old_cli_demos
+demo_pipeline.py
+    Two-photon batch CNMF pipeline.  Downloads the Sue_2x_3000 demo dataset
+    automatically.  Replaces the upstream demo_pipeline.py with GPU MC,
+    memory-safe F→C conversion, CNMFRunner orchestration, and headless QC
+    figures via QCRunner.
 
+demo_pipeline_cnmfE.py
+    One-photon / CNMF-E microendoscope pipeline.  Downloads data_endoscope.tif
+    automatically.  Uses corr_pnr initialisation with ring background model
+    (gnb=-1).  Includes ring size constraint check at startup.
+
+demo_OnACID.py
+    OnACID online analysis.  Processes frames streaming through the algorithm.
+    Uses PipelineTimer and QCRunner for post-hoc figures on the final estimates.
+
+demo_param_estimation.py
+    Standalone parameter estimation tool.  Takes an existing MC mmap (or runs
+    MC from a TIF with --run-mc) and estimates gSig, min_corr, min_pnr, rf
+    from the data.  Can write suggestions directly into a pipeline JSON.
+
+demo_pipeline_NWB.py
+    Two-photon pipeline with NWB output (upstream, unchanged).
+
+demo_pipeline_voltage_imaging.py
+    Voltage imaging pipeline using VolPy (upstream, unchanged).
+
+demo_behavior.py
+    Behavioral video analysis (upstream, unchanged).
+
+demos/notebooks/
+----------------
+
+Jupyter notebooks for interactive exploration.  Launch with:
+
+    jupyter lab --ZMQChannelsWebsocketConnection.iopub_data_rate_limit=1.0e10
+
+See docs/source/Getting_Started.rst for details.

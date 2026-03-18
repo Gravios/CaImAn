@@ -27,3 +27,69 @@ If you cannot get the performance (or memory usage) you need with Caiman, you ma
 If you have suitable GPU hardware, look into enabling GPU support in tensorflow, by reading the README-GPU.md doc.
 
 For some of these alternative dependencies, they may be installable through conda. Some platforms, for example, have alternate builds of math libraries that either will use CPU instructions specific to certain CPUs, or some OS parallelisation settings. Look in particular at `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `VECLIB_MAXIMUM_THREADS`, but know that adjustments to these can cause the code to hang during processing. 
+
+GPU acceleration
+----------------
+
+This fork adds GPU paths for the most expensive pipeline stages.  All GPU
+paths fall back to CPU silently when CuPy is not available.
+
+**Motion correction** (`use_gpu=True`) uses a batched cuFFT phase-correlation
+implementation.  Typical speedup: 30–45× over the CPU multiprocessing path
+for a 512×512 × 5000 frame movie.
+
+**Full-FOV filter precompute** replaces per-patch CPU filtering.  The GPU
+filters the entire FOV once in chunks of `precompute_chunk_frames` frames
+and writes a float16 mmap to `/dev/shm`.  Workers copy their slice from RAM
+instead of running T filter calls per patch.
+
+Tune `precompute_chunk_frames` in the JSON `gpu` section:
+
+```text
+peak VRAM per chunk ≈ 2 × chunk_frames × d1 × d2 × 4 bytes
+500 frames × 512 × 512 × 4 × 2 = 1.05 GB
+```
+
+**correlation_pnr** uses the same chunked GPU path for summary image
+computation.  Pass `use_gpu=True` to force GPU or `use_gpu=None` (default)
+for automatic dispatch.
+
+**Spatial update** uses a GPU gram-matrix path that is ~10–20× faster than
+the CPU path for K=50, T=6000.
+
+See [gpu_acceleration](gpu_acceleration) for a full table and details.
+
+Memory management
+-----------------
+
+Three explicit memory management calls are integrated at critical points in
+the pipeline:
+
+- `malloc_trim()`: returns glibc heap free-pages to the OS immediately after
+  large array deletions.  Without this Python holds freed pages for minutes,
+  artificially inflating RSS and causing the worker budget check to spawn
+  fewer processes than available RAM allows.
+
+- `madvise_dontneed(Yr)`: evicts the C-order mmap from the kernel page cache
+  before CNMF workers start.  Workers read the F-order mmap from NVMe; the
+  C-order copy does not need to compete for page-cache slots during the fit.
+
+- `cupy_flush()`: fully reclaims VRAM after MC and Cn computation.  Sequence:
+  `gc.collect()` → FFT plan cache clear → pool `free_all_blocks()` → device
+  sync.  The pool flush alone is insufficient — Python gc must run first to
+  drop references, and the FFT plan cache maintains its own CUDA allocations
+  separately.
+
+Storage: NVMe vs FUSE
+---------------------
+
+`CAIMAN_TEMP` must be on a local NVMe drive formatted ext4.  NTFS-3g FUSE
+causes D-state stalls (uninterruptible I/O waits) during tile loading because
+FUSE silently ignores `posix_fadvise` hints.  The pipeline uses
+`madvise(MADV_DONTNEED)` instead, which is handled by the kernel VM
+subsystem regardless of filesystem.
+
+| Filesystem | Tile read time | MC mmap write speed |
+|---|---|---|
+| NTFS-3g (FUSE) | ~40 s/tile | ~94 MB/s |
+| ext4 NVMe | ~1 s/tile | ~3 GB/s |

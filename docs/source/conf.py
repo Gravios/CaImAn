@@ -21,6 +21,9 @@ import shlex
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('../../ca_source_extraction'))
+sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('../../caiman/utils'))
+
 sys.path.insert(0, os.path.abspath('../../SPGL1_python_port'))
 # -- General configuration ------------------------------------------------
 
@@ -32,20 +35,31 @@ sys.path.insert(0, os.path.abspath('../../SPGL1_python_port'))
 # ones.
 extensions = [
     'sphinx.ext.autodoc',
-    #    'sphinx.ext.viewcode',
-    #    'sphinx.ext.napoleon',
+    'sphinx.ext.autosummary',
+    'sphinx.ext.napoleon',
+    'sphinx.ext.viewcode',
     'numpydoc',
-    'sphinx.ext.autosummary'
+    'myst_parser',
 ]
 # Had: 'numpydoc'
+
+# Mock imports for modules with syntax errors or heavy optional deps
+autodoc_mock_imports = [
+    'caiman.source_extraction.volpy.spikepursuit',
+    'caiman.source_extraction.volpy.volpy',
+]
+
+autosummary_generate = True
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
-# source_suffix = ['.rst', '.md']
-source_suffix = ['.rst', '.md']
+source_suffix = {
+    '.rst': 'restructuredtext',
+    '.md':  'markdown',
+}
 
 # The encoding of source files.
 #source_encoding = 'utf-8-sig'
@@ -54,9 +68,9 @@ source_suffix = ['.rst', '.md']
 master_doc = 'index'
 
 # General information about the project.
-project = 'CaImAn'
-copyright = '2024, Flatiron Institute, Simons Foundation, New York, NY'
-author = 'Eftychios Pnevmatikakis and Andrea Giovannucci'
+project = 'CaImAn (Gravios fork)'
+copyright = '2024, Flatiron Institute, Simons Foundation. Gravios fork: Institute of Imaging and Optogenetics, JGU Mainz'
+author = 'Eftychios Pnevmatikakis, Andrea Giovannucci, and Gravios contributors'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
