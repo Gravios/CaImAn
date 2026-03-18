@@ -434,33 +434,44 @@ def apply_suggestions(
     json_path: Union[str, Path],
     suggestions: dict,
     *,
+    section: str = "cnmf",
     dry_run: bool = False,
 ) -> None:
     """Write parameter suggestions into an existing pipeline JSON file.
 
-    Only the keys present in *suggestions* are updated; all other values
-    in the ``cnmf`` section are preserved.
+    Keys in *suggestions* may be plain strings (written into *section*) or
+    dotted ``"section.key"`` strings (written into the named section).
+    All other values in the JSON are preserved.
 
     Parameters
     ----------
     json_path
         Path to ``<session>_pipeline.json``.
     suggestions
-        Dict returned by :func:`estimate_params`.
+        Dict of ``{key: value}`` or ``{"section.key": value}`` pairs.
+        Plain keys are written into *section* (default ``"cnmf"``).
+        Dotted keys override the section: ``"motion_correction.max_shifts"``
+        writes ``max_shifts`` into the ``motion_correction`` section.
+    section
+        Default section for plain (non-dotted) keys (default ``"cnmf"``).
     dry_run
-        If ``True``, print what would be written without modifying the file.
+        If ``True``, log what would be written without modifying the file.
     """
-    import json
+    import json as _json
 
     path = Path(json_path)
-    raw  = json.loads(path.read_text())
-    cnmf = raw.setdefault("cnmf", {})
+    raw  = _json.loads(path.read_text())
 
     changed = {}
     for k, v in suggestions.items():
-        if cnmf.get(k) != v:
-            changed[k] = (cnmf.get(k), v)
-        cnmf[k] = v
+        if "." in k:
+            sec, leaf = k.split(".", 1)
+        else:
+            sec, leaf = section, k
+        target = raw.setdefault(sec, {})
+        if target.get(leaf) != v:
+            changed[f"{sec}.{leaf}"] = (target.get(leaf), v)
+        target[leaf] = v
 
     if not changed:
         logger.info("apply_suggestions: no changes needed")
@@ -468,11 +479,11 @@ def apply_suggestions(
 
     if dry_run:
         logger.info("apply_suggestions (dry run):")
-        for k, (old, new) in changed.items():
-            logger.info(f"  {k}: {old!r} → {new!r}")
+        for k, (old_v, new_v) in changed.items():
+            logger.info(f"  {k}: {old_v!r} → {new_v!r}")
         return
 
-    path.write_text(json.dumps(raw, indent=4) + "\n")
+    path.write_text(_json.dumps(raw, indent=4) + "\n")
     logger.info(f"apply_suggestions: updated {path.name}")
-    for k, (old, new) in changed.items():
-        logger.info(f"  {k}: {old!r} → {new!r}")
+    for k, (old_v, new_v) in changed.items():
+        logger.info(f"  {k}: {old_v!r} → {new_v!r}")
