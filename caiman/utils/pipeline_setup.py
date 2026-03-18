@@ -47,8 +47,9 @@ def resolve_pipeline_path(
     Must be called before any caiman import — it has zero caiman dependencies
     and uses only the Python standard library.
 
-    Resolution order for the script path
-    -------------------------------------
+    Notes
+    -----
+    **Resolution order for the script path:**
     1. ``__file__`` from the calling frame — set by CPython for normal
        execution and IPython ``%run``.
     2. Frame globals walk — works in Emacs ``python-el`` and any ``exec()``
@@ -56,9 +57,9 @@ def resolve_pipeline_path(
     3. ``sys.argv[0]`` if it names an existing ``.py`` file.
     4. ``Path.cwd() / "pipeline.py"`` as a last resort.
 
-    Session name derivation
-    -----------------------
-    The following pipeline suffixes are recognised (dot *and* underscore
+    **Session name derivation:**
+
+        The following pipeline suffixes are recognised (dot *and* underscore
     variants, upper *and* lower case):
 
     ===========================  ===========================
@@ -70,9 +71,9 @@ def resolve_pipeline_path(
     ``sess.Pipeline.py``         ``sess``
     ===========================  ===========================
 
-    Config path
-    -----------
-    - ``sys.argv[argv_index]`` when that argument is present (explicit JSON
+    **Config path:**
+
+        - ``sys.argv[argv_index]`` when that argument is present (explicit JSON
       path override).
     - Otherwise ``<script_dir>/<session>_pipeline.json`` if that file exists.
     - Otherwise ``<script_dir>/<script_stem>.json`` (legacy dot-naming

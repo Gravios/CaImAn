@@ -364,3 +364,106 @@ See also:
 
 * :doc:`Our clustering doc <cluster>`
 
+
+
+.. _gpu-install:
+
+GPU Acceleration Setup (Gravios fork)
+--------------------------------------
+
+This section covers the additional requirements for the GPU-accelerated
+pipeline features added in this fork.
+
+Requirements
+~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 20 60
+
+   * - Component
+     - Version
+     - Notes
+   * - CUDA
+     - 11.8+
+     - Check with ``nvidia-smi``
+   * - CuPy
+     - ≥ 12 (match CUDA)
+     - ``pip install cupy-cuda12x``
+   * - dill
+     - any
+     - Enables pickling of non-standard callables across workers
+   * - scikit-image
+     - any
+     - LoG blob detection for parameter estimation
+   * - NVMe storage
+     - —
+     - ``CAIMAN_TEMP`` must be on NVMe ext4; NTFS-3g FUSE causes D-state stalls
+
+Installing CuPy
+~~~~~~~~~~~~~~~
+
+.. code:: bash
+
+    # CUDA 12.x
+    pip install cupy-cuda12x
+
+    # CUDA 11.x
+    pip install cupy-cuda11x
+
+    # Verify
+    python -c "import cupy as cp; print(cp.cuda.Device(0).compute_capability)"
+
+Install from source (Gravios fork)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code:: bash
+
+    git clone https://github.com/Gravios/CaImAn.git
+    cd CaImAn
+    pip install -e .
+    pip install cupy-cuda12x dill psutil scikit-image
+
+Install drop-in over existing environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If your lab machine already has CaImAn installed, apply only the changed
+files without touching the rest of the package:
+
+.. code:: bash
+
+    tar -xzf pipeline_refactor.tar.gz -C ~/software/CaImAn/
+
+Storage configuration
+~~~~~~~~~~~~~~~~~~~~~
+
+Set these paths in the ``env`` section of your pipeline JSON (see
+:doc:`configuration`):
+
+.. code:: text
+
+    CAIMAN_DATA    /data/caiman          # CNN model files, persistent data
+    CAIMAN_TEMP    /data/caiman/temp     # MC mmaps, CNMF mmaps — NVMe required
+    CAIMAN_SHM     /dev/shm              # tile buffers (RAM-backed tmpfs)
+
+The pipeline creates these directories automatically on first run.
+
+**Why NVMe for CAIMAN_TEMP?**  The GPU precompute filter writes a ~14.5 GB
+float16 mmap to ``/dev/shm`` and reads the F-order MC mmap from
+``CAIMAN_TEMP``.  On NTFS-3g (FUSE) tile reads take ~40 s each; on ext4 NVMe
+the same read takes ~1 s.
+
+Thread count
+~~~~~~~~~~~~
+
+Always set BLAS thread counts to 1 to prevent oversubscription across
+multiprocessing workers:
+
+.. code:: bash
+
+    export MKL_NUM_THREADS=1
+    export OMP_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export NUMEXPR_NUM_THREADS=1
+
+These are set automatically from the JSON ``env`` section by the pipeline.

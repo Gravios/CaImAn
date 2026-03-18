@@ -160,3 +160,65 @@ Deconvolution tips
    if you deconvolve DF/F traces and have knowledge of what change in DF/F units a spike is
    inducing, you can use this information to approximate the number of spikes (under certain
    linearity assumptions)..
+
+
+GPU acceleration tips (Gravios fork)
+-------------------------------------
+
+-  Enable GPU motion correction by passing ``use_gpu=True`` to
+   ``MotionCorrect``.  The pipeline template does this by default.  The GPU
+   path falls back to CPU automatically if CuPy is not installed.
+
+-  Flush the CuPy pool before starting CNMF.  Motion correction and
+   correlation-image computation each leave ~12 GB parked in CuPy's memory
+   pool.  Call ``cupy_flush(logger)`` before the CNMF fit to reclaim VRAM:
+
+   .. code:: python
+
+       from caiman.utils.memory import cupy_flush
+       cupy_flush(logger, label="before CNMF fit")
+
+-  Tune ``precompute_chunk_frames`` (JSON ``gpu`` section) to control VRAM
+   usage during the filter precompute.  At 500 frames (default) peak VRAM is
+   ~1.05 GB per chunk for 512×512 data.  Reduce if you see GPU OOM during
+   precompute.
+
+-  The spatial update GPU path fires automatically when CuPy is available.
+   It computes a K×K gram matrix on GPU rather than K×T per-pixel NNLS,
+   giving ~10–20× speedup for K=50.  No configuration needed.
+
+Pipeline framework tips (Gravios fork)
+---------------------------------------
+
+-  Always put the pipeline body inside ``if __name__ == "__main__":``.
+   Without this guard, multiprocessing ``spawn`` re-executes the pipeline in
+   every worker, producing duplicate log entries and redundant computation.
+
+-  Use ``new_session.py --run-mc --estimate-params`` before the first run on
+   a new dataset.  This runs GPU motion correction, analyses the shift
+   distribution to suggest ``max_shifts``, estimates ``gSig``, ``min_corr``,
+   and ``min_pnr`` from the Cn/PNR images, writes the suggestions into the
+   JSON, and deletes the temporary MC mmap.  Pre-existing mmaps are never
+   deleted.
+
+-  The ring size constraint ``ring_size_factor × gSiz < rf`` is checked at
+   runtime.  Violating it causes ``compute_W`` to return a degenerate weight
+   matrix, collapsing hundreds of raw patch components to very few after
+   assembly.  If component count is unexpectedly low, check this constraint
+   first.
+
+-  Call ``malloc_trim()`` after deleting large arrays and before the CNMF
+   fit.  Python's glibc allocator holds freed pages for minutes; explicit
+   trimming returns them to the OS and allows the worker budget check to
+   allocate the correct number of processes.
+
+-  Use ``QCRunner`` for headless figure generation.  It resolves all output
+   paths and parameter values from the ``ParamBag`` automatically, so call
+   sites contain only the data objects that change at each step:
+
+   .. code:: python
+
+       qc = QCRunner(_P, session, outdir)
+       qc.raw_sample(fnames)
+       qc.motion_correction(mc)
+       qc.traces(cnm2)

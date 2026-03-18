@@ -3,15 +3,14 @@ caiman/utils/timing.py
 ======================
 Step-level timing and resource tracking for CaImAn pipelines.
 
-Two complementary patterns
---------------------------
+Two usage patterns are supported:
 
-**Context manager** — for inline pipeline steps (the primary interface):
+Context manager (primary interface for inline pipeline steps)::
 
     with timer("Motion correction"):
         mc.motion_correct(save_movie=True)
 
-**Decorator** — for steps expressed as named functions:
+Decorator (for steps expressed as named functions)::
 
     @timer.step("Motion correction")
     def run_motion_correction():
@@ -21,9 +20,9 @@ Two complementary patterns
 
 Both produce identical log output and event records.
 
-**`@log_call`** — lightweight decorator for utility functions.  Logs the
+``@log_call`` is a lightweight decorator for utility functions.  Logs the
 function name, key arguments, and elapsed time at DEBUG level without
-creating a full timer event:
+creating a full timer event::
 
     @log_call(logger)
     def ensure_model_files(model_dir):
@@ -101,14 +100,16 @@ class PipelineTimer:
     logger
         Logger to write START / DONE messages to.
 
-    Context-manager usage
-    ---------------------
+    Examples
+    --------
+    Context-manager usage::
+
     >>> timer = PipelineTimer(logger)
     >>> with timer("Motion correction"):
     ...     mc.motion_correct(save_movie=True)
 
-    Decorator usage
-    ---------------
+    Decorator usage::
+
     >>> @timer.step("Motion correction")
     ... def run_motion_correction():
     ...     mc.motion_correct(save_movie=True)

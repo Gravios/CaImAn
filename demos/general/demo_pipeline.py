@@ -1,202 +1,248 @@
 #!/usr/bin/env python
-
 """
-Complete demo pipeline for processing two photon calcium imaging data using the
-Caiman batch algorithm. The processing pipeline included motion correction,
-source extraction and deconvolution. The demo shows how to construct the
-params, MotionCorrect and cnmf objects and call the relevant functions. You
-can also run a large part of the pipeline with a single method (cnmf.fit_file)
-See inside for details.
+Two-photon batch CNMF pipeline demo
+=====================================
+Updated for Gravios/CaImAn fork.  Replaces ``demos/general/demo_pipeline.py``.
 
-Demo is also available as a jupyter notebook (see demo_pipeline.ipynb)
-Dataset couresy of Sue Ann Koay and David Tank (Princeton University)
+Changes from the upstream demo
+-------------------------------
+- ``if __name__ == "__main__":`` guard prevents worker re-execution under
+  multiprocessing ``spawn``
+- GPU motion correction (``use_gpu=True``, no cluster)
+- ``fc_convert_parallel`` for memory-safe F→C conversion (single-pass slabs)
+- ``cupy_flush`` + ``madvise_dontneed`` + ``malloc_trim`` before CNMF
+- ``CNMFRunner`` replaces manual fit → refit → evaluate → select → dF/F
+- ``QCRunner`` produces headless PNG figures at each step
+- ``PipelineTimer`` records timing and resource usage per step
+- ``write_report`` writes ``<session>_report.txt`` and ``_report.json``
 
-This demo pertains to two photon data. For a complete analysis pipeline for
-one photon microendoscopic data see demo_pipeline_cnmfE.py
+Usage
+-----
+    python demos/demo_pipeline_2p.py
+
+Downloads the Sue_2x_3000_40_-46.tif demo dataset automatically via
+``caiman.utils.utils.download_demo`` if not already present.
 """
 
-import argparse
-import cv2
-import glob
-import logging
-import matplotlib
-import numpy as np
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# Must run in every process (parent + workers).  Keep stdlib-only.
 import os
+import sys
 
-try:
-    cv2.setNumThreads(0)
-except:
-    pass
+os.environ.setdefault("MKL_NUM_THREADS",      "1")
+os.environ.setdefault("OMP_NUM_THREADS",      "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS",  "1")
+os.environ.setdefault("MPLBACKEND",           "Agg")
 
-import caiman
-from caiman.motion_correction import MotionCorrect
-from caiman.source_extraction.cnmf import cnmf as cnmf
-from caiman.source_extraction.cnmf import params as params
-from caiman.summary_images import local_correlations_movie_offline
-from caiman.utils.utils import download_demo
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import gc
+    import json
+    import warnings
+    from pathlib import Path
 
+    import numpy as np
+    import cv2
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
 
-def main():
-    cfg = handle_args()
-    # Set up logging
-    logger = logging.getLogger("caiman")
-    logger.setLevel(logging.INFO) # Or another loglevel
-    logfmt = logging.Formatter("[%(filename)s:%(funcName)20s():%(lineno)s] %(message)s")
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero encountered in remainder",
+        category=RuntimeWarning,
+        module=r"scipy\.sparse\._dia",
+    )
 
-    if cfg.logfile:
-        handler = logging.FileHandler(cfg.logfile)
-    else:
-        handler = logging.StreamHandler()
+    import caiman as cm
+    import caiman.mmapping
+    import caiman.summary_images as csi
+    from caiman.motion_correction import MotionCorrect
+    from caiman.utils.utils          import download_demo
 
-    handler.setFormatter(logfmt)
-    logger.addHandler(handler)
+    from caiman.utils.tiff_io        import fc_convert_parallel
+    from caiman.utils.params_io      import ParamBag
+    from caiman.utils.pipeline_setup import setup_logging, ensure_model_files, clean_stale_shm
+    from caiman.utils.timing         import PipelineTimer, write_report
+    from caiman.utils.memory         import malloc_trim, madvise_dontneed, cupy_flush
+    from caiman.utils.cnmf_runner    import CNMFRunner
+    from caiman.utils.qc             import QCRunner
 
-    # First set up some parameters for data and motion correction
-    opts = params.CNMFParams(params_from_file=cfg.configfile)
+    import dill as _dill
+    import multiprocessing.reduction as _mpr
+    _mpr.ForkingPickler.dumps = _dill.dumps
 
-    if cfg.input is not None:
-        opts.change_params({"data": {"fnames": cfg.input}})
-    if not opts.data['fnames']: # Set neither by CLI arg nor through JSON, so use default data
-        fnames = [download_demo('Sue_2x_3000_40_-46.tif')]
-        opts.change_params({"data": {"fnames": fnames}})
+    # ── Paths and session ─────────────────────────────────────────────────
+    CAIMAN_DATA = os.environ.get("CAIMAN_DATA", cm.paths.caiman_datadir())
+    CAIMAN_TEMP = os.environ.get("CAIMAN_TEMP", os.path.join(CAIMAN_DATA, "temp"))
+    CAIMAN_SHM  = os.environ.get("CAIMAN_SHM",  "/dev/shm")
 
-    m_orig = caiman.load_movie_chain(opts.data['fnames'])
+    for _d in [CAIMAN_DATA, os.path.join(CAIMAN_DATA, "model"), CAIMAN_TEMP]:
+        os.makedirs(_d, exist_ok=True)
 
-    # play the movie (optional)
-    # playing the movie using opencv. It requires loading the movie in memory.
-    # To close the video press q
+    outdir  = Path(CAIMAN_DATA) / "demo_2p_output"
+    outdir.mkdir(exist_ok=True)
+    session = "demo_2p"
 
-    if not cfg.no_play:
-        ds_ratio = 0.2
-        moviehandle = m_orig.resize(1, 1, ds_ratio)
-        moviehandle.play(q_max=99.5, fr=60, magnification=2)
+    logger         = setup_logging(outdir / f"{session}.log")
+    _cnn_available = ensure_model_files(os.path.join(CAIMAN_DATA, "model"))
+    timer          = PipelineTimer(logger)
 
-    # start a cluster for parallel processing
-    c, dview, n_processes = caiman.cluster.setup_cluster(backend=cfg.cluster_backend, n_processes=cfg.cluster_nproc)
+    # ── Download demo data ────────────────────────────────────────────────
+    fname = download_demo("Sue_2x_3000_40_-46.tif")
+    logger.info(f"Input: {fname}")
 
-    # Motion Correction
-    # first we create a motion correction object with the specified parameters
-    mc = MotionCorrect(opts.data['fnames'], dview=dview, **opts.get_group('motion'))
-    # note that the file is not loaded in memory
+    # ── Parameters ───────────────────────────────────────────────────────
+    # Build a minimal ParamBag directly from a dict.
+    # In a real session this comes from load_pipeline_params("session_pipeline.json").
+    _params_dict = {
+        "data": {
+            "fr": 15,
+            "decay_time": 0.4,
+            "add_baseline": 100.0,
+        },
+        "motion_correction": {
+            "max_shifts": [6, 6],
+            "strides": [48, 48],
+            "overlaps": [24, 24],
+            "max_deviation_rigid": 3,
+            "pw_rigid": False,
+            "shifts_opencv": True,
+            "border_nan": "copy",
+        },
+        "cnmf": {
+            "p": 1,
+            "gnb": 2,
+            "merge_thr": 0.8,
+            "rf": 15,
+            "stride": 6,
+            "K": 4,
+            "gSig": [4, 4],
+            "gSiz": [17, 17],
+            "ring_size_factor": 1.5,
+            "min_corr": 0.8,
+            "min_pnr": 10.0,
+            "ssub": 1,
+            "tsub": 1,
+            "method_init": "greedy_roi",
+            "method_deconv": "oasis",
+            "method_ls": "lasso_lars",
+            "dff_quantile_min": 8,
+            "dff_frames_window": 250,
+        },
+        "quality": {
+            "min_SNR": 2.0,
+            "rval_thr": 0.85,
+            "use_cnn": True,
+            "min_cnn_thr": 0.5,
+            "cnn_lowest": 0.1,
+        },
+        "cluster": {
+            "n_processes": None,
+            "ram_budget_frac": 0.75,
+            "worker_overhead_frac": 1.6,
+            "blas_threads_per_worker": 1,
+        },
+        "gpu": {
+            "precompute_chunk_frames": 500,
+        },
+    }
+    _P = ParamBag(_params_dict)
+    qc = QCRunner(_P, session, outdir)
 
-    # Run (piecewise-rigid motion) correction using NoRMCorre
-    mc.motion_correct(save_movie=True)
+    # ── Motion correction ─────────────────────────────────────────────────
+    mc = MotionCorrect(
+        [fname], dview=None, use_gpu=True, nonneg_movie=True,
+        max_shifts          = _P.motion_correction.max_shifts,
+        strides             = _P.motion_correction.strides,
+        overlaps            = _P.motion_correction.overlaps,
+        max_deviation_rigid = _P.motion_correction.max_deviation_rigid,
+        shifts_opencv       = _P.motion_correction.shifts_opencv,
+        border_nan          = _P.motion_correction.border_nan,
+        pw_rigid            = _P.motion_correction.pw_rigid,
+    )
+    with timer("Motion correction"):
+        mc.motion_correct(save_movie=True)
+    fname_mc   = mc.mmap_file[0]
+    shifts_rig = mc.shifts_rig
+    logger.info(f"MC done: {fname_mc}")
 
-    # compare with original movie
-    if not cfg.no_play:
-        m_orig = caiman.load_movie_chain(opts.data['fnames'])
-        m_els = caiman.load(mc.mmap_file)
-        ds_ratio = 0.2
-        moviehandle = caiman.concatenate([m_orig.resize(1, 1, ds_ratio) - mc.min_mov*mc.nonneg_movie,
-                                      m_els.resize(1, 1, ds_ratio)], axis=2)
-        moviehandle.play(fr=60, q_max=99.5, magnification=2)  # press q to exit
+    with timer("QC: motion correction"):
+        qc.motion_correction(mc)
+    del mc
 
-    # MEMORY MAPPING
-    border_to_0 = 0 if mc.border_nan == 'copy' else mc.border_to_0
-    # you can include the boundaries of the FOV if you used the 'copy' option
-    # during motion correction, although be careful about the components near
-    # the boundaries
+    bord_px = 0  # border_nan="copy"
 
-    # memory map the file in order 'C'
-    fname_new = caiman.save_memmap(mc.mmap_file, base_name='memmap_', order='C',
-                               border_to_0=border_to_0)  # exclude borders
+    # ── F→C mmap conversion ───────────────────────────────────────────────
+    Yr_F, dims, T = cm.mmapping.load_memmap(fname_mc)
+    n_px       = int(np.prod(dims))
+    fname_cnmf = cm.paths.fn_relocated(
+        cm.paths.memmap_frames_filename(session + "_cnmf", dims, T, "C"),
+        force_temp=True,
+    )
+    Yr_C = np.memmap(fname_cnmf, mode="w+", dtype=np.float32,
+                     shape=cm.mmapping.prepare_shape((n_px, T)), order="C")
+    with timer("F→C mmap conversion"):
+        fc_convert_parallel(Yr_F, Yr_C, n_px, T,
+                            _P.data.add_baseline, logger)
+    del Yr_C, Yr_F
+    logger.info(f"C-order mmap: {fname_cnmf}")
 
-    # now load the file
-    Yr, dims, T = caiman.load_memmap(fname_new)
-    images = np.reshape(Yr.T, [T] + list(dims), order='F')
-    # load frames in python format (T x X x Y)
+    # ── Correlation image ─────────────────────────────────────────────────
+    Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+    images = np.reshape(Yr.T, [T] + list(dims), order="F")
+    images.filename = Yr.filename
+    logger.info(f"Data: {images.shape}  dtype={images.dtype}")
 
-    # restart cluster to clean up memory
-    caiman.stop_server(dview=dview)
-    c, dview, n_processes = caiman.cluster.setup_cluster(backend=cfg.cluster_backend, n_processes=cfg.cluster_nproc)
+    cupy_flush(logger, label="before summary-image step")
+    with timer("Correlation image (Cn)"):
+        Cn = csi.local_correlations_fft(images[::5], swap_dim=False)
+        Cn[np.isnan(Cn)] = 0
+        np.save(str(outdir / f"{session}_Cn.npy"), Cn)
 
-    # RUN CNMF ON PATCHES
-    # First extract spatial and temporal components on patches and combine them
-    # for this step deconvolution is turned off (p=0). If you want to have
-    # deconvolution within each patch change params.patch['p_patch'] to a
-    # nonzero value
+    with timer("QC: correlation image"):
+        qc.correlation_image(Cn)
 
-    #opts.change_params({'p': 0})
-    cnm = cnmf.CNMF(n_processes, params=opts, dview=dview)
-    cnm.fit(images)
+    # Release Cn-step RSS before CNMF
+    del images, Yr
+    gc.collect()
+    malloc_trim(logger)
+    Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+    images = np.reshape(Yr.T, [T] + list(dims), order="F")
+    images.filename = Yr.filename
 
-    # plot contours of found components
-    Cns = local_correlations_movie_offline(mc.mmap_file[0],
-                                           remove_baseline=True,
-                                           window=1000, stride=1000,
-                                           winSize_baseline=100, quantil_min_baseline=10,
-                                           dview=dview)
-    Cn = Cns.max(axis=0)
-    Cn[np.isnan(Cn)] = 0
-    if not cfg.no_play:
-        cnm.estimates.plot_contours(img=Cn)
+    # ── CNMF ──────────────────────────────────────────────────────────────
+    clean_stale_shm(CAIMAN_SHM, CAIMAN_TEMP, logger)
+    logger.info("Starting CNMF cluster")
+    _, dview, n_processes = cm.cluster.setup_cluster(
+        backend="multiprocessing",
+        n_processes=None,
+        single_thread=False,
+    )
 
-    # save results
-    cnm.estimates.Cn = Cn
-    cnm.save(fname_new[:-5] + '_init.hdf5') # FIXME
+    runner = CNMFRunner(
+        _P, session, outdir,
+        fname_mc      = fname_mc,
+        fname_cnmf    = fname_cnmf,
+        dims          = dims,
+        bord_px       = bord_px,
+        dview         = dview,
+        n_processes   = n_processes,
+        cnn_available = _cnn_available,
+    )
 
-    # RE-RUN seeded CNMF on accepted patches to refine and perform deconvolution
-    cnm2 = cnm.refit(images, dview=dview)
+    try:
+        cnm2 = runner.run_all(images, Yr=Yr, qc=qc, Cn=Cn, timer=timer)
+        del images, Yr, Cn
+    finally:
+        logger.info("Stopping cluster")
+        cm.stop_server(dview=dview)
 
-    # Component Evaluation
-    #   Components are evaluated in three ways:
-    #   a) the shape of each component must be correlated with the data
-    #   b) a minimum peak SNR is required over the length of a transient
-    #   c) each shape passes a CNN based classifier
+    # ── Report ────────────────────────────────────────────────────────────
+    write_report(timer, session, outdir, logger)
 
-    cnm2.estimates.evaluate_components(images, cnm2.params, dview=dview)
-
-    if not cfg.no_play:
-        # Plot Components
-        cnm2.estimates.plot_contours(img=Cn, idx=cnm2.estimates.idx_components)
-
-        # View Traces (accepted and rejected)
-        cnm2.estimates.view_components(images, img=Cn,
-                                      idx=cnm2.estimates.idx_components)
-        cnm2.estimates.view_components(images, img=Cn,
-                                      idx=cnm2.estimates.idx_components_bad)
-
-    # update object with selected components (optional)
-    cnm2.estimates.select_components(use_object=True)
-
-    # Extract DF/F values
-    cnm2.estimates.detrend_df_f(quantileMin=8, frames_window=250)
-
-    # Show final traces
-    if not cfg.no_play:
-        cnm2.estimates.view_components(img=Cn)
-
-    cnm2.estimates.Cn = Cn
-    cnm2.save(cnm2.mmap_file[:-4] + 'hdf5')
-
-    # reconstruct denoised movie (press q to exit)
-    if not cfg.no_play:
-        cnm2.estimates.play_movie(images, q_max=99.9, gain_res=2,
-                                  magnification=2,
-                                  bpx=border_to_0,
-                                  include_bck=False)  # background not shown
-
-    # Stop the cluster and clean up log files
-    caiman.stop_server(dview=dview)
-    if not cfg.no_play:
-        matplotlib.pyplot.show(block=True)
-
-    if not cfg.keep_logs:
-        log_files = glob.glob('*_LOG_*')
-        for log_file in log_files:
-            os.remove(log_file)
-
-def handle_args():
-    parser = argparse.ArgumentParser(description="Demonstrate 2P Pipeline using batch algorithm")
-    parser.add_argument("--configfile", default=os.path.join(caiman.paths.caiman_datadir(), 'demos', 'general', 'params_demo_pipeline.json'), help="JSON Configfile for Caiman parameters")
-    parser.add_argument("--keep_logs",  action="store_true", help="Keep temporary logfiles")
-    parser.add_argument("--no_play",    action="store_true", help="Do not display results")
-    parser.add_argument("--cluster_backend", default="multiprocessing", help="Specify multiprocessing, ipyparallel, or single to pick an engine")
-    parser.add_argument("--cluster_nproc", type=int, default=None, help="Override automatic selection of number of workers to use")
-    parser.add_argument("--input", action="append", help="File(s) to work on, provide multiple times for more files")
-    parser.add_argument("--logfile",    help="If specified, log to the named file")
-    return parser.parse_args()
-
-########
-main()
-
+    print(f"\nResults saved to: {outdir}/{session}_results.hdf5")
+    print(f"Components:       {cnm2.estimates.A.shape[1]}")
+    print(f"Report:           {outdir}/{session}_report.txt")

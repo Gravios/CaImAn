@@ -155,8 +155,10 @@ def cupy_flush(
 ) -> None:
     """Fully reclaim VRAM before a GPU-intensive step.
 
-    Sequence
-    --------
+    Notes
+    -----
+    **Flush sequence:**
+
     1. ``gc.collect()`` — drops Python references so arrays are added to
        CuPy's free-list rather than staying live.
     2. ``cp.fft.config.get_plan_cache().clear()`` — releases cuFFT plans,

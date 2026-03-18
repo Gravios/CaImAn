@@ -258,3 +258,80 @@ VolPy
 .. currentmodule:: caiman.source_extraction.volpy.spikepursuit
 .. autofunction:: volspike
 
+
+
+Pipeline Framework Utilities (Gravios fork)
+--------------------------------------------
+
+The following utilities are available in ``caiman.utils``.
+Full API documentation with parameter descriptions is in :doc:`utilities_api`.
+
+.. currentmodule:: caiman.utils.pipeline_setup
+
+Path resolution and infrastructure
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   resolve_pipeline_path
+   setup_logging
+   ensure_model_files
+   clean_stale_shm
+
+.. currentmodule:: caiman.utils.cnmf_runner
+
+CNMF Orchestrator
+~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   CNMFRunner
+
+.. currentmodule:: caiman.utils.qc
+
+QC Figures
+~~~~~~~~~~~
+
+.. autosummary::
+
+   QCRunner
+   qc_raw_sample
+   qc_motion_correction
+   qc_correlation_image
+   qc_pnr_image
+   qc_cnmf_fit
+   qc_cnmf_refit
+   qc_component_evaluation
+   qc_traces
+
+.. currentmodule:: caiman.utils.params_estimator
+
+Parameter Estimation
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   estimate_params
+   apply_suggestions
+
+.. currentmodule:: caiman.utils.timing
+
+Timing and Reporting
+~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   PipelineTimer
+   write_report
+   log_call
+
+.. currentmodule:: caiman.utils.memory
+
+Memory Management
+~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+
+   malloc_trim
+   madvise_dontneed
+   cupy_flush

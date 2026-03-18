@@ -1,154 +1,271 @@
 #!/usr/bin/env python
-
 """
-Complete pipeline for motion correction, source extraction, and deconvolution
-of one photon microendoscopic calcium imaging data using the CaImAn package.
-The demo demonstrates how to use the params, MotionCorrect and cnmf objects
-for processing 1p microendoscopic data. The analysis pipeline is similar as in
-the case of 2p data processing with core difference being the usage of the
-CNMF-E algorithm for source extraction (as opposed to plain CNMF). Check
-the companion paper for more details.
+One-photon / CNMF-E microendoscope pipeline demo
+==================================================
+Updated for Gravios/CaImAn fork.  Replaces ``demos/general/demo_pipeline_cnmfE.py``.
 
-See also the jupyter notebook demo_pipeline_cnmfE.ipynb
+Key differences from 2P
+------------------------
+- ``method_init = "corr_pnr"`` with ring neuropil background model
+- ``gnb = -1``: ring model replaces global background components
+- ``ring_size_factor``: must satisfy ``ring_size_factor × gSiz < rf``
+- Smaller ``gSig`` (1–3 px for microendoscope / Miniscope data)
+- ``ssub_B = 2``: background spatial downsampling
+
+Ring size constraint check
+---------------------------
+    ring_size_factor × gSiz[0] < rf
+
+With the defaults below: 1.4 × 13 = 18.2 < 40 ✓
+
+Usage
+-----
+    python demos/demo_pipeline_cnmfe.py
+
+Downloads ``data_endoscope.tif`` automatically if not present.
 """
 
-import argparse
-import glob
-import logging
-import matplotlib.pyplot as plt
-import numpy as np
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
 import os
+import sys
 
-import caiman
-from caiman.motion_correction import MotionCorrect
-from caiman.source_extraction import cnmf
-from caiman.source_extraction.cnmf import params as params
-from caiman.utils.utils import download_demo
-from caiman.utils.visualization import inspect_correlation_pnr
+os.environ.setdefault("MKL_NUM_THREADS",      "1")
+os.environ.setdefault("OMP_NUM_THREADS",      "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS",  "1")
+os.environ.setdefault("MPLBACKEND",           "Agg")
 
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import gc
+    import warnings
+    from pathlib import Path
 
+    import numpy as np
+    import cv2
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
 
-def main():
-    cfg = handle_args()
-    # Set up logging
-    logger = logging.getLogger("caiman")
-    logger.setLevel(logging.INFO) # Or another loglevel
-    logfmt = logging.Formatter("[%(filename)s:%(funcName)20s():%(lineno)s] %(message)s")
+    warnings.filterwarnings(
+        "ignore",
+        message="divide by zero encountered in remainder",
+        category=RuntimeWarning,
+        module=r"scipy\.sparse\._dia",
+    )
 
-    if cfg.logfile:
-        handler = logging.FileHandler(cfg.logfile)
-    else:
-        handler = logging.StreamHandler()
+    import caiman as cm
+    import caiman.mmapping
+    import caiman.summary_images as csi
+    from caiman.motion_correction import MotionCorrect
+    from caiman.utils.utils          import download_demo
 
-    handler.setFormatter(logfmt)
-    logger.addHandler(handler)
+    from caiman.utils.tiff_io        import fc_convert_parallel
+    from caiman.utils.params_io      import ParamBag
+    from caiman.utils.pipeline_setup import setup_logging, ensure_model_files, clean_stale_shm
+    from caiman.utils.timing         import PipelineTimer, write_report
+    from caiman.utils.memory         import malloc_trim, madvise_dontneed, cupy_flush
+    from caiman.utils.cnmf_runner    import CNMFRunner
+    from caiman.utils.qc             import QCRunner
 
-    opts = params.CNMFParams(params_from_file=cfg.configfile)
+    import dill as _dill
+    import multiprocessing.reduction as _mpr
+    _mpr.ForkingPickler.dumps = _dill.dumps
 
-    if cfg.input is not None:
-        # If no input is specified, use sample data, downloading if necessary
-        opts.change_params({"data": {"fnames": cfg.input}})
-    if not opts.data['fnames']: # Set neither by CLI arg nor through JSON, so use default data
-        fnames = [download_demo('data_endoscope.tif')]
-        opts.change_params({"data": {"fnames": fnames}})
+    # ── Paths and session ─────────────────────────────────────────────────
+    CAIMAN_DATA = os.environ.get("CAIMAN_DATA", cm.paths.caiman_datadir())
+    CAIMAN_TEMP = os.environ.get("CAIMAN_TEMP", os.path.join(CAIMAN_DATA, "temp"))
+    CAIMAN_SHM  = os.environ.get("CAIMAN_SHM",  "/dev/shm")
 
-    # First set up some parameters for data and motion correction
-    # dataset dependent parameters
+    for _d in [CAIMAN_DATA, os.path.join(CAIMAN_DATA, "model"), CAIMAN_TEMP]:
+        os.makedirs(_d, exist_ok=True)
 
-    c, dview, n_processes = caiman.cluster.setup_cluster(backend=cfg.cluster_backend, n_processes=cfg.cluster_nproc)
-    # Motion Correction
-    #  The motion:pw_rigid parameter determines where to use rigid or pw-rigid
-    #  motion correction
-    if not cfg.no_motion_correct:
-        # do motion correction rigid
-        mc = MotionCorrect(opts.data['fnames'], dview=dview, **opts.get_group('motion'))
+    outdir  = Path(CAIMAN_DATA) / "demo_cnmfe_output"
+    outdir.mkdir(exist_ok=True)
+    session = "demo_cnmfe"
+
+    logger         = setup_logging(outdir / f"{session}.log")
+    _cnn_available = ensure_model_files(os.path.join(CAIMAN_DATA, "model"))
+    timer          = PipelineTimer(logger)
+
+    # ── Download demo data ────────────────────────────────────────────────
+    fname = download_demo("data_endoscope.tif")
+    logger.info(f"Input: {fname}")
+
+    # ── Parameters ───────────────────────────────────────────────────────
+    # 1P / microendoscope parameters.
+    # Critical differences from 2P:
+    #   gnb = -1          → ring neuropil model (no global background)
+    #   method_init       → corr_pnr (required for ring model)
+    #   ring_size_factor  → must satisfy: ring_size_factor × gSiz < rf
+    #   ssub_B            → background spatial downsampling
+    _params_dict = {
+        "data": {
+            "fr": 10,
+            "decay_time": 0.4,
+            "add_baseline": 0.0,   # endoscope data is already baseline-corrected
+        },
+        "motion_correction": {
+            "max_shifts": [5, 5],
+            "strides": [48, 48],
+            "overlaps": [24, 24],
+            "max_deviation_rigid": 3,
+            "pw_rigid": False,
+            "shifts_opencv": True,
+            "border_nan": "copy",
+        },
+        "cnmf": {
+            "p": 1,
+            "gnb": -1,               # ring model: -1 = exact ring background
+            "ssub_B": 2,             # background spatial downsampling factor
+            "merge_thr": 0.7,
+            "rf": 40,
+            "stride": 20,
+            "K": 10,
+            "gSig": [3, 3],          # smaller than 2P: ~1–4 px for microendoscope
+            "gSiz": [13, 13],
+            "ring_size_factor": 1.4, # ring outer radius / gSiz; must be < rf/gSiz
+            "min_corr": 0.8,
+            "min_pnr": 10.0,
+            "ssub": 1,
+            "tsub": 2,
+            "method_init": "corr_pnr",   # required for ring model
+            "method_deconv": "oasis",
+            "method_ls": "lasso_lars",
+            "dff_quantile_min": 8,
+            "dff_frames_window": 500,
+        },
+        "quality": {
+            "min_SNR": 2.5,
+            "rval_thr": 0.85,
+            "use_cnn": False,        # CNN not trained on 1P data by default
+            "min_cnn_thr": 0.9,
+            "cnn_lowest": 0.1,
+        },
+        "cluster": {
+            "n_processes": None,
+            "ram_budget_frac": 0.75,
+            "worker_overhead_frac": 1.6,
+            "blas_threads_per_worker": 1,
+        },
+        "gpu": {
+            "precompute_chunk_frames": 500,
+        },
+    }
+    _P = ParamBag(_params_dict)
+
+    # Ring size constraint check
+    _gsiz = _P.cnmf.gSiz[0]
+    _rsf  = _P.cnmf.ring_size_factor
+    _rf   = _P.cnmf.rf
+    assert _rsf * _gsiz < _rf, (
+        f"Ring constraint violated: ring_size_factor({_rsf}) × gSiz({_gsiz}) "
+        f"= {_rsf*_gsiz:.1f} ≥ rf({_rf}). "
+        f"Increase rf or decrease ring_size_factor."
+    )
+    logger.info(f"Ring check: {_rsf} × {_gsiz} = {_rsf*_gsiz:.1f} < {_rf} ✓")
+
+    qc = QCRunner(_P, session, outdir)
+
+    # ── Motion correction ─────────────────────────────────────────────────
+    mc = MotionCorrect(
+        [fname], dview=None, use_gpu=True, nonneg_movie=True,
+        max_shifts          = _P.motion_correction.max_shifts,
+        strides             = _P.motion_correction.strides,
+        overlaps            = _P.motion_correction.overlaps,
+        max_deviation_rigid = _P.motion_correction.max_deviation_rigid,
+        shifts_opencv       = _P.motion_correction.shifts_opencv,
+        border_nan          = _P.motion_correction.border_nan,
+        pw_rigid            = _P.motion_correction.pw_rigid,
+    )
+    with timer("Motion correction"):
         mc.motion_correct(save_movie=True)
-        fname_mc = mc.fname_tot_els if opts.motion['pw_rigid'] else mc.fname_tot_rig
-        if opts.motion['pw_rigid']:
-            bord_px = np.ceil(np.maximum(np.max(np.abs(mc.x_shifts_els)),
-                                         np.max(np.abs(mc.y_shifts_els)))).astype(int)
-        else:
-            bord_px = np.ceil(np.max(np.abs(mc.shifts_rig))).astype(int)
-            plt.subplot(1, 2, 1)
-            plt.imshow(mc.total_template_rig)  # plot template
-            plt.subplot(1, 2, 2)
-            plt.plot(mc.shifts_rig)  # plot rigid shifts
-            plt.legend(['x shifts', 'y shifts'])
-            plt.xlabel('frames')
-            plt.ylabel('pixels')
+    fname_mc   = mc.mmap_file[0]
+    shifts_rig = mc.shifts_rig
+    logger.info(f"MC done: {fname_mc}")
 
-        bord_px = 0 if opts.motion['border_nan'] == 'copy' else bord_px
-        fname_new = caiman.save_memmap(fname_mc, base_name='memmap_', order='C',
-                                   border_to_0=bord_px)
-    else:  # if no motion correction just memory map the file
-        fname_new = caiman.save_memmap(opts.data['fnames'], base_name='memmap_',
-                                   order='C', border_to_0=0, dview=dview)
+    with timer("QC: motion correction"):
+        qc.motion_correction(mc)
+    del mc
+    bord_px = 0
 
-    # load memory mappable file
-    Yr, dims, T = caiman.load_memmap(fname_new)
-    images = Yr.T.reshape((T,) + dims, order='F')
+    # ── F→C mmap conversion ───────────────────────────────────────────────
+    Yr_F, dims, T = cm.mmapping.load_memmap(fname_mc)
+    n_px       = int(np.prod(dims))
+    fname_cnmf = cm.paths.fn_relocated(
+        cm.paths.memmap_frames_filename(session + "_cnmf", dims, T, "C"),
+        force_temp=True,
+    )
+    Yr_C = np.memmap(fname_cnmf, mode="w+", dtype=np.float32,
+                     shape=cm.mmapping.prepare_shape((n_px, T)), order="C")
+    with timer("F→C mmap conversion"):
+        fc_convert_parallel(Yr_F, Yr_C, n_px, T,
+                            _P.data.add_baseline, logger)
+    del Yr_C, Yr_F
+    logger.info(f"C-order mmap: {fname_cnmf}")
 
-    # Parameters for source extraction and deconvolution (CNMF-E algorithm)
-    Ain = None          # possibility to seed with predetermined binary masks
+    # ── Correlation + PNR images ──────────────────────────────────────────
+    Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+    images = np.reshape(Yr.T, [T] + list(dims), order="F")
+    images.filename = Yr.filename
+    logger.info(f"Data: {images.shape}  dtype={images.dtype}")
 
-    opts.change_params(params_dict={'dims': dims,                          # we rework the source files
-                                    'border_pix': bord_px})                # number of pixels to not consider in the borders)
+    cupy_flush(logger, label="before summary-image step")
+    with timer("Correlation image (Cn) + PNR"):
+        from caiman.summary_images import correlation_pnr
+        Cn, pnr = correlation_pnr(
+            images[::2],            # every 2nd frame for speed
+            gSig  = _P.cnmf.gSig[0],
+            center_psf = True,
+            swap_dim   = False,
+        )
+        Cn[np.isnan(Cn)] = 0
+        np.save(str(outdir / f"{session}_Cn.npy"),  Cn)
+        np.save(str(outdir / f"{session}_PNR.npy"), pnr)
 
-    # compute some summary images (correlation and peak to noise)
-    # change swap dim if output looks weird, it is a problem with tiffile
-    cn_filter, pnr = caiman.summary_images.correlation_pnr(images[::1], gSig=opts.init['gSig'][0], swap_dim=False)
-    # if your images file is too long this computation will take unnecessarily
-    # long time and consume a lot of memory. Consider changing images[::1] to
-    # images[::5] or something similar to compute on a subset of the data
+    with timer("QC: Cn + PNR"):
+        qc.correlation_image(Cn)
+        qc.pnr_image(Cn, pnr)       # shows threshold lines from JSON
 
-    # inspect the summary images and set the parameters
-    inspect_correlation_pnr(cn_filter, pnr)
-    print(f"Minimum correlation: {opts.init['min_corr']}") # min correlation of peak (from correlation image)
-    print(f"Minimum peak to noise ratio: {opts.init['min_pnr']}")  # min peak to noise ratio
+    # Release RSS before CNMF
+    del images, Yr
+    gc.collect()
+    malloc_trim(logger)
+    Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
+    images = np.reshape(Yr.T, [T] + list(dims), order="F")
+    images.filename = Yr.filename
 
-    # Run CMNF in patches
-    cnm = cnmf.CNMF(n_processes=n_processes, dview=dview, Ain=Ain, params=opts)
-    cnm.fit(images)
+    # ── CNMF-E ───────────────────────────────────────────────────────────
+    clean_stale_shm(CAIMAN_SHM, CAIMAN_TEMP, logger)
+    logger.info("Starting CNMF cluster")
+    _, dview, n_processes = cm.cluster.setup_cluster(
+        backend="multiprocessing",
+        n_processes=None,
+        single_thread=False,
+    )
 
-    # Quality Control: DISCARD LOW QUALITY COMPONENTS
-    cnm.estimates.evaluate_components(images, cnm.params, dview=dview)
+    runner = CNMFRunner(
+        _P, session, outdir,
+        fname_mc      = fname_mc,
+        fname_cnmf    = fname_cnmf,
+        dims          = dims,
+        bord_px       = bord_px,
+        dview         = dview,
+        n_processes   = n_processes,
+        cnn_available = _cnn_available,
+    )
 
-    print(' ***** ')
-    print(f"Number of total components: {len(cnm.estimates.C)}")
-    print(f"Number of accepted components: {len(cnm.estimates.idx_components)}")
+    try:
+        cnm2 = runner.run_all(images, Yr=Yr, qc=qc, Cn=Cn, timer=timer)
+        del images, Yr, Cn
+    finally:
+        logger.info("Stopping cluster")
+        cm.stop_server(dview=dview)
 
-    # Play result movies
-    if not cfg.no_play:
-        cnm.dims = dims
-        cnm.estimates.plot_contours(img=cn_filter, idx=cnm.estimates.idx_components)
-        cnm.estimates.view_components(images, idx=cnm.estimates.idx_components)
-        # fully reconstructed movie
-        cnm.estimates.play_movie(images, q_max=99.5, magnification=2,
-                                 include_bck=True, gain_res=10, bpx=bord_px)
-        # movie without background
-        cnm.estimates.play_movie(images, q_max=99.9, magnification=2,
-                                 include_bck=False, gain_res=4, bpx=bord_px)
+    # ── Report ────────────────────────────────────────────────────────────
+    write_report(timer, session, outdir, logger)
 
-    # Stop the cluster and clean up log files
-    caiman.stop_server(dview=dview)
-
-    if not cfg.keep_logs:
-        log_files = glob.glob('*_LOG_*')
-        for log_file in log_files:
-            os.remove(log_file)
-
-def handle_args():
-    parser = argparse.ArgumentParser(description="Demonstrate CNMFE Pipeline")
-    parser.add_argument("--configfile", default=os.path.join(caiman.paths.caiman_datadir(), 'demos', 'general', 'params_demo_pipeline_cnmfE.json'), help="JSON Configfile for Caiman parameters")
-    parser.add_argument("--no_motion_correct", action='store_true', help="Set to disable motion correction")
-    parser.add_argument("--keep_logs",  action="store_true", help="Keep temporary logfiles")
-    parser.add_argument("--no_play",    action="store_true", help="Do not display results")
-    parser.add_argument("--cluster_backend", default="multiprocessing", help="Specify multiprocessing, ipyparallel, or single to pick an engine")
-    parser.add_argument("--cluster_nproc", type=int, default=None, help="Override automatic selection of number of workers to use")
-    parser.add_argument("--input", action="append", help="File(s) to work on, provide multiple times for more files")
-    parser.add_argument("--logfile",    help="If specified, log to the named file")
-    return parser.parse_args()
-
-########
-main()
-
+    print(f"\nResults saved to: {outdir}/{session}_results.hdf5")
+    print(f"Components:       {cnm2.estimates.A.shape[1]}")
+    print(f"Report:           {outdir}/{session}_report.txt")
