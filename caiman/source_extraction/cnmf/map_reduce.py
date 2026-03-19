@@ -431,6 +431,18 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     def _build_patch_args(patch_indices, tile_path, filt_path,
                           tile_shape, filt_shape, tile_extents):
         tx0, tx1, ty0, ty1 = tile_extents
+        # Sort patches within this tile heaviest-first.
+        # Workers pull from a shared queue so leading entries are grabbed first.
+        # Cost was precomputed (seed pixel count) during args_in construction.
+        # The global longest-first sort already ordered args_in; here we refine
+        # within the tile group since the tile load re-bundles them.
+        if len(patch_indices) > 1 and _precomp_result is not None                 and _precomp_result.get('pnr_full') is not None:
+            _min_pnr_d = params.get('init', 'min_pnr') or 1.0
+            def _patch_cost(i):
+                x0, x1, y0, y1 = patch_boxes[i]
+                _p = _precomp_result['pnr_full'][x0:x1, y0:y1]
+                return float((_p > _min_pnr_d).sum())
+            patch_indices = sorted(patch_indices, key=_patch_cost, reverse=True)
         patch_args = []
         for i in patch_indices:
             fn, id_f, id_2d, p = args_in[i]
@@ -595,7 +607,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     # Watchdog: if a worker is OOM-killed its result never arrives and
     # _done_event never fires. Poll every 60s and check pool worker pids.
     import os as _os_wd
-    _timeout_s = 120   # seconds between liveness checks
+    _timeout_s = 60    # seconds between liveness checks
     while not _done_event.wait(timeout=_timeout_s):
         # Check whether any pool workers have died unexpectedly
         try:
@@ -609,8 +621,17 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _n_expected = pool._processes
             if len(_alive) < _n_expected and len(file_res) < total:
                 _dead = _n_expected - len(_alive)
+                try:
+                    import shutil as _shu_wd
+                    _shm_info = (f" SHM={_shu_wd.disk_usage(_shm_dir).used/2**30:.1f}"
+                                 f"/{_shu_wd.disk_usage(_shm_dir).total/2**30:.0f}GB")
+                except Exception:
+                    _shm_info = ""
                 _msg = (f"TileDispatcher watchdog: {_dead} of {_n_expected} "
-                        f"workers died (OOM-kill?). Aborting.")
+                        f"workers died (OOM-kill?). "
+                        f"Completed {len(file_res)}/{total} patches.{_shm_info} "
+                        f"Reduce n_processes (currently {_n_expected}) "
+                        f"or free RAM before running.")
                 logger.error(_msg)
                 with _lock:
                     _errors.append(RuntimeError(_msg))
@@ -1043,7 +1064,15 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             # workers consistently use less RAM than estimated, raise if OOM.
             # Exposed in JSON as cluster.worker_overhead_frac.
             _overhead_frac = float(params.get("patch", "worker_overhead_frac") or 1.6)
-            _worker_bytes = int(_analytical * _overhead_frac)
+            # incp_shm: the 5 per-worker /dev/shm mmap files (data_filtered,
+            # data_raw, groi_B, groi_B0, computeW_X) are on tmpfs but still
+            # consume physical RAM.  They must be added to _analytical before
+            # computing the per-worker budget so the safe-worker cap accounts
+            # for them.  Without this, the cap is too optimistic and workers
+            # cause swap pressure or OOM kills.
+            _tsub = params.get('init', 'tsub') or 1
+            _incp_shm_b = 5 * _patch_pixels * max(1, T // _tsub) * f32
+            _worker_bytes = int((_analytical + _incp_shm_b) * _overhead_frac)
             _vm             = _psu.virtual_memory()
             # Budget: tile dispatcher reads movie one tile at a time.
             # Workers never map the full movie — only the dispatcher holds
