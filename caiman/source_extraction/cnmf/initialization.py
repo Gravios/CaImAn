@@ -2722,8 +2722,26 @@ def precompute_corr_pnr_filtered_fov(
     import caiman.paths as _cpaths
     import re as _re_mb
     _shm_dir = os.environ.get('CAIMAN_SHM', '')
-    _precomp_dir = _shm_dir if (_shm_dir and os.path.isdir(_shm_dir)) \
-        else _cpaths.get_tempdir()
+    # Auto-route to NVMe if /dev/shm doesn't have enough free RAM.
+    # filt_full = d1 × d2 × T × float16 bytes.
+    # If free < 1.1× filt_full, writing to /dev/shm will evict other
+    # pages to swap — use CAIMAN_TEMP (NVMe) instead.
+    _filt_full_bytes = int(np.prod(dims) * T * np.dtype(np.float16).itemsize)
+    _shm_ok = False
+    if _shm_dir and os.path.isdir(_shm_dir):
+        try:
+            import shutil as _shutil_flt
+            _shm_free = _shutil_flt.disk_usage(_shm_dir).free
+            if _shm_free >= _filt_full_bytes * 1.1:
+                _shm_ok = True
+            else:
+                logger.warning(
+                    f'precompute: /dev/shm only has {_shm_free/2**30:.1f} GB free, '
+                    f'need {_filt_full_bytes*1.1/2**30:.1f} GB for filt_full. '
+                    f'Writing to CAIMAN_TEMP (NVMe) instead to avoid swap.')
+        except Exception:
+            _shm_ok = bool(_shm_dir)
+    _precomp_dir = _shm_dir if _shm_ok else _cpaths.get_tempdir()
     _movie_base = os.path.splitext(os.path.basename(movie_path))[0]
     _movie_base = _re_mb.sub(r'[_-]d1_\d+.*$', '', _movie_base)
     _movie_base = _re_mb.sub(r'[_-](cnmf|raw_mp|rig).*$', '', _movie_base)

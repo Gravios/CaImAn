@@ -359,8 +359,14 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         # SHM headroom guard: estimate tile cost and check free space
         # before mmap'ing. Writing beyond /dev/shm capacity raises SIGBUS
         # (unrecoverable crash). Abort early with a clear error instead.
+        # Only count images tile — filt tiles are skipped when filt_full
+        # is on NVMe (workers read filt_full directly, no SHM copy).
         _tile_bytes = int(_np_td.prod(tile_shape)) * 4
-        _filt_bytes = int(_np_td.prod(tile_shape)) * 2  # float16
+        _filt_on_shm_hg = (
+            _filt_full is not None
+            and str(getattr(_filt_full, 'filename', '') or '').startswith(_shm_dir)
+        )
+        _filt_bytes = int(_np_td.prod(tile_shape)) * 2 if _filt_on_shm_hg else 0
         _needed_gb  = (_tile_bytes + _filt_bytes) / 2**30
         try:
             import shutil as _shutil_hg
@@ -403,11 +409,23 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
 
         filt_shape = None
         if _filt_full is not None:
-            filt_shape = (tx1-tx0, ty1-ty0, T)
-            fm = _np_td.memmap(filt_path, dtype=_np_td.float16,
-                               mode='w+', shape=filt_shape, order='F')
-            fm[:] = _filt_full[tx0:tx1, ty0:ty1, :]
-            fm.flush(); del fm
+            # If filt_full is on NVMe (not /dev/shm), skip the SHM tile copy.
+            # Pass the filt_full path + absolute FOV dims directly to workers.
+            # Workers slice filt_full[x0:x1, y0:y1, :] using absolute patch
+            # coords — the NVMe page cache is warm from the tile write above.
+            # Saves 2 × ~3.7 GB = 7.4 GB /dev/shm per slot pair.
+            _filt_filename = str(getattr(_filt_full, 'filename', '') or '')
+            _filt_on_shm   = _filt_filename.startswith(_shm_dir)
+            if _filt_on_shm:
+                filt_shape = (tx1-tx0, ty1-ty0, T)
+                fm = _np_td.memmap(filt_path, dtype=_np_td.float16,
+                                   mode='w+', shape=filt_shape, order='F')
+                fm[:] = _filt_full[tx0:tx1, ty0:ty1, :]
+                fm.flush(); del fm
+                filt_path = filt_path
+            else:
+                filt_shape = (_precomp_result['d1'], _precomp_result['d2'], T)
+                filt_path  = _precomp_result['filtered_path']
             try:
                 _os_fv.posix_fadvise(
                     _filt_full._mmap.fileno(), 0, 0, _FADV_DONTNEED)
@@ -464,8 +482,16 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _pc['tile_lx']    = (lx0, lx1)
             _pc['tile_ly']    = (ly0, ly1)
             if filt_path and filt_shape:
-                _pc['filt_tile_path']  = filt_path
-                _pc['filt_tile_shape'] = filt_shape
+                # If filt_shape is full-FOV (NVMe passthrough), skip filt_tile_path.
+                # Workers then use the fallback path (direct filt_full read with
+                # absolute patch coords x0:x1, y0:y1 — already implemented).
+                _filt_is_full_fov = (filt_shape[0] == dims[0] and
+                                     filt_shape[1] == dims[1])
+                if not _filt_is_full_fov:
+                    _pc['filt_tile_path']  = filt_path
+                    _pc['filt_tile_shape'] = filt_shape
+                # (else: filt_full path already in precomp['filtered_path'];
+                #  workers read it directly via the fallback branch)
                 # Clip filt tile coords to filt_shape extent.
                 _flx1 = min(lx1, filt_shape[0])
                 _fly1 = min(ly1, filt_shape[1])
@@ -642,12 +668,25 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                     _done_event.set()
         except Exception as _wd_exc:
             logger.warning(f"TileDispatcher watchdog check failed: {_wd_exc}")
-    if _errors:
-        raise _errors[0]
-
+    # ── Cleanup slot files (runs on both success and error paths) ──────────
+    # Slot files linger on /dev/shm after dispatch — up to 22 GB for 2 slots.
+    # Unlink them now; workers have closed their handles since _done_event
+    # fires only after all results are collected.
     if _Yr is not None: del _Yr
     if _movie_f is not None: del _movie_f
     if _filt_full is not None: del _filt_full
+
+    for _s_idx in range(_n_slots):
+        for _slot_f in _slot_paths[_s_idx]:
+            try:
+                if _os_td.path.exists(_slot_f):
+                    _os_td.unlink(_slot_f)
+                    logger.debug(f'TileDispatcher: freed slot file {_slot_f}')
+            except OSError:
+                pass
+
+    if _errors:
+        raise _errors[0]
 
     return file_res
 
