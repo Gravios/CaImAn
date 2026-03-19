@@ -436,8 +436,12 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         # Cost was precomputed (seed pixel count) during args_in construction.
         # The global longest-first sort already ordered args_in; here we refine
         # within the tile group since the tile load re-bundles them.
-        if len(patch_indices) > 1 and _precomp_result is not None                 and _precomp_result.get('pnr_full') is not None:
-            _min_pnr_d = params.get('init', 'min_pnr') or 1.0
+        if (len(patch_indices) > 1
+                and _precomp_result is not None
+                and _precomp_result.get('pnr_full') is not None):
+            # params is not in _tile_dispatch scope; read min_pnr from the patch params
+            _first_p   = args_in[patch_indices[0]][3]
+            _min_pnr_d = float(_first_p.get('init', 'min_pnr') or 1.0)
             def _patch_cost(i):
                 x0, x1, y0, y1 = patch_boxes[i]
                 _p = _precomp_result['pnr_full'][x0:x1, y0:y1]
