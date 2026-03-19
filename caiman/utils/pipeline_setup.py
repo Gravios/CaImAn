@@ -352,6 +352,12 @@ def clean_stale_shm(
         + glob.glob(os.path.join(shm_dir, "_caiman_tile_*.mmap"))
         + glob.glob(os.path.join(shm_dir, "_caiman_filt_*.mmap"))
         + glob.glob(os.path.join(temp_dir, "caiman_*.mmap"))
+        # precomputed filt_full from crashed runs: *_precomp_filt_*_f16.mmap
+        + glob.glob(os.path.join(shm_dir,  "*_precomp_filt_*_f16.mmap"))
+        + glob.glob(os.path.join(temp_dir, "*_precomp_filt_*_f16.mmap"))
+        # precomputed npz companion files
+        + glob.glob(os.path.join(shm_dir,  "*_precomp_sn_*.npz"))
+        + glob.glob(os.path.join(temp_dir, "*_precomp_sn_*.npz"))
     )
     transient = (
         glob.glob(os.path.join(shm_dir, "psm_*"))
