@@ -356,6 +356,27 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         tile_path, filt_path = _slot_paths[slot]
         tile_shape = (T, tx1-tx0, ty1-ty0)
 
+        # SHM headroom guard: estimate tile cost and check free space
+        # before mmap'ing. Writing beyond /dev/shm capacity raises SIGBUS
+        # (unrecoverable crash). Abort early with a clear error instead.
+        _tile_bytes = int(_np_td.prod(tile_shape)) * 4
+        _filt_bytes = int(_np_td.prod(tile_shape)) * 2  # float16
+        _needed_gb  = (_tile_bytes + _filt_bytes) / 2**30
+        try:
+            import shutil as _shutil_hg
+            _shm_free_gb = _shutil_hg.disk_usage(_shm_dir).free / 2**30
+            _headroom_gb = 2.0   # keep 2 GB in reserve for worker incp files
+            if _shm_free_gb - _needed_gb < _headroom_gb:
+                raise MemoryError(
+                    f'TileDispatcher: insufficient SHM headroom for tile '
+                    f'({tx0}:{tx1},{ty0}:{ty1}): need {_needed_gb:.1f} GB + '
+                    f'{_headroom_gb:.1f} GB reserve, only {_shm_free_gb:.1f} GB free. '
+                    f'Reduce CAIMAN_TILE_SLOTS (currently {_n_slots}) or '
+                    f'increase /dev/shm: sudo mount -o remount,size=60G /dev/shm'
+                )
+        except (OSError, AttributeError):
+            pass  # skip check if disk_usage fails (non-tmpfs /dev/shm)
+
         tm = _np_td.memmap(tile_path, dtype=_np_td.float32,
                            mode='w+', shape=tile_shape, order='F')
         if _use_forder:
@@ -416,6 +437,10 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             x0, x1, y0, y1 = patch_boxes[i]
             lx0, lx1 = x0 - tx0, x1 - tx0
             ly0, ly1 = y0 - ty0, y1 - ty0
+            # Clip to tile extent — prevents images.shape from exceeding
+            # tile_shape when a patch extends beyond the written tile region.
+            lx1 = min(lx1, tile_shape[1])
+            ly1 = min(ly1, tile_shape[2])
             _p = _copy.copy(p)
             _pc = dict(_p.init.get('precomp') or {})
             _pc['tile_path']  = tile_path
@@ -425,8 +450,11 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             if filt_path and filt_shape:
                 _pc['filt_tile_path']  = filt_path
                 _pc['filt_tile_shape'] = filt_shape
-                _pc['filt_tile_lx']    = (lx0, lx1)
-                _pc['filt_tile_ly']    = (ly0, ly1)
+                # Clip filt tile coords to filt_shape extent.
+                _flx1 = min(lx1, filt_shape[0])
+                _fly1 = min(ly1, filt_shape[1])
+                _pc['filt_tile_lx']    = (lx0, _flx1)
+                _pc['filt_tile_ly']    = (ly0, _fly1)
             _p.init['precomp'] = _pc
             patch_args.append((fn, id_f, id_2d, _p))
         return patch_args
@@ -1257,7 +1285,21 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             if nnan > 0:
                 raise RuntimeError('found %d/%d nans in A, cannot continue' % (nnan, len(A.data)))
 
-            sn_tot[idx_] = sn
+            if sn is not None and len(sn) == len(idx_):
+                sn_tot[idx_] = sn
+            elif sn is not None and len(sn) < len(idx_):
+                # Tile-boundary shape mismatch: CNMF fit ran on fewer pixels
+                # than idx_ covers (clipped tile data).  Assign what we have
+                # to the first len(sn) elements of idx_ — the rest stay zero.
+                # This only affects sn_tot (noise map) used for display; it
+                # does not affect A, C, or the spatial/temporal estimates.
+                logger.warning(
+                    f"sn shape mismatch at patch {idx_[0]}: "
+                    f"len(sn)={len(sn)} len(idx_)={len(idx_)} — "
+                    f"tile boundary clip; partial sn assignment")
+                sn_tot[idx_[:len(sn)]] = sn
+            else:
+                sn_tot[idx_] = sn
             f_tot.append(f)
             bl_tot.append(bl)
             c1_tot.append(c1)
@@ -1267,16 +1309,30 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             shapes_tot.append(shapes)
             mask[idx_] += 1
 
+            # Boundary-tile guard: b.shape[0] may differ from len(idx_)
+            # when the tile-clipped fit ran on fewer pixels than idx_ covers.
+            # Rebuild a trimmed index that matches the actual fit dimensions.
+            _b_npx = b.shape[0] if b is not None and hasattr(b, 'shape') else len(idx_)
+            if _b_npx != len(idx_):
+                logger.warning(
+                    f'b shape mismatch at patch {idx_[0]}: '
+                    f'b.shape[0]={_b_npx} len(idx_)={len(idx_)} '
+                    f'— tile boundary clip; rebuilding idx_ from fit dims')
+                # Use the first _b_npx flat indices from idx_ to stay consistent
+                # with how the tile data was delivered (row-major within patch).
+                _idx_b = idx_[:_b_npx]
+            else:
+                _idx_b = idx_
             if scipy.sparse.issparse(b):
                 b = scipy.sparse.csc_matrix(b)
                 b_tot.append(b.data)
                 idx_ptr_B += list(b.indptr[1:] - b.indptr[:-1])
-                idx_tot_B.append(idx_[b.indices])
+                idx_tot_B.append(_idx_b[b.indices])
             else:
                 for ii in range(b.shape[-1]):
                     b_tot.append(b[:, ii])
-                    idx_tot_B.append(idx_)
-                    idx_ptr_B.append(len(idx_))
+                    idx_tot_B.append(_idx_b)
+                    idx_ptr_B.append(len(_idx_b))
                     # F_tot[patch_id, :] = f[ii, :]
             count_bgr += b.shape[-1]
             if nb_patch >= 0:
@@ -1292,12 +1348,18 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             else:  # full background per patch
                 F_tot = np.concatenate([F_tot, f])
 
+            _a_npx = A.shape[0] if A is not None else len(idx_)
+            _idx_a = idx_[:_a_npx] if _a_npx != len(idx_) else idx_
+            if _a_npx != len(idx_):
+                logger.warning(
+                    f'A shape mismatch at patch {idx_[0]}: '
+                    f'A.shape[0]={_a_npx} len(idx_)={len(idx_)}')
             for ii in range(A.shape[-1]):
                 new_comp = A[:, ii]  # / np.sqrt(A[:, ii].power(2).sum())
                 if new_comp.sum() > 0:
                     a_tot.append(new_comp.toarray().flatten())
-                    idx_tot_A.append(idx_)
-                    idx_ptr_A.append(len(idx_))
+                    idx_tot_A.append(_idx_a)
+                    idx_ptr_A.append(len(_idx_a))
                     C_tot[count, :] = C[ii, :]
                     if params.get('init', 'center_psf'):
                         S_tot[count, :] = S[ii, :]
