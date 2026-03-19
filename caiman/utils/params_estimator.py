@@ -8,20 +8,22 @@ Cn/PNR images and from them estimates:
 
 - **gSig** — Gaussian half-width of the PSF (soma radius proxy).  Measured by
   brightness-weighted LoG blob detection on the PNR image.  Only blobs whose
-  peak PNR exceeds the image 85th percentile are retained — this excludes thin
-  dendrites and processes (moderate PNR) and keeps soma bodies (high PNR).
+  peak PNR ≥ the image 87th percentile are retained (soma bodies have high PNR;
+  dendrites have moderate PNR).  Uses the 25th percentile of retained blob radii
+  — conservative against merged-soma outliers.  Hard-capped at 10 px (20 px
+  diameter) since cortical neurons in vivo rarely exceed this.
 - **gSiz** — Spatial support, set to ``4 × gSig + 1``.
-- **min_corr** — Cn threshold derived by finding the *valley* between the
-  background and signal modes in the Cn histogram (Otsu-like valley detection),
-  rather than the inflection of the falling background edge.
-- **min_pnr** — PNR threshold derived from the signal pixel population
-  (pixels where Cn > min_corr), not the full distribution.  Anchored to the
-  10th percentile of PNR at those pixels so weak neurons are not excluded.
-- **rf** — Patch half-size computed as ``ceil(gSiz × 1.5)`` rounded to a clean
-  multiple, with the ring constraint ``ring_size_factor × gSiz < rf`` verified.
+- **min_corr** — Cn threshold derived from the upper tail of the Cn distribution.
+  For sparse 2P data the Cn histogram is dominated by a single background peak
+  with a long tail; a valley between modes may not exist.  We use the p92 of all
+  Cn pixels (including zero, not just Cn>0.05) which reliably lands in the
+  active-neuron tail without requiring bimodality.
+- **min_pnr** — PNR threshold derived from signal pixels (Cn ≥ min_corr), using
+  the 10th percentile of their PNR values.  Hard floor of 3.0.
+- **rf** — Patch half-size computed as ``ceil(gSiz × 1.5)`` rounded to an even
+  number, verified against the ring constraint.
 
-All estimates are *starting points* — inspect the QC figures and tune from
-there.
+All estimates are *starting points* — inspect the QC figures and tune from there.
 
 Usage
 -----
@@ -60,25 +62,18 @@ def estimate_params(
 ) -> dict:
     """Estimate CNMF parameters from a subsampled movie.
 
-    Computes Cn and PNR images from *n_frames* evenly-spaced frames of the
-    motion-corrected movie, then derives ``gSig``, ``gSiz``, ``rf``,
-    ``stride``, ``min_corr``, and ``min_pnr`` from those images.
-
     Parameters
     ----------
     fname_mc
         Path to the F-order motion-corrected mmap (``*rig*order_F*.mmap``).
     gSig_hint
-        Prior estimate of the soma half-width in pixels.  If ``None``, gSig
-        is estimated automatically.
+        Prior estimate of the soma half-width in pixels.  Skips blob detection.
     n_frames
-        Number of frames to subsample.  500 is fast (~2 s); use 1000+ for
-        noisy or sparse datasets.
+        Number of frames to subsample.  500 is fast (~2 s).
     fr
-        Acquisition frame rate in Hz (used only for log messages).
+        Acquisition frame rate in Hz (for log messages only).
     ring_size_factor
-        Must match the JSON ``cnmf`` section.  Used to verify the ring
-        constraint on the suggested ``rf``.
+        Must match the JSON ``cnmf`` section.  Verified against suggested ``rf``.
     out_path
         If given, save a Cn/PNR inspection figure to this path.
     logger
@@ -87,92 +82,66 @@ def estimate_params(
     Returns
     -------
     dict
-        Suggested values ready to copy into the JSON ``cnmf`` section::
-
-            {
-                "gSig":     [N, N],
-                "gSiz":     [M, M],
-                "rf":       R,
-                "stride":   R // 2,
-                "min_corr": float,
-                "min_pnr":  float,
-            }
+        ``{"gSig", "gSiz", "rf", "stride", "min_corr", "min_pnr"}``
     """
     import caiman.mmapping as _mmap
 
     logger.info(f"Parameter estimation: loading {n_frames} frames from {fname_mc}")
 
-    # ── Load subsampled movie ─────────────────────────────────────────────────
     Yr, dims, T = _mmap.load_memmap(str(fname_mc))
     step   = max(1, T // n_frames)
     frames = np.reshape(Yr.T, [T] + list(dims), order="F")[::step]
     del Yr
     logger.info(f"  Loaded {len(frames)} frames  dims={dims}  fr={fr} Hz")
 
-    # ── Compute Cn and PNR ────────────────────────────────────────────────────
-    # First pass: unfiltered (gSig=None) to get the true PNR image for gSig
-    # estimation.  The filter kernel depends on gSig, so we need the soma size
-    # before we can filter — chicken-and-egg resolved by estimating gSig from
-    # the unfiltered PNR then recomputing with the correct filter.
+    # ── Compute Cn and PNR (two-pass if gSig unknown) ─────────────────────────
     from caiman.summary_images import correlation_pnr as _corr_pnr
 
     if gSig_hint is not None:
-        # Single pass with the provided hint
         gSig = int(round(gSig_hint))
-        logger.info(f"  gSig: using hint = {gSig} px (single-pass)")
+        logger.info(f"  gSig: using hint = {gSig} px")
         cn, pnr = _corr_pnr(frames, gSig=[gSig, gSig], center_psf=True,
                              swap_dim=False)
     else:
-        # Two-pass: estimate gSig from unfiltered PNR, then recompute
+        # Pass 1: unfiltered PNR to estimate gSig from blob sizes
         logger.info("  Pass 1: unfiltered PNR for gSig estimation")
-        cn_raw, pnr_raw = _corr_pnr(frames, gSig=None, center_psf=False,
-                                     swap_dim=False)
+        _cn_raw, pnr_raw = _corr_pnr(frames, gSig=None, center_psf=False,
+                                      swap_dim=False)
         gSig = _estimate_gsig_from_pnr(pnr_raw, logger=logger)
+        del _cn_raw, pnr_raw
 
         logger.info(f"  Pass 2: filtered Cn/PNR with gSig={gSig}")
         cn, pnr = _corr_pnr(frames, gSig=[gSig, gSig], center_psf=True,
                              swap_dim=False)
-        del cn_raw, pnr_raw
 
     cn[np.isnan(cn)] = 0
 
     logger.info(
-        f"  Cn:  mean={cn.mean():.3f}  p75={np.percentile(cn, 75):.3f}  "
+        f"  Cn:  mean={cn.mean():.3f}  p90={np.percentile(cn, 90):.3f}  "
         f"p99={np.percentile(cn, 99):.3f}  max={cn.max():.3f}"
     )
     logger.info(
-        f"  PNR: mean={pnr.mean():.1f}  p75={np.percentile(pnr, 75):.1f}  "
-        f"p99={np.percentile(pnr, 99):.1f}  max={np.percentile(pnr, 99.9):.1f}"
+        f"  PNR: mean={pnr.mean():.1f}  p90={np.percentile(pnr, 90):.1f}  "
+        f"p99={np.percentile(pnr, 99):.1f}"
     )
 
     # ── Geometry ──────────────────────────────────────────────────────────────
     gSiz   = gSig * 4 + 1
-    # rf must satisfy ring constraint AND be large enough to capture the full
-    # soma + local background annulus.  ceil(gSiz * 1.5) rounded to next even
-    # number, minimum ring_constraint + 2.
     rf_ring = int(np.ceil(gSiz * ring_size_factor)) + 2
-    rf_soma = int(np.ceil(gSiz * 1.5 / 2)) * 2      # even number ≥ 1.5×gSiz
+    rf_soma = int(np.ceil(gSiz * 1.5 / 2)) * 2
     rf      = max(rf_ring, rf_soma)
     stride  = rf // 2
 
-    assert rf > gSiz * ring_size_factor, (
-        f"Ring constraint violated: rf={rf} ≤ ring_size_factor×gSiz="
-        f"{ring_size_factor*gSiz:.1f}"
-    )
+    assert rf > gSiz * ring_size_factor, \
+        f"Ring constraint violated: rf={rf} ≤ {ring_size_factor}×{gSiz}"
     logger.info(
         f"  Geometry: gSig={gSig}  gSiz={gSiz}  rf={rf}  stride={stride}  "
         f"(ring check: {ring_size_factor:.2f}×{gSiz}={ring_size_factor*gSiz:.1f} < {rf} ✓)"
     )
 
     # ── Thresholds ────────────────────────────────────────────────────────────
-    # min_corr: valley between background and signal modes in the Cn histogram
-    min_corr = _corr_threshold_from_valley(cn, logger=logger)
-
-    # min_pnr: lower-tail PNR of signal pixels (Cn > min_corr).
-    # This anchors min_pnr to the actual signal population rather than the
-    # background PNR distribution which dominates the full histogram.
-    min_pnr = _pnr_threshold_from_signal_pixels(cn, pnr, min_corr,
-                                                 logger=logger)
+    min_corr = _corr_threshold_upper_tail(cn, logger=logger)
+    min_pnr  = _pnr_threshold_from_signal_pixels(cn, pnr, min_corr, logger=logger)
 
     min_corr = round(float(min_corr), 2)
     min_pnr  = round(float(min_pnr),  1)
@@ -198,48 +167,25 @@ def estimate_params(
 def _estimate_gsig_from_pnr(
     pnr:        np.ndarray,
     *,
-    min_sigma:  float = 3.5,      # skip thin processes (< 7 px diameter)
-    max_sigma:  float = 25.0,
-    num_sigma:  int   = 15,
-    threshold:  float = 0.10,     # fraction of max LoG response
-    pnr_pct:    float = 87.0,     # only keep blobs brighter than this PNR percentile
-    fallback:   int   = 7,
+    min_sigma:  float = 3.5,
+    max_sigma:  float = 12.0,   # cap: 12 px sigma → ~17px diameter max
+    num_sigma:  int   = 12,
+    threshold:  float = 0.10,
+    pnr_pct:    float = 87.0,
+    gsig_min:   int   = 3,
+    gsig_max:   int   = 10,     # hard cap: 10 px → 20 px diameter
+    fallback:   int   = 6,
     logger:     logging.Logger = logger,
 ) -> int:
     """Estimate gSig by brightness-weighted LoG blob detection on the PNR image.
 
-    Two-stage filtering:
+    Only blobs whose peak PNR ≥ ``pnr_pct`` percentile of the image are
+    retained (soma bodies have high PNR; thin dendrites do not).
+    The gSig estimate is the 25th percentile of retained blob radii, capped
+    at ``gsig_max`` (default 10 px = 20 px diameter) to prevent merged soma
+    clusters from inflating the estimate.
 
-    1. LoG blob detection with ``min_sigma=3.5`` to skip responses from thin
-       dendrites and axons (< 7 px diameter).
-    2. Brightness filter: retain only blobs whose peak PNR exceeds the image
-       ``pnr_pct`` percentile.  Bright somas have high PNR; dim dendrites do not.
-
-    The estimated gSig is the 25th percentile of the retained blob radii
-    (conservative — avoids bias from oversized merged-soma blobs).
-
-    Falls back to ``fallback`` (default 7) if fewer than 5 blobs survive
-    filtering.
-
-    Parameters
-    ----------
-    pnr
-        2-D PNR image.
-    min_sigma
-        Minimum LoG sigma.  Default 3.5 corresponds to ~7 px diameter —
-        thin processes are effectively excluded.
-    max_sigma
-        Maximum LoG sigma.
-    num_sigma
-        Number of sigma steps.
-    threshold
-        LoG response threshold (fraction of maximum response).
-    pnr_pct
-        Percentile of the PNR image used as the brightness cutoff for blob
-        retention.  Blobs with peak PNR below this are rejected.  Default 87
-        keeps only the brightest soma bodies while excluding dendrites.
-    fallback
-        gSig returned when blob detection yields too few results.
+    Falls back to ``fallback`` (default 6) if fewer than 5 blobs survive.
     """
     try:
         from skimage.feature import blob_log as _blob_log
@@ -247,7 +193,6 @@ def _estimate_gsig_from_pnr(
         logger.warning("  scikit-image not available — using fallback gSig")
         return fallback
 
-    # Percentile-normalise PNR for the LoG detector
     p_bright = float(np.percentile(pnr, pnr_pct))
     pnr_norm = np.clip(pnr, 0, np.percentile(pnr, 99.9))
     p_max    = pnr_norm.max()
@@ -256,7 +201,6 @@ def _estimate_gsig_from_pnr(
         return fallback
     pnr_norm = pnr_norm / p_max
 
-    # LoG detection
     blobs = _blob_log(
         pnr_norm,
         min_sigma  = min_sigma,
@@ -269,161 +213,111 @@ def _estimate_gsig_from_pnr(
         logger.warning(f"  No blobs found — using fallback gSig={fallback}")
         return fallback
 
-    # Brightness filter: keep blobs whose peak PNR exceeds pnr_pct percentile
-    bright_blobs = []
     h, w = pnr.shape
+    bright_blobs = []
     for r, c, sigma in blobs:
         r_px, c_px = int(round(r)), int(round(c))
         if 0 <= r_px < h and 0 <= c_px < w:
-            peak_pnr = float(pnr[r_px, c_px])
-            if peak_pnr >= p_bright:
-                bright_blobs.append((r, c, sigma, peak_pnr))
+            if float(pnr[r_px, c_px]) >= p_bright:
+                bright_blobs.append((r, c, sigma))
 
-    n_total  = len(blobs)
-    n_bright = len(bright_blobs)
     logger.info(
-        f"  Blob detection: {n_total} total blobs → "
-        f"{n_bright} bright (PNR ≥ {p_bright:.1f})"
+        f"  Blob detection: {len(blobs)} total → "
+        f"{len(bright_blobs)} bright (PNR ≥ {p_bright:.1f})"
     )
 
-    if n_bright < 5:
+    if len(bright_blobs) < 5:
         logger.warning(
-            f"  Only {n_bright} bright blobs — using fallback gSig={fallback}"
-        )
+            f"  Only {len(bright_blobs)} bright blobs — using fallback gSig={fallback}")
         return fallback
 
-    # Convert LoG sigma to radius: radius = sigma × sqrt(2)
-    # Use 25th percentile (conservative) to avoid bias from large merged blobs
     sigmas = np.array([b[2] for b in bright_blobs])
     radii  = sigmas * np.sqrt(2)
-    gSig   = max(2, int(round(float(np.percentile(radii, 25)))))
+    gSig   = int(round(float(np.percentile(radii, 25))))
+    gSig   = int(np.clip(gSig, gsig_min, gsig_max))
 
     logger.info(
         f"  Bright blob radii: p25={np.percentile(radii,25):.1f}  "
         f"median={np.median(radii):.1f}  p75={np.percentile(radii,75):.1f} px"
-        f"  → gSig={gSig}"
+        f"  → gSig={gSig} (cap [{gsig_min},{gsig_max}])"
     )
     return gSig
 
 
 # ── Threshold estimation ──────────────────────────────────────────────────────
 
-def _corr_threshold_from_valley(
+def _corr_threshold_upper_tail(
     cn:     np.ndarray,
     *,
-    n_bins: int = 300,
+    tail_pct: float = 92.0,
     logger: logging.Logger = logger,
 ) -> float:
-    """Estimate min_corr by finding the valley between background and signal.
+    """Estimate min_corr from the upper tail of the Cn distribution.
 
-    The Cn histogram of a 2P movie is bimodal: a large background peak at
-    low Cn (noise pixels, ~0.05–0.20) and a smaller signal tail at higher Cn
-    (active neurons, dendrites).  The threshold should sit in the valley
-    between these two modes, not on the falling edge of the background peak.
+    For sparse 2P data the Cn histogram is dominated by background pixels
+    (large peak at low Cn) with a long heavy tail of active-neuron pixels.
+    The histogram is often *not* bimodal — soma pixels are too few to form a
+    visible second mode — so valley detection is unreliable.
 
-    Algorithm:
+    Instead we use the ``tail_pct`` percentile of *all* Cn pixels (including
+    the zero-valued border pixels).  The default p92 of ALL pixels places the
+    threshold well into the active-neuron tail while typically leaving at least
+    ~8% of the FOV as candidate seed pixels.
 
-    1. Histogram Cn > 0.05 pixels, smoothed with a Gaussian (sigma=3 bins).
-    2. Identify the background mode (highest peak in the lower 50% of range).
-    3. Search rightward from the background mode for a local minimum — the
-       valley bottom.  Clip between [p60, p92] of the input values as a
-       sanity bound.
-    4. If no clear valley is found (flat tail), fall back to the 80th percentile
-       of Cn > 0.05 pixels.
+    The result is clipped to [p80, p98] of the full Cn image as a sanity bound.
     """
-    from scipy.ndimage import gaussian_filter1d as _gf1d
+    all_cn  = cn.ravel()
+    # p92 of ALL pixels (incl. zero / border)
+    threshold = float(np.percentile(all_cn, tail_pct))
 
-    vals = cn[cn > 0.05].ravel()
-    if len(vals) == 0:
-        return 0.3
-
-    vlo = float(np.percentile(vals, 1))
-    vhi = float(np.percentile(vals, 99))
-    hist, edges = np.histogram(np.clip(vals, vlo, vhi), bins=n_bins, density=True)
-    centres = 0.5 * (edges[:-1] + edges[1:])
-
-    smooth = _gf1d(hist.astype(float), sigma=3)
-
-    # Background mode: highest peak in the lower 50% of the histogram range
-    mid_idx   = n_bins // 2
-    bg_mode   = int(np.argmax(smooth[:mid_idx]))
-
-    # Search right of bg_mode for the first local minimum (valley)
-    valley_idx = None
-    for i in range(bg_mode + 1, len(smooth) - 1):
-        if smooth[i] <= smooth[i - 1] and smooth[i] <= smooth[i + 1]:
-            valley_idx = i
-            break
-
-    if valley_idx is not None:
-        threshold = float(centres[valley_idx])
-        logger.info(
-            f"  min_corr: valley at Cn={threshold:.3f} "
-            f"(bg_mode={centres[bg_mode]:.3f})"
-        )
-    else:
-        # No clear valley — fall back to 80th percentile of signal pixels
-        threshold = float(np.percentile(vals, 80))
-        logger.info(
-            f"  min_corr: no clear valley — using p80={threshold:.3f}"
-        )
-
-    # Sanity clip: prevent extreme values but allow the valley to sit high.
-    # [p65, p97] — wide enough that a true valley in the signal range isn't
-    # clipped down into the background distribution.
-    lo = float(np.percentile(vals, 65))
-    hi = float(np.percentile(vals, 97))
+    lo = float(np.percentile(all_cn, 80))
+    hi = float(np.percentile(all_cn, 98))
     threshold = float(np.clip(threshold, lo, hi))
 
-    logger.info(f"  min_corr → {threshold:.3f}  (clipped to [{lo:.3f}, {hi:.3f}])")
+    # Count candidate seed pixels so the user can sanity-check
+    n_seeds   = int((cn >= threshold).sum())
+    frac_seeds = n_seeds / cn.size
+    logger.info(
+        f"  min_corr: p{tail_pct:.0f} of all Cn = {threshold:.3f}  "
+        f"({n_seeds} pixels = {frac_seeds*100:.1f}% of FOV)"
+    )
     return threshold
 
 
 def _pnr_threshold_from_signal_pixels(
-    cn:       np.ndarray,
-    pnr:      np.ndarray,
-    min_corr: float,
+    cn:        np.ndarray,
+    pnr:       np.ndarray,
+    min_corr:  float,
     *,
-    signal_pnr_pct:  float = 10.0,   # use the 10th percentile PNR at signal pixels
-    logger:   logging.Logger = logger,
+    signal_pnr_pct: float = 10.0,
+    pnr_floor:      float = 3.0,
+    logger:    logging.Logger = logger,
 ) -> float:
     """Estimate min_pnr from the signal pixel population.
 
-    Rather than finding the inflection of the full PNR histogram (which is
-    dominated by background pixels), this function:
-
-    1. Masks to pixels where Cn > min_corr (the signal population).
-    2. Returns the ``signal_pnr_pct`` percentile of PNR at those pixels.
-
-    Using the 10th percentile captures even the weakest active neurons in
-    the signal population.  A hard lower bound of 2.5 is applied.
-
-    If fewer than 100 signal pixels are found (sparse FOV or aggressive
-    min_corr), falls back to the 85th percentile of all PNR > 1 pixels.
+    Masks to pixels where Cn ≥ min_corr, then returns the ``signal_pnr_pct``
+    percentile of PNR at those pixels.  Falls back to the 85th percentile
+    of all PNR > 1 pixels if fewer than 100 signal pixels are found.
     """
-    signal_mask = cn > min_corr
+    signal_mask = cn >= min_corr
     n_signal    = int(signal_mask.sum())
 
     if n_signal >= 100:
         signal_pnr  = pnr[signal_mask]
-        # Clip extreme values before computing percentile
         pnr_99      = float(np.percentile(signal_pnr, 99))
         signal_pnr  = signal_pnr[signal_pnr < pnr_99]
         threshold   = float(np.percentile(signal_pnr, signal_pnr_pct))
         logger.info(
-            f"  min_pnr: {n_signal} signal pixels (Cn>{min_corr:.2f})  "
+            f"  min_pnr: {n_signal} signal pixels (Cn≥{min_corr:.2f})  "
             f"p10={threshold:.1f}  median={np.median(signal_pnr):.1f}"
         )
     else:
-        # Fallback: 85th percentile of all PNR > 1
         all_pnr   = pnr[pnr > 1].ravel()
         threshold = float(np.percentile(all_pnr, 85))
         logger.warning(
-            f"  min_pnr: only {n_signal} signal pixels — "
-            f"fallback to p85 of all PNR: {threshold:.1f}"
-        )
+            f"  min_pnr: only {n_signal} signal pixels — fallback p85={threshold:.1f}")
 
-    threshold = max(2.5, threshold)
+    threshold = max(pnr_floor, threshold)
     logger.info(f"  min_pnr → {threshold:.1f}")
     return threshold
 
@@ -438,7 +332,7 @@ def _save_inspection_figure(
     out_path:    Union[str, Path],
     logger:      logging.Logger,
 ) -> None:
-    """Save a four-panel Cn/PNR inspection figure with estimated thresholds."""
+    """Save a four-panel Cn/PNR inspection figure."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -461,12 +355,12 @@ def _save_inspection_figure(
                 sp.set_edgecolor("0.3")
             return ax
 
-        # Images — top row
+        # Images
         ax_cn  = _dax(gs[0, 0]); ax_cn.axis("off")
         ax_pnr = _dax(gs[0, 1]); ax_pnr.axis("off")
 
-        im_cn  = ax_cn.imshow(cn, cmap="inferno", aspect="equal",
-                               interpolation="nearest")
+        im_cn = ax_cn.imshow(cn, cmap="inferno", aspect="equal",
+                              interpolation="nearest")
         ax_cn.set_title(
             f"Correlation (Cn)  |  min_corr={min_corr:.2f}",
             color="0.85", fontsize=8)
@@ -484,35 +378,34 @@ def _save_inspection_figure(
         cb2  = plt.colorbar(im_pnr, cax=div2.append_axes("right", "3%", pad=0.05))
         cb2.ax.tick_params(colors="0.6", labelsize=6)
 
-        # Histograms — bottom row
+        # Histograms
         ax_ch = _dax(gs[1, 0])
-        cn_vals = cn[cn > 0.05].ravel()
-        ax_ch.hist(cn_vals, bins=200, color="#4fc3f7", edgecolor="none", alpha=0.8,
-                   range=(float(np.percentile(cn_vals, 1)),
-                          float(np.percentile(cn_vals, 99))))
+        cn_all  = cn.ravel()
+        cn_pos  = cn_all[cn_all > 0]
+        ax_ch.hist(cn_pos, bins=200, color="#4fc3f7", edgecolor="none", alpha=0.8,
+                   range=(0, float(np.percentile(cn_pos, 99.5))))
         ax_ch.axvline(min_corr, color="white", lw=1.5, ls="--",
                       label=f"min_corr={min_corr:.2f}")
         ax_ch.set_xlabel("Cn value", color="0.6", fontsize=7)
         ax_ch.set_ylabel("pixels",   color="0.6", fontsize=7)
-        ax_ch.set_title("Cn distribution  (threshold = valley between modes)",
+        ax_ch.set_title("Cn distribution  (threshold = p92 of all pixels)",
                         color="0.85", fontsize=8)
         ax_ch.legend(fontsize=7, facecolor="0.15", labelcolor="0.85")
 
         ax_ph = _dax(gs[1, 1])
-        # Show PNR for signal pixels (Cn > min_corr) overlaid on full distribution
         pnr_all    = pnr[(pnr > 1) & (pnr < np.percentile(pnr, 99.5))].ravel()
-        pnr_signal = pnr[cn > min_corr].ravel()
+        pnr_signal = pnr[cn >= min_corr].ravel()
         pnr_signal = pnr_signal[(pnr_signal > 1) &
                                  (pnr_signal < np.percentile(pnr_signal, 99.5))]
-        ax_ph.hist(pnr_all, bins=150, color="#444", edgecolor="none", alpha=0.6,
-                   label="all pixels")
+        ax_ph.hist(pnr_all,    bins=150, color="#444", edgecolor="none",
+                   alpha=0.6, label="all pixels")
         ax_ph.hist(pnr_signal, bins=100, color="#f48fb1", edgecolor="none",
-                   alpha=0.85, label=f"Cn>{min_corr:.2f} pixels")
+                   alpha=0.85, label=f"Cn≥{min_corr:.2f}")
         ax_ph.axvline(min_pnr, color="white", lw=1.5, ls="--",
                       label=f"min_pnr={min_pnr:.1f}")
         ax_ph.set_xlabel("PNR value", color="0.6", fontsize=7)
         ax_ph.set_ylabel("pixels",    color="0.6", fontsize=7)
-        ax_ph.set_title("PNR distribution  (pink = signal pixels)",
+        ax_ph.set_title("PNR distribution  (pink = signal pixels Cn≥min_corr)",
                         color="0.85", fontsize=8)
         ax_ph.legend(fontsize=6, facecolor="0.15", labelcolor="0.85")
 
@@ -536,31 +429,17 @@ def _save_inspection_figure(
 # ── JSON helper ───────────────────────────────────────────────────────────────
 
 def apply_suggestions(
-    json_path: Union[str, Path],
+    json_path:   Union[str, Path],
     suggestions: dict,
     *,
-    section: str = "cnmf",
+    section: str  = "cnmf",
     dry_run: bool = False,
 ) -> None:
     """Write parameter suggestions into an existing pipeline JSON file.
 
-    Keys in *suggestions* may be plain strings (written into *section*) or
-    dotted ``"section.key"`` strings (written into the named section).
-    All other values in the JSON are preserved.
-
-    Parameters
-    ----------
-    json_path
-        Path to ``<session>_pipeline.json``.
-    suggestions
-        Dict of ``{key: value}`` or ``{"section.key": value}`` pairs.
-        Plain keys are written into *section* (default ``"cnmf"``).
-        Dotted keys override the section: ``"motion_correction.max_shifts"``
-        writes ``max_shifts`` into the ``motion_correction`` section.
-    section
-        Default section for plain (non-dotted) keys (default ``"cnmf"``).
-    dry_run
-        If ``True``, log what would be written without modifying the file.
+    Plain keys go into *section* (default ``"cnmf"``); dotted keys
+    (``"motion_correction.max_shifts"``) override the section.
+    Preserves all other JSON content.
     """
     import json as _json
 

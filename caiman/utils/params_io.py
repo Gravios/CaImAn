@@ -205,6 +205,27 @@ def build_cnmf_opts(
     c  = P.cnmf
     q  = P.quality
 
+    # ── Sanity-check and auto-correct gSiz ───────────────────────────────────
+    # gSiz must equal 4*gSig+1.  If the JSON was hand-edited to change gSig
+    # without updating gSiz, the ring background model will overlap the soma
+    # body (ring inner edge ≤ gSig px), zeroing out all spatial footprints.
+    # Auto-correct silently so pipelines continue without manual intervention.
+    _gSig_val = c.gSig[0] if hasattr(c.gSig, '__len__') else int(c.gSig)
+    _gSiz_expected = 4 * _gSig_val + 1
+    _gSiz_val = c.gSiz[0] if hasattr(c.gSiz, '__len__') else int(c.gSiz)
+    if _gSiz_val != _gSiz_expected:
+        import logging as _lg
+        _lg.getLogger("caiman").warning(
+            f"build_cnmf_opts: gSiz={_gSiz_val} is inconsistent with "
+            f"gSig={_gSig_val} (expected {_gSiz_expected}). "
+            f"Auto-correcting gSiz to {_gSiz_expected}. "
+            f"Update the JSON cnmf section: gSiz=[{_gSiz_expected},{_gSiz_expected}]"
+        )
+        # Patch the ParamBag so downstream code also sees the corrected value
+        import types as _types
+        c = _types.SimpleNamespace(**vars(c))
+        c.gSiz = [_gSiz_expected, _gSiz_expected]
+
     opts = CNMFParams()
 
     opts.set("data", {

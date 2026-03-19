@@ -459,10 +459,21 @@ def _qc_footprints(
     A_dense = np.asarray(A.todense())                   # (d1*d2, K)
     A_max   = A_dense.max(axis=1).reshape(d1, d2, order="F")
 
+    # Colormap scaling: use only non-zero pixels (neuron pixels) for the
+    # vmax estimate.  With sparse 2P recordings the FOV is >80% background
+    # (A_max=0), so percentile_clip(A_max) would map vmax≈0 → black image.
+    _nz = A_max[A_max > 0]
+    if _nz.size > 0:
+        _vmax = float(np.percentile(_nz, 99))
+        _vmin = 0.0
+    else:
+        _vmax = None
+        _vmin = None
+
     ncols   = 2 if Cn is not None else 1
     fig, axes = _dark_fig(1, ncols, figsize=(ncols * 7, 6))
 
-    _imshow(axes[0], _percentile_clip(A_max),
+    _imshow(axes[0], A_max, vmin=_vmin, vmax=_vmax,
             cmap="hot", title=f"Max footprint projection  (K={K})")
 
     if Cn is not None and ncols > 1:
