@@ -1364,8 +1364,15 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
             logger.info('Updating spatial components')
             A, _, C, _ = caiman.source_extraction.cnmf.spatial.update_spatial_components(
                 B, C=C, f=np.zeros((0, total_frames), np.float32), A_in=A,
-                sn=np.sqrt(downscale((sn**2).reshape(dims, order='F'),
-                                     tuple([ssub] * len(dims))).ravel() / tsub) / ssub,
+                sn=np.sqrt(downscale(
+                    # sn may have been computed on the full (unclipped) patch
+                    # (d1_full × d2_full elements) while dims = (d1, d2) is the
+                    # actual clipped boundary-patch shape.  Reshape via full dims,
+                    # then slice to actual patch dims before downscaling.
+                    (sn**2).reshape(Y_ds.shape[:2], order='F')[:d1, :d2]
+                    if sn is not None and sn.size != d1 * d2
+                    else (sn**2).reshape(dims, order='F'),
+                    tuple([ssub] * len(dims))).ravel() / tsub) / ssub,
                 b_in=np.zeros((d1 * d2, 0), np.float32),
                 dview=None, dims=(d1, d2), **options['spatial'])
             logger.info(f'[mem] after update_spatial (iter 1): {_rss_gb():.1f} GB RSS')
@@ -1411,8 +1418,11 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
             logger.info('Updating spatial components')
             A, _, C, _ = caiman.source_extraction.cnmf.spatial.update_spatial_components(
                 B, C=C, f=np.zeros((0, total_frames), np.float32), A_in=A,
-                sn=np.sqrt(downscale((sn**2).reshape(dims, order='F'),
-                                     tuple([ssub] * len(dims))).ravel() / tsub) / ssub,
+                sn=np.sqrt(downscale(
+                    (sn**2).reshape(Y_ds.shape[:2], order='F')[:d1, :d2]
+                    if sn is not None and sn.size != d1 * d2
+                    else (sn**2).reshape(dims, order='F'),
+                    tuple([ssub] * len(dims))).ravel() / tsub) / ssub,
                 b_in=np.zeros((d1 * d2, 0), np.float32),
                 dview=None, dims=(d1, d2), **options['spatial'])
             A = A.astype(np.float32)
@@ -1490,7 +1500,12 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
                 B = B0   # B0 becomes the background for NMF
 
         use_NMF = True
-        if nb == -1:
+        if nb == 0:
+            # No background components — b_in/f_in are empty arrays.
+            # This path is taken when nb_patch=0 (corr_pnr with ring model).
+            b_in = np.zeros((d1 * d2, 0), dtype=np.float32)
+            f_in = np.zeros((0, total_frames), dtype=np.float32)
+        elif nb == -1:
             logger.info('Returning full background')
             b_in = spr.eye(len(B), dtype='float32')
             f_in = B
@@ -1703,6 +1718,10 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             _filt_raw = np.transpose(
                 np.asarray(_filt_full[x0:x1, y0:y1, :], dtype=np.float32), (2, 0, 1))
             del _filt_full
+            # Clip to actual patch shape — boundary patches are narrower than
+            # the nominal gSiz×gSiz extent when the patch abuts the movie edge.
+            _d1p, _d2p = data_filtered.shape[1], data_filtered.shape[2]
+            _filt_raw = _filt_raw[:, :_d1p, :_d2p]
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
             data_filtered[:] = _filt_raw[::_ftsub]
             del _filt_raw
@@ -2726,7 +2745,7 @@ def precompute_corr_pnr_filtered_fov(
     # filt_full = d1 × d2 × T × float16 bytes.
     # If free < 1.1× filt_full, writing to /dev/shm will evict other
     # pages to swap — use CAIMAN_TEMP (NVMe) instead.
-    _filt_full_bytes = int(np.prod(dims) * T * np.dtype(np.float16).itemsize)
+    _filt_full_bytes = int(d1 * d2 * T * np.dtype(np.float16).itemsize)  # dims=(d1,d2,T)
     _shm_ok = False
     if _shm_dir and os.path.isdir(_shm_dir):
         try:
@@ -2946,9 +2965,19 @@ def precompute_corr_pnr_filtered_fov(
     # ── Finalise Cn ───────────────────────────────────────────────────────────
     logger.info('precompute_corr_pnr_filtered_fov: computing Cn on GPU')
     try:
-        _var_gpu = cp.asarray(np.where(sn_full == 0, np.inf, sn_full ** 2))
-        cn_full  = cp.asnumpy(YYc_acc / (_var_gpu * _MASK_gpu * T)).astype(np.float32)
-        cn_full  = np.where(np.isnan(cn_full) | (cn_full < 0), 0, cn_full)
+        # Correct Pearson-style local correlation:
+        # cn[x,y] = sum_k[ cov(Y_xy, Y_k) / (std_xy * std_k) ] / n_neighbors
+        # = YYc[x,y] / (sqrt(Y2_xy) * sqrt(Y2_neighbors_sum / MASK) * T)
+        # Using Y2_neighbor (spatial sum of Y2_acc) as the neighbor variance.
+        _sz3_flat = cp.ones((3,3,1), dtype=cp.float32); _sz3_flat[1,1,0] = 0
+        _Y2_gpu      = cp.asarray(Y2_acc)
+        _Y2_neigh    = _cpnd.convolve(_Y2_gpu[:,:,cp.newaxis], _sz3_flat,
+                                       mode='constant').squeeze()
+        _denom       = cp.sqrt(_Y2_gpu * _Y2_neigh / cp.maximum(_MASK_gpu, 1)) * T
+        _denom       = cp.where(_denom == 0, cp.inf, _denom)
+        cn_full      = cp.asnumpy((YYc_acc / _denom).clip(-1, 1)).astype(np.float32)
+        del _Y2_gpu, _Y2_neigh, _denom
+        cn_full      = np.where(np.isnan(cn_full), 0, cn_full)
         del YYc_acc, _var_gpu, _MASK_gpu
         logger.info('precompute_corr_pnr_filtered_fov: Cn computed on GPU')
     except Exception as _cn_exc:

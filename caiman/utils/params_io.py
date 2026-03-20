@@ -210,9 +210,9 @@ def build_cnmf_opts(
     # without updating gSiz, the ring background model will overlap the soma
     # body (ring inner edge ≤ gSig px), zeroing out all spatial footprints.
     # Auto-correct silently so pipelines continue without manual intervention.
-    _gSig_val = c.gSig[0] if hasattr(c.gSig, '__len__') else int(c.gSig)
+    _gSig_val = getattr(c, "gSig", [8,8]); _gSig_val = _gSig_val[0] if hasattr(_gSig_val, '__len__') else int(_gSig_val)
     _gSiz_expected = 4 * _gSig_val + 1
-    _gSiz_val = c.gSiz[0] if hasattr(c.gSiz, '__len__') else int(c.gSiz)
+    _gSiz_val = getattr(c, "gSiz", [33,33]); _gSiz_val = _gSiz_val[0] if hasattr(_gSiz_val, '__len__') else int(_gSiz_val)
     if _gSiz_val != _gSiz_expected:
         import logging as _lg
         _lg.getLogger("caiman").warning(
@@ -231,6 +231,7 @@ def build_cnmf_opts(
     opts.set("data", {
         "fnames"     : [fname_cnmf],
         "fr"         : d.fr,
+        "dxy"        : tuple(getattr(d, "dxy", (1.0, 1.0))),
         "decay_time" : d.decay_time,
         "dims"       : dims,
     })
@@ -246,12 +247,23 @@ def build_cnmf_opts(
     _blas_threads  = int(getattr(_cl,   "blas_threads_per_worker", 1))   if _cl else 1
 
     opts.set("patch", {
-        "rf"                  : c.rf,
-        "stride"              : c.stride,
+        "rf"                  : getattr(c, "rf", 48),
+        "stride"              : getattr(c, "stride", 24),
         "n_processes"         : n_processes,
         "only_init"           : True,
         "p_patch"             : 0,
-        "nb_patch"            : c.gnb,
+        # For corr_pnr (center_psf=True), nb_patch=0 tells patch workers
+        # to return raw initialized components without a per-patch
+        # spatial/temporal update. The global update in cnmf.fit() handles
+        # refinement after assembly. nb_patch=gnb (the old default) causes
+        # scale mismatch: after normalize_components, A is tiny, then
+        # update_temporal makes C huge, then lasso lambda ≈ Xy → zero A.
+        "nb_patch"            : 0 if getattr(c, "method_init", "corr_pnr") == "corr_pnr" else getattr(c, "gnb", 2),
+        # del_duplicates: for dense 1P/CNMFE recordings (gnb=0) this prevents
+        # duplicate components flooding assembly. For sparse 2P recordings
+        # (gnb>0) it is counterproductive — with ~1 neuron per patch on average,
+        # del_duplicates drops most real neurons. Use merge_comps instead.
+        "del_duplicates"      : (getattr(c, "method_init", "corr_pnr") == "corr_pnr" and getattr(c, "gnb", 2) == 0),
         "border_pix"          : bord_px,
         "ram_budget_frac"      : _ram_frac,
         "worker_overhead_frac" : _overhead_frac,
@@ -259,22 +271,28 @@ def build_cnmf_opts(
     })
 
     opts.set("init", {
-        "K"              : c.K,
-        "gSig"           : c.gSig,
-        "gSiz"           : c.gSiz,
-        "method_init"    : c.method_init,
-        "ssub"           : c.ssub,
-        "tsub"           : c.tsub,
-        "nb"             : c.gnb,
+        "K"              : getattr(c, "K", 30),
+        "gSig"           : getattr(c, "gSig", [8, 8]),
+        "gSiz"           : getattr(c, "gSiz", [33, 33]),
+        "method_init"    : getattr(c, "method_init", "corr_pnr"),
+        "ssub"           : getattr(c, "ssub", 1),
+        "tsub"           : getattr(c, "tsub", 2),
+        "nb"             : getattr(c, "gnb", 2),
         # center_psf=True is required for corr_pnr to route the post-patch
         # flow through: merge→update_temporal→update_spatial→update_temporal.
         # With center_psf=False the update_spatial step is skipped entirely.
-        "center_psf"     : c.method_init == "corr_pnr",
+        "center_psf"     : getattr(c, "method_init", "corr_pnr") == "corr_pnr",
         # ring_size_factor: neuropil background ring model radius.
         # None disables the ring model; 1.5 is standard for 2P cortical data.
         "ring_size_factor": float(getattr(c, "ring_size_factor", 1.5)),
         **({"min_corr": c.min_corr} if hasattr(c, "min_corr") else {}),
         **({"min_pnr":  c.min_pnr}  if hasattr(c, "min_pnr")  else {}),
+        # normalize_init must be False for corr_pnr (ring model incompatible with norm).
+        # CaImAn auto-corrects this, but we set it explicitly to avoid the warning.
+        "normalize_init" : False if getattr(c, "method_init", "corr_pnr") == "corr_pnr"
+                           else getattr(c, "normalize_init", True),
+        "rolling_sum"    : getattr(c, "rolling_sum",  True),
+        "ssub_B"         : getattr(c, "ssub_B",       2),
     })
 
     opts.set("preprocess", {
@@ -282,20 +300,27 @@ def build_cnmf_opts(
     })
 
     opts.set("merging", {
-        "merge_thr"  : c.merge_thr,
+        "merge_thr"  : getattr(c, "merge_thr", 0.85),
     })
 
     opts.set("spatial", {
-        "nb"         : c.gnb,
+        "nb"         : getattr(c, "gnb", 2),
         # nnls_L0 (LAPACK active-set) is 3-5× faster than lasso_lars
         # for sparse patch-sized problems (d=5329). lasso_lars computes
         # the full regularization path which is expensive at patch scale.
         "method_ls"  : str(getattr(c, "method_ls", "nnls_L0")),
+        # maxthr: footprint pixels below maxthr×peak are zeroed.
+        # 0.1 (default) can clip weak neurons; 0.05 is more inclusive.
+        "maxthr"     : float(getattr(c, "maxthr",     0.1)),
+        # extract_cc: keep only the largest connected component per footprint.
+        # True for soma 2P recordings; False for dendritic imaging.
+        "extract_cc" : bool(getattr(c, "extract_cc",  True)),
     })
 
     opts.set("temporal", {
-        "nb"                 : c.gnb,
-        "method_deconvolution": c.method_deconv,
+        "nb"                 : getattr(c, "gnb", 2),
+        "method_deconvolution": getattr(c, "method_deconv", "oasis"),
+        "bas_nonneg"          : getattr(c, "bas_nonneg", True),
         "p"                  : 0,
     })
 
@@ -303,13 +328,19 @@ def build_cnmf_opts(
         "min_SNR"    : q.min_SNR,
         "rval_thr"   : q.rval_thr,
         "use_cnn"    : q.use_cnn and cnn_available,
+        "SNR_lowest"  : getattr(q, "SNR_lowest",  0.5),
+        "rval_lowest" : getattr(q, "rval_lowest", -1.0),
         "min_cnn_thr": q.min_cnn_thr,
         "cnn_lowest" : q.cnn_lowest,
     })
 
+    _log_gSig = getattr(c, "gSig", "?")
+    _log_rf   = getattr(c, "rf",   "?")
+    _log_p    = getattr(c, "p",    "?")
+    _log_gnb  = getattr(c, "gnb",  "?")
     logger.info(
-        f"CNMFParams built: method_init={c.method_init}  K={c.K}  "
-        f"gSig={c.gSig}  rf={c.rf}  p={c.p}  gnb={c.gnb}  "
+        f"CNMFParams built: method_init={getattr(c, 'method_init', '?')}  K={getattr(c, 'K', '?')}  "
+        f"gSig={_log_gSig}  rf={_log_rf}  p={_log_p}  gnb={_log_gnb}  "
         f"decay_time={d.decay_time}  n_proc={n_processes}"
     )
     return opts

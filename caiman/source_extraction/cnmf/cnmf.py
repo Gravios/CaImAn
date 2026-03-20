@@ -272,6 +272,7 @@ class CNMF(object):
             cnm
                 A new CNMF object
         """
+        logger = logging.getLogger("caiman")
         cnm = CNMF(self.params.patch['n_processes'], params=self.params, dview=dview) # New object; this call does NOT modify self
 
         cnm.provenance += self.provenance
@@ -279,11 +280,38 @@ class CNMF(object):
         # We add the "history imported" note because the datestamp from the init of the new CNMF will be later than imported history (meaning right now)
         # so if you parse in list order you'll see a time-oddity here
 
-        # Do NOT reset rf here: the caller (e.g. pipeline.py) sets the desired
-        # rf on opts before calling refit(), and overriding it to None would
-        # silently disable patches and the SharedMovieBuffer path that goes with
-        # them.  Only clear only_init so the full spatial/temporal update runs.
+        # Refit runs as a single full-FOV CNMF (rf=None), not patch-by-patch.
+        # With rf=None, fit() takes the single-patch path:
+        #   preprocess → skip initialize (A already set) → update_spatial → update_temporal
+        # This matches upstream CaImAn behaviour and avoids the C/f temporal
+        # dimension mismatch that occurs when patch workers receive global C
+        # (T=27720) alongside patch-level f (T_sub=13860 at tsub=2).
+        cnm.params.patch['rf'] = None
         cnm.params.patch['only_init'] = False
+        # Spawn a fresh pool for the refit's spatial/temporal update.
+        # The dview passed in (from the initial fit's cluster) may already
+        # be terminated by the time refit() runs.  A fresh small pool
+        # avoids 'Pool not running' errors in determine_search_location.
+        # With rf=None and GPU gram path active (d>16384), spatial runs on
+        # GPU anyway; the pool is only used by determine_search_location
+        # (indicator computation) which is fast.
+        _refit_n = (self.params.patch.get('n_processes') or 4)
+        try:
+            from caiman.source_extraction.cnmf.map_reduce import (
+                _collect_log_params, _worker_logging_init)
+            _refit_ctx  = multiprocessing.get_context('spawn')
+            _refit_pool = _refit_ctx.Pool(
+                _refit_n,
+                initializer=_worker_logging_init,
+                initargs=(_collect_log_params(),),
+            )
+            cnm.dview = _refit_pool
+            logger.info(f'refit(): spawned fresh pool ({_refit_n} workers) '
+                        f'for spatial/temporal update')
+        except Exception as _pe:
+            logger.warning(f'refit(): could not spawn pool ({_pe}); '
+                           f'running single-threaded')
+            cnm.dview = None
         estimates = deepcopy(self.estimates)
         estimates.select_components(use_object=True)
         estimates.coordinates = None
@@ -303,7 +331,17 @@ class CNMF(object):
         # fast sequential frame reads instead of scattered C-order reads.
         if hasattr(self, '_forder_movie_path') and self._forder_movie_path:
             cnm._forder_movie_path = self._forder_movie_path
-        cnm.fit(images)
+        try:
+            cnm.fit(images)
+        finally:
+            if getattr(cnm, 'dview', None) is not None and \
+                    'multiprocessing' in str(type(cnm.dview)):
+                try:
+                    cnm.dview.terminate()
+                    cnm.dview.join()
+                    cnm.dview = None
+                except Exception:
+                    pass
         return cnm
 
     def fit(self, images, indices=(slice(None), slice(None))) -> None:
@@ -681,6 +719,8 @@ class CNMF(object):
                         self.merge_comps(Yr, mx=np.inf, fast_merge=True)
 
                     if self.params.get('init', 'nb') == 0:
+                        # Pure ring-model path (nb=0 / CNMFE): compute_W
+                        # recalibrates C in raw-ADU scale via the ring background.
                         self.estimates.W, self.estimates.b0 = compute_W(
                             Yr, self.estimates.A.toarray(), self.estimates.C, self.dims,
                             self.params.get('init', 'ring_size_factor') *
@@ -692,6 +732,26 @@ class CNMF(object):
                         self.estimates.C = self.estimates.C.astype(np.float32)
                     else:
                         self.estimates.S = self.estimates.C
+
+                    # Hybrid 2P path: nb_patch=0 + nb>0 (corr_pnr init with
+                    # low-rank global background).  Patch workers returned A/C
+                    # in DoG-filtered scale.  Without a global spatial/temporal
+                    # update here, A stays in filtered scale (~0.001 ADU), making
+                    # evaluate_components spatial correlation (rval) near-zero
+                    # vs the raw movie → almost all components rejected.
+                    # Fix: run update_spatial + update_temporal so A/C are
+                    # recalibrated to raw-ADU scale before evaluation.
+                    if self.params.get('init', 'nb') > 0 and len(self.estimates.C):
+                        self.params.set('spatial', {'se': np.ones((1,) * len(self.dims),
+                                                                    dtype=np.uint8)})
+                        logger.info('fit(): nb>0 + nb_patch=0: updating spatial (corr_pnr hybrid)')
+                        # use_init=True restricts each footprint to its existing
+                        # non-zero support so the lasso cannot zero a component
+                        # entirely.  The refit (with p=1 and better C) will
+                        # refine or eliminate genuinely spurious components.
+                        self.update_spatial(Yr, use_init=True)
+                        logger.info('fit(): nb>0 + nb_patch=0: updating temporal (corr_pnr hybrid)')
+                        self.update_temporal(Yr, use_init=False)
             else:
                 while len(self.estimates.merged_ROIs) > 0:
                     self.merge_comps(Yr, mx=np.inf)
