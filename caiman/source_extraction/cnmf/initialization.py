@@ -1708,7 +1708,12 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             # Apply tsub to match data_filtered shape (total_frames, d1p, d2p).
             # total_frames = T//tsub; _fd_T = T (full). Downsample by slicing.
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
-            data_filtered[:] = _filt_raw[::_ftsub]
+            # Apply temporal AND spatial subsampling.
+            # filt_full is at full resolution (ssub=1); data_filtered was
+            # allocated at (total_frames, d1//ssub, d2//ssub) via Y_ds.
+            # When ssub=1 the ::1 slices are identity — no overhead.
+            _fssub = ssub if ssub and ssub > 1 else 1
+            data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw
         else:
             # Fallback: read directly from filt_full on /dev/shm
@@ -1723,7 +1728,8 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             _d1p, _d2p = data_filtered.shape[1], data_filtered.shape[2]
             _filt_raw = _filt_raw[:, :_d1p, :_d2p]
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
-            data_filtered[:] = _filt_raw[::_ftsub]
+            _fssub = ssub if ssub and ssub > 1 else 1
+            data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw
         # Use precomputed sn, data_max, pnr (no filter loop, no get_noise_fft)
         # Shape guard: sn/data_max are sliced from the full-FOV npz using
