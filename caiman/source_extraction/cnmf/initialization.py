@@ -2984,7 +2984,7 @@ def precompute_corr_pnr_filtered_fov(
         cn_full      = cp.asnumpy((YYc_acc / _denom).clip(-1, 1)).astype(np.float32)
         del _Y2_gpu, _Y2_neigh, _denom
         cn_full      = np.where(np.isnan(cn_full), 0, cn_full)
-        del YYc_acc, _var_gpu, _MASK_gpu
+        del YYc_acc, _MASK_gpu
         logger.info('precompute_corr_pnr_filtered_fov: Cn computed on GPU')
     except Exception as _cn_exc:
         logger.warning(f'precompute_corr_pnr_filtered_fov: GPU Cn failed ({_cn_exc}); '
