@@ -252,6 +252,10 @@ def _build_parser() -> argparse.ArgumentParser:
              "files and update the JSON with the suggestions (requires caiman)")
     p.add_argument("--n-frames", type=int, default=500, metavar="N",
         help="Frames to subsample for parameter estimation (default 500)")
+    p.add_argument("--species", choices=["mouse", "rat"], default="mouse",
+        help="Animal species — constrains gSig search range (default: mouse)")
+    p.add_argument("--magnification", choices=["20x", "40x"], default="20x",
+        help="Objective magnification — combined with species to bound gSig (default: 20x)")
 
     return p
 
@@ -375,6 +379,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Dest       : {dest}")
     print(f"  data_root  : {dr}")
     print(f"  experiment : {exp}")
+    if args.estimate_params or args.run_mc:
+        print(f"  Species    : {args.species}")
+        print(f"  Magnif.    : {args.magnification}")
     if overrides:
         print("  Overrides  :")
         for k, v in overrides.items():
@@ -476,9 +483,11 @@ def main(argv: list[str] | None = None) -> int:
                         from caiman.utils.params_estimator import estimate_params, apply_suggestions
                         _suggestions = estimate_params(
                             _mc_path[-1],
-                            n_frames  = args.n_frames,
-                            out_path  = out_json.parent / f"{session}_qc_00_param_estimate.png",
-                            logger    = _est_logger,
+                            species       = args.species,
+                            magnification = args.magnification,
+                            n_frames      = args.n_frames,
+                            out_path      = out_json.parent / f"{session}_qc_00_param_estimate.png",
+                            logger        = _est_logger,
                         )
                         apply_suggestions(out_json, _suggestions)
                         print(f"\n  JSON updated with estimated parameters.")

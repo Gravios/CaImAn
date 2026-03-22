@@ -135,15 +135,37 @@ def madvise_dontneed(
         if logger is not None:
             logger.debug(f"madvise unavailable: {exc}")
 
-    # posix_fadvise fallback
+    # posix_fadvise fallback (Linux/macOS file-backed mmaps)
     try:
         import os
         os.posix_fadvise(mm.fileno(), 0, 0, _FADV_DONTNEED)
         if logger is not None:
             logger.info("posix_fadvise(DONTNEED): page cache hint sent")
+        return
     except Exception as exc:
         if logger is not None:
             logger.debug(f"posix_fadvise skipped: {exc}")
+
+    # Windows: DiscardVirtualMemory (Win8+) for anonymous/pagefile-backed
+    # regions. Has no effect on file-backed mmaps (no Windows equivalent).
+    # Silently skipped on older Windows or if ctypes unavailable.
+    try:
+        import sys, ctypes
+        if sys.platform == "win32":
+            _kernel32 = ctypes.windll.kernel32   # type: ignore[attr-defined]
+            _DiscardVirtualMemory = getattr(_kernel32, "DiscardVirtualMemory", None)
+            if _DiscardVirtualMemory is not None:
+                buf  = (ctypes.c_char * 1).from_buffer(mm)
+                addr = ctypes.c_void_p(ctypes.addressof(buf))
+                size = ctypes.c_size_t(len(mm))
+                rc   = _DiscardVirtualMemory(addr, size)
+                if logger is not None and rc != 0:
+                    logger.debug(
+                        f"DiscardVirtualMemory: evicted {len(mm)/2**30:.1f} GB "
+                        f"(rc={rc})")
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(f"DiscardVirtualMemory skipped: {exc}")
 
 
 # ── cupy_flush ────────────────────────────────────────────────────────────────

@@ -255,8 +255,16 @@ class CNMFRunner:
             logger.warning("idx_components is None — re-running evaluate_components")
             cnm2.estimates.evaluate_components(images, cnm2.params, dview=None)
 
-        n_acc = len(cnm2.estimates.idx_components)
-        n_rej = len(cnm2.estimates.idx_components_bad)
+        idx_acc = cnm2.estimates.idx_components
+        idx_rej = cnm2.estimates.idx_components_bad
+        if idx_acc is None:
+            logger.error("evaluate_components: idx_components still None after retry — "
+                         "treating all components as rejected")
+            idx_acc, idx_rej = [], list(range(cnm2.estimates.A.shape[1]))
+        if idx_rej is None:
+            idx_rej = []
+        n_acc = len(idx_acc)
+        n_rej = len(idx_rej)
         logger.info(f"Components: {n_acc} accepted / {n_rej} rejected")
         return n_acc, n_rej
 

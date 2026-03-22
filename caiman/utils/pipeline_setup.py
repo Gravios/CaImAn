@@ -325,37 +325,65 @@ def clean_stale_shm(
     temp_dir: Union[str, Path],
     logger: logging.Logger,
 ) -> None:
-    """Remove stale CaImAn worker mmaps and SHM files from crashed runs.
+    """Remove stale CaImAn worker mmaps and SHM segments from crashed runs.
 
-    Safe to call at any point before starting a new CNMF cluster.  PID-tagged
-    ``caiman_{pid}_*`` files are only deleted when the owning process no longer
-    exists; all other transient SHM files (``psm_*``, ``sem.loky-*``,
-    ``__KMP_REGISTERED_LIB_*``, ``_caiman_tile_*``, ``_caiman_filt_*``) are
-    always removed.
+    Cross-platform: on Linux/macOS removes file-backed tiles from ``/dev/shm``;
+    on Windows releases named ``multiprocessing.shared_memory`` segments
+    (``caiman_tile_A/B/C`` and ``caiman_filt_A/B/C``) that a previous crashed
+    run may have left open.
 
     Parameters
     ----------
     shm_dir
-        Shared-memory directory, typically ``/dev/shm``.
+        Shared-memory directory (``/dev/shm`` on Linux, ignored on Windows).
     temp_dir
-        CaImAn temp directory, typically ``CAIMAN_TEMP``.
+        CaImAn temp directory (``CAIMAN_TEMP``).
     logger
         Logger to write removal messages to.
     """
     import glob
+    import sys as _sys_cs
 
     shm_dir  = str(shm_dir)
     temp_dir = str(temp_dir)
 
+    if _sys_cs.platform == "win32":
+        # Windows: tile/filt slots are multiprocessing.shared_memory segments.
+        # Try to attach and unlink each known slot name. Silently ignore if
+        # they don't exist (normal case when no crash occurred).
+        from multiprocessing.shared_memory import SharedMemory as _SHM_cs
+        _WIN_SHM_NAMES = [
+            "caiman_tile_A", "caiman_tile_B", "caiman_tile_C", "caiman_tile_D",
+            "caiman_filt_A", "caiman_filt_B", "caiman_filt_C", "caiman_filt_D",
+        ]
+        for _sname in _WIN_SHM_NAMES:
+            try:
+                _seg = _SHM_cs(name=_sname, create=False)
+                _seg.close()
+                _seg.unlink()
+                logger.info(f"Cleared stale SHM segment: {_sname}")
+            except Exception:
+                pass   # doesn't exist — nothing to clean
+
+        # Also clean any temp-dir file mmaps from crashed runs
+        for path in (glob.glob(os.path.join(temp_dir, "caiman_*.mmap"))
+                     + glob.glob(os.path.join(temp_dir, "*_precomp_filt_*_f16.mmap"))
+                     + glob.glob(os.path.join(temp_dir, "*_precomp_sn_*.npz"))):
+            try:
+                os.unlink(path)
+                logger.info(f"Cleared stale mmap: {path}")
+            except OSError:
+                pass
+        return
+
+    # ── Linux / macOS: file-backed SHM cleanup ───────────────────────────
     caiman_mmaps = (
         glob.glob(os.path.join(shm_dir,  "caiman_*.mmap"))
         + glob.glob(os.path.join(shm_dir, "_caiman_tile_*.mmap"))
         + glob.glob(os.path.join(shm_dir, "_caiman_filt_*.mmap"))
         + glob.glob(os.path.join(temp_dir, "caiman_*.mmap"))
-        # precomputed filt_full from crashed runs: *_precomp_filt_*_f16.mmap
         + glob.glob(os.path.join(shm_dir,  "*_precomp_filt_*_f16.mmap"))
         + glob.glob(os.path.join(temp_dir, "*_precomp_filt_*_f16.mmap"))
-        # precomputed npz companion files
         + glob.glob(os.path.join(shm_dir,  "*_precomp_sn_*.npz"))
         + glob.glob(os.path.join(temp_dir, "*_precomp_sn_*.npz"))
     )
@@ -365,17 +393,19 @@ def clean_stale_shm(
         + glob.glob(os.path.join(shm_dir, "__KMP_REGISTERED_LIB_*"))
     )
 
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True   # process exists but we can't signal it
+
     for path in caiman_mmaps:
         m = re.search(r"caiman_(\d+)_", os.path.basename(path))
-        if m:
-            pid = int(m.group(1))
-            try:
-                os.kill(pid, 0)
-                continue           # process alive — leave it alone
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                continue
+        if m and _pid_alive(int(m.group(1))):
+            continue    # process alive — leave it alone
         try:
             os.unlink(path)
             logger.info(f"Cleared stale worker mmap: {path}")

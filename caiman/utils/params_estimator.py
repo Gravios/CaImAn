@@ -164,10 +164,20 @@ def estimate_params(
     stride  = rf // 2
     ring_px = _RING_SIZE_FACTOR * gSiz
     margin  = rf - ring_px
+    if margin <= 0:
+        logger.warning(
+            f"  Ring constraint VIOLATED: rf={rf} <= ring={ring_px:.1f}px. "
+            f"Increasing rf to {int(ring_px) + 6}.")
+        rf = int(ring_px) + 6
+        if rf % 2 != 0:
+            rf += 1
+        stride = rf // 2
+        margin = rf - ring_px
 
-    # Informational: patch count on a typical 512×512 FOV
-    step_px           = 2 * rf - stride   # = rf  (50% overlap)
-    n_per_dim         = max(1, math.ceil((512 - 2 * rf) / step_px) + 2)
+    # Informational: patch count on a typical 512×512 FOV.
+    # CaImAn steps patches by stride (= rf//2 here), so the number of
+    # patch origins along one axis is ceil(FOV / stride).
+    n_per_dim         = max(1, math.ceil(512 / stride))
     n_patches_typical = n_per_dim ** 2
 
     logger.info(

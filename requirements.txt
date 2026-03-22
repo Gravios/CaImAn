@@ -1,0 +1,34 @@
+# ── Core pipeline ─────────────────────────────────────────────────────────────
+# Required for all pipeline steps (motion correction, CNMF, QC, dF/F).
+numpy>=1.20
+scipy>=1.7
+scikit-image>=0.19
+scikit-learn>=1.0
+opencv-python>=4.5
+tifffile>=2022.2
+matplotlib>=3.5
+psutil>=5.9
+h5py>=3.6
+dill>=0.3
+
+# ── GPU ───────────────────────────────────────────────────────────────────────
+# Required for GPU motion correction and GPU Cn/PNR precompute.
+# Install the variant matching your CUDA driver version:
+#
+#   CUDA 11.x:   pip install cupy-cuda11x
+#   CUDA 12.x:   pip install cupy-cuda12x
+#
+# Check your driver version with: nvidia-smi | head -1
+#
+cupy-cuda12x>=12.0
+
+# ── Optional: NWB output ──────────────────────────────────────────────────────
+# Required if NWB export is enabled (pending feature).
+# pynwb>=2.3
+
+# ── Optional: widefield pipeline ─────────────────────────────────────────────
+# Required for the widefield calcium imaging analysis pipeline.
+# ipyparallel>=8.4
+
+# ── Note: 'logging' is Python standard library ───────────────────────────────
+# It ships with every Python installation — no pip install needed.
