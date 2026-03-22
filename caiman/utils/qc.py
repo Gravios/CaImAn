@@ -593,7 +593,8 @@ def qc_component_evaluation(
     if has_snr:
         snr    = np.asarray(est.SNR_comp)
         ax_snr = _dark_ax(fig, gs[0, col])
-        bins   = np.linspace(0, np.nanpercentile(snr, 99), 40)
+        _snr_hi = np.nanpercentile(snr, 99)
+        bins   = np.linspace(0, _snr_hi if np.isfinite(_snr_hi) else 10, 40)
         if len(idx_good):
             ax_snr.hist(snr[idx_good], bins=bins, color="#69ff47",
                         alpha=0.75, label=f"accept (n={len(idx_good)})")

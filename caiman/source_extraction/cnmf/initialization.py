@@ -1698,13 +1698,28 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             _fts = precomp['filt_tile_shape']   # (dx, dy, T)
             _flx = precomp['filt_tile_lx']      # (lx0, lx1)
             _fly = precomp['filt_tile_ly']      # (ly0, ly1)
-            _ftm = np.memmap(_fp, dtype=np.float16, mode='r',
-                             shape=_fts, order='F')
+            import sys as _sys_ir, os as _os_ir
+            _filt_tile_is_shm = (_sys_ir.platform == "win32"
+                                 or (_os_ir.sep not in str(_fp)
+                                     and "/" not in str(_fp)))
             _flx0, _flx1 = _flx;  _fly0, _fly1 = _fly
-            _filt_raw = np.transpose(
-                np.asarray(_ftm[_flx0:_flx1, _fly0:_fly1, :], dtype=np.float32),
-                (2, 0, 1))  # (T_full, d1p, d2p)
-            del _ftm
+            if _filt_tile_is_shm:
+                from multiprocessing.shared_memory import SharedMemory as _SHM_ir
+                _filt_shm_wk = _SHM_ir(name=_fp, create=False)
+                _ftm = np.ndarray(_fts, dtype=np.float16,
+                                  buffer=_filt_shm_wk.buf, order='F')
+                _filt_raw = np.transpose(
+                    np.asarray(_ftm[_flx0:_flx1, _fly0:_fly1, :], dtype=np.float32),
+                    (2, 0, 1))  # (T_full, d1p, d2p)
+                del _ftm
+                _filt_shm_wk.close()  # allow parent to unlink on Windows
+            else:
+                _ftm = np.memmap(_fp, dtype=np.float16, mode='r',
+                                 shape=_fts, order='F')
+                _filt_raw = np.transpose(
+                    np.asarray(_ftm[_flx0:_flx1, _fly0:_fly1, :], dtype=np.float32),
+                    (2, 0, 1))  # (T_full, d1p, d2p)
+                del _ftm
             # Apply tsub to match data_filtered shape (total_frames, d1p, d2p).
             # total_frames = T//tsub; _fd_T = T (full). Downsample by slicing.
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
@@ -2825,9 +2840,9 @@ def precompute_corr_pnr_filtered_fov(
             _libc_w.posix_fadvise(_fd_w, 0, 0, _ct_warm.c_int(2))  # SEQUENTIAL
             # Read raw file bytes sequentially — true 14 GB/s NVMe throughput
             _blk = 128 * 2**20  # 128 MB read buffer
-            _buf = bytearray(_blk)
-            _mv  = memoryview(_buf)
-            while _os_warm.readv(_fd_w, [_mv]) > 0:
+            # os.readv is POSIX-only; use os.read for cross-platform support.
+            # os.read returns b"" at EOF, so loop until empty.
+            while _os_warm.read(_fd_w, _blk):
                 pass
             _os_warm.close(_fd_w)
             logger.info('precompute_corr_pnr_filtered_fov: movie cache warmed')
@@ -2918,9 +2933,7 @@ def precompute_corr_pnr_filtered_fov(
         _fd_fw = _os_fw.open(filt_path, _os_fw.O_RDONLY)
         _libc_fw.posix_fadvise(_fd_fw, 0, 0, _ct_fw.c_int(2))  # SEQUENTIAL
         _blk_fw = 128 * 2**20
-        _buf_fw = bytearray(_blk_fw)
-        _mv_fw  = memoryview(_buf_fw)
-        while _os_fw.readv(_fd_fw, [_mv_fw]) > 0:
+        while _os_fw.read(_fd_fw, _blk_fw):  # os.readv is POSIX-only
             pass
         _os_fw.close(_fd_fw)
     except Exception:

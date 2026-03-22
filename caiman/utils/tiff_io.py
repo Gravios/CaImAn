@@ -38,7 +38,11 @@ logger = logging.getLogger("caiman")
 
 # ── madvise ──────────────────────────────────────────────────────────────────
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6",
+                        use_errno=True)
+except (OSError, TypeError):
+    _libc = None   # madvise_sequential will no-op
 _MADV_SEQUENTIAL = 2
 _MADV_WILLNEED   = 3
 
@@ -51,6 +55,8 @@ def madvise_sequential(arr: np.ndarray) -> None:
     if madvise is unavailable.
     """
     try:
+        if _libc is None:
+            return
         addr   = arr.ctypes.data
         length = arr.nbytes
         _libc.madvise(
@@ -100,6 +106,12 @@ def ensure_multipage_tiff(src_path: str) -> str:
         arr = tf.asarray(out="memmap")          # mmap — no RAM copy
         madvise_sequential(arr)
 
+        if arr.ndim == 2:
+            # Genuine single-frame TIFF — nothing to convert.
+            logger.warning(
+                f"ensure_multipage_tiff: {src_path!r} appears to be a "
+                f"single 2-D frame; returning original path.")
+            return src_path
         T_src = arr.shape[0]
         H, W  = arr.shape[1], arr.shape[2]
 

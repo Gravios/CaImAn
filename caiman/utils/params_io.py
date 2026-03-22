@@ -230,9 +230,9 @@ def build_cnmf_opts(
 
     opts.set("data", {
         "fnames"     : [fname_cnmf],
-        "fr"         : d.fr,
-        "dxy"        : tuple(getattr(d, "dxy", (1.0, 1.0))),
-        "decay_time" : d.decay_time,
+        "fr"         : float(getattr(d, "fr",          30.0)),
+        "dxy"        : tuple(getattr(d, "dxy",         (1.0, 1.0))),
+        "decay_time" : float(getattr(d, "decay_time",  1.0)),
         "dims"       : dims,
     })
 
@@ -263,7 +263,7 @@ def build_cnmf_opts(
         # duplicate components flooding assembly. For sparse 2P recordings
         # (gnb>0) it is counterproductive — with ~1 neuron per patch on average,
         # del_duplicates drops most real neurons. Use merge_comps instead.
-        "del_duplicates"      : (getattr(c, "method_init", "corr_pnr") == "corr_pnr" and getattr(c, "gnb", 2) == 0),
+        "del_duplicates"      : (getattr(c, "gnb", 2) == 0),  # True for 1P/CNMFE (gnb=0); False for 2P (gnb>0)
         "border_pix"          : bord_px,
         "ram_budget_frac"      : _ram_frac,
         "worker_overhead_frac" : _overhead_frac,
@@ -284,7 +284,9 @@ def build_cnmf_opts(
         "center_psf"     : getattr(c, "method_init", "corr_pnr") == "corr_pnr",
         # ring_size_factor: neuropil background ring model radius.
         # None disables the ring model; 1.5 is standard for 2P cortical data.
-        "ring_size_factor": float(getattr(c, "ring_size_factor", 1.5)),
+        # Default 0.9 validated for 2P sparse. 1.5 (CaImAn default) violates
+        # the ring constraint at typical patch sizes (ring > rf).
+        "ring_size_factor": float(getattr(c, "ring_size_factor", 0.9)),
         **({"min_corr": c.min_corr} if hasattr(c, "min_corr") else {}),
         **({"min_pnr":  c.min_pnr}  if hasattr(c, "min_pnr")  else {}),
         # normalize_init must be False for corr_pnr (ring model incompatible with norm).
@@ -311,7 +313,7 @@ def build_cnmf_opts(
         "method_ls"  : str(getattr(c, "method_ls", "nnls_L0")),
         # maxthr: footprint pixels below maxthr×peak are zeroed.
         # 0.1 (default) can clip weak neurons; 0.05 is more inclusive.
-        "maxthr"     : float(getattr(c, "maxthr",     0.1)),
+        "maxthr"     : float(getattr(c, "maxthr",     0.05)),  # 0.1 clips weak neurons
         # extract_cc: keep only the largest connected component per footprint.
         # True for soma 2P recordings; False for dendritic imaging.
         "extract_cc" : bool(getattr(c, "extract_cc",  True)),
@@ -325,13 +327,13 @@ def build_cnmf_opts(
     })
 
     opts.set("quality", {
-        "min_SNR"    : q.min_SNR,
-        "rval_thr"   : q.rval_thr,
-        "use_cnn"    : q.use_cnn and cnn_available,
-        "SNR_lowest"  : getattr(q, "SNR_lowest",  0.5),
-        "rval_lowest" : getattr(q, "rval_lowest", -1.0),
-        "min_cnn_thr": q.min_cnn_thr,
-        "cnn_lowest" : q.cnn_lowest,
+        "min_SNR"     : float(getattr(q, "min_SNR",     1.5)),
+        "rval_thr"    : float(getattr(q, "rval_thr",    0.6)),
+        "use_cnn"     : bool(getattr(q,  "use_cnn",     False)) and cnn_available,
+        "SNR_lowest"  : float(getattr(q, "SNR_lowest",  0.5)),
+        "rval_lowest" : float(getattr(q, "rval_lowest", -1.0)),
+        "min_cnn_thr" : float(getattr(q, "min_cnn_thr", 0.6)),
+        "cnn_lowest"  : float(getattr(q, "cnn_lowest",  0.1)),
     })
 
     _log_gSig = getattr(c, "gSig", "?")
@@ -341,6 +343,6 @@ def build_cnmf_opts(
     logger.info(
         f"CNMFParams built: method_init={getattr(c, 'method_init', '?')}  K={getattr(c, 'K', '?')}  "
         f"gSig={_log_gSig}  rf={_log_rf}  p={_log_p}  gnb={_log_gnb}  "
-        f"decay_time={d.decay_time}  n_proc={n_processes}"
+        f"decay_time={getattr(d, 'decay_time', '?')}  n_proc={n_processes}"
     )
     return opts

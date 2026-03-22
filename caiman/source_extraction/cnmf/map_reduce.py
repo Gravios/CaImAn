@@ -198,17 +198,34 @@ def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
     _tile_lx    = _precomp_inner.get('tile_lx')
     _tile_ly    = _precomp_inner.get('tile_ly')
     if _tile_path is not None and _tile_shape is not None:
-        # Mmap tile from /dev/shm then copy slice as (d1p, d2p, T) F-order.
-        # This layout makes Y=transpose(images,[1,2,0]) F-contiguous so that
-        # Y.reshape(-1,T,order='F') and the subsequent Yr are zero-copy views.
-        _tile_mm = np.memmap(_tile_path, dtype=np.float32, mode='r',
-                             shape=_tile_shape, order='F')
+        # Attach to tile data — either a file-backed mmap (Linux/macOS)
+        # or a named SharedMemory segment (Windows).  Detect by checking
+        # whether the path exists as a file; if not, treat as SHM name.
+        import sys as _sys_wk
+        # Detect SHM vs filesystem path: SHM names contain no path separator.
+        # On Windows all tiles are SHM; on Linux tile_path is a full /dev/shm/ path.
+        _tile_is_shm = (_sys_wk.platform == "win32"
+                        or (os.sep not in str(_tile_path)
+                            and "/" not in str(_tile_path)))
         lx0, lx1 = _tile_lx
         ly0, ly1 = _tile_ly
-        # asfortranarray of the transposed slice → (d1p, d2p, T) F-contiguous
-        _images_f = np.asfortranarray(
-            _tile_mm[:, lx0:lx1, ly0:ly1].transpose(1, 2, 0), dtype=np.float32)
-        del _tile_mm
+        if _tile_is_shm:
+            from multiprocessing.shared_memory import SharedMemory as _SHM_wk
+            _tile_shm_wk = _SHM_wk(name=_tile_path, create=False)
+            _tile_mm = np.ndarray(_tile_shape, dtype=np.float32,
+                                  buffer=_tile_shm_wk.buf, order='F')
+            _images_f = np.asfortranarray(
+                _tile_mm[:, lx0:lx1, ly0:ly1].transpose(1, 2, 0), dtype=np.float32)
+            del _tile_mm
+            # Release the SHM attachment so Windows allows unlink from parent.
+            _tile_shm_wk.close()
+        else:
+            # Linux/macOS: mmap from /dev/shm, copy slice, del mmap handle.
+            _tile_mm = np.memmap(_tile_path, dtype=np.float32, mode='r',
+                                 shape=_tile_shape, order='F')
+            _images_f = np.asfortranarray(
+                _tile_mm[:, lx0:lx1, ly0:ly1].transpose(1, 2, 0), dtype=np.float32)
+            del _tile_mm
         # Wrap as (T, d1p, d2p) view for fit() — Y=transpose([1,2,0]) recovers
         # _images_f which IS F-contiguous → Y_ds_flat is a zero-copy view.
         images = _images_f.transpose(2, 0, 1)
@@ -278,9 +295,60 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     import numpy as _np_td
     import threading as _thr
     import os as _os_td
+    import sys as _sys_td
 
     d1, d2 = dims
+
+    # ── Platform-aware SHM backend ───────────────────────────────────────
+    # Linux/macOS: file-backed tiles on /dev/shm (tmpfs).  Workers mmap
+    #   the file; unlink while mapped is safe (inode stays live).
+    # Windows:     multiprocessing.shared_memory (pagefile-backed section
+    #   objects).  Workers attach by name; shm.close() must be called in
+    #   every process before shm.unlink() in the parent.
+    _IS_WIN  = _sys_td.platform == "win32"
     _shm_dir = _os_td.environ.get('CAIMAN_SHM', '/dev/shm')
+
+    def _shm_headroom_bytes():
+        """Free bytes available for SHM tiles (cross-platform)."""
+        if _IS_WIN:
+            try:
+                import psutil as _psu_hd
+                return _psu_hd.virtual_memory().available
+            except Exception:
+                return 2**40  # unknown — skip guard
+        try:
+            import shutil as _shu_hd
+            return _shu_hd.disk_usage(_shm_dir).free
+        except Exception:
+            return 2**40
+
+    def _shm_usage_str():
+        """Human-readable SHM usage for log messages (cross-platform)."""
+        if _IS_WIN:
+            try:
+                import psutil as _psu_lg
+                vm = _psu_lg.virtual_memory()
+                return (f"RAM avail={vm.available/2**30:.2f}GB "
+                        f"used={vm.used/2**30:.2f}GB")
+            except Exception:
+                return ""
+        try:
+            import shutil as _shu_lg
+            _du = _shu_lg.disk_usage(_shm_dir)
+            return (f"SHM={_du.used/2**30:.2f}GB"
+                    f"/{_du.total/2**30:.1f}GB "
+                    f"free={_du.free/2**30:.2f}GB")
+        except Exception:
+            return ""
+
+    # SharedMemory names must be ≤31 chars and alphanumeric on Windows.
+    # Slot names A-D support up to 4 slots (CAIMAN_TILE_SLOTS max 4).
+    _SHM_NAMES = {
+        0: ("caiman_tile_A", "caiman_filt_A"),
+        1: ("caiman_tile_B", "caiman_filt_B"),
+        2: ("caiman_tile_C", "caiman_filt_C"),
+        3: ("caiman_tile_D", "caiman_filt_D"),
+    }
 
     # ── Build patch spatial bounding boxes ──────────────────────────────────
     patch_boxes = []
@@ -334,15 +402,63 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
 
     # ── Two SHM slot paths ───────────────────────────────────────────────────
     _n_slots = int(_os_td.environ.get('CAIMAN_TILE_SLOTS', '2'))
-    _slot_paths = {
-        0: (_os_td.path.join(_shm_dir, '_caiman_tile_A.mmap'),
-            _os_td.path.join(_shm_dir, '_caiman_filt_A.mmap')),
-        1: (_os_td.path.join(_shm_dir, '_caiman_tile_B.mmap'),
-            _os_td.path.join(_shm_dir, '_caiman_filt_B.mmap')),
-        2: (_os_td.path.join(_shm_dir, '_caiman_tile_C.mmap'),
-            _os_td.path.join(_shm_dir, '_caiman_filt_C.mmap')),
-    }
-    _slot_paths = {k: v for k, v in _slot_paths.items() if k < _n_slots}
+    # Cap n_slots at the number of named SHM slots on Windows.
+    if _IS_WIN and _n_slots > len(_SHM_NAMES):
+        logger.warning(
+            f"CAIMAN_TILE_SLOTS={_n_slots} exceeds max supported ({len(_SHM_NAMES)}) "
+            f"on Windows; capping at {len(_SHM_NAMES)}.")
+        _n_slots = len(_SHM_NAMES)
+
+    # Slot paths (Linux) or SharedMemory handle registry (Windows).
+    # _slot_shm_handles[slot] = (tile_shm | None, filt_shm | None)
+    # on Linux these remain None; tile_path strings are used directly.
+    _slot_shm_handles = {k: [None, None] for k in range(_n_slots)}
+
+    if _IS_WIN:
+        # No filesystem paths — slots are identified by SharedMemory name.
+        # Paths are set to None; workers receive the SHM name instead.
+        _slot_paths = {k: (None, None) for k in range(_n_slots)}
+    else:
+        _slot_paths = {
+            k: (_os_td.path.join(_shm_dir, f'_caiman_tile_{chr(65+k)}.mmap'),
+                _os_td.path.join(_shm_dir, f'_caiman_filt_{chr(65+k)}.mmap'))
+            for k in range(_n_slots)
+        }
+
+    def _alloc_shm(name, nbytes, slot_idx, is_filt):
+        """Allocate (or reallocate) a SHM slot.  Windows-only.
+        Returns the SharedMemory object and a writable np.ndarray view.
+        The handle is stored in _slot_shm_handles for later cleanup.
+        Handles stale segments from crashed runs by attaching and
+        unlinking before creating a fresh one.
+        """
+        from multiprocessing.shared_memory import SharedMemory as _SHM
+        # Release known previous handle
+        _prev = _slot_shm_handles[slot_idx][int(is_filt)]
+        if _prev is not None:
+            try: _prev.close(); _prev.unlink()
+            except Exception: pass
+        # Create fresh segment — if a stale one exists from a crash,
+        # attach and unlink it first, then retry.
+        try:
+            shm = _SHM(name=name, create=True, size=nbytes)
+        except FileExistsError:
+            try:
+                _stale = _SHM(name=name, create=False)
+                _stale.close(); _stale.unlink()
+            except Exception:
+                pass
+            shm = _SHM(name=name, create=True, size=nbytes)
+        _slot_shm_handles[slot_idx][int(is_filt)] = shm
+        return shm
+
+    def _free_shm_slot(slot_idx):
+        """Release both SHM segments for a slot (Windows-only)."""
+        for seg in _slot_shm_handles[slot_idx]:
+            if seg is not None:
+                try: seg.close(); seg.unlink()
+                except Exception: pass
+        _slot_shm_handles[slot_idx] = [None, None]
 
     def _write_tile(tile_id, patch_indices, slot):
         """Load one tile from FUSE into SHM slot. Returns tile metadata."""
@@ -353,38 +469,45 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         tx0, tx1 = min(tile_xs), max(tile_xe)
         ty0, ty1 = min(tile_ys), max(tile_ye)
 
-        tile_path, filt_path = _slot_paths[slot]
+        tile_path_or_name, filt_path_or_name = _slot_paths[slot]
         tile_shape = (T, tx1-tx0, ty1-ty0)
 
-        # SHM headroom guard: estimate tile cost and check free space
-        # before mmap'ing. Writing beyond /dev/shm capacity raises SIGBUS
-        # (unrecoverable crash). Abort early with a clear error instead.
-        # Only count images tile — filt tiles are skipped when filt_full
-        # is on NVMe (workers read filt_full directly, no SHM copy).
+        # ── SHM headroom guard ─────────────────────────────────────────
         _tile_bytes = int(_np_td.prod(tile_shape)) * 4
         _filt_on_shm_hg = (
             _filt_full is not None
+            and not _IS_WIN
             and str(getattr(_filt_full, 'filename', '') or '').startswith(_shm_dir)
         )
         _filt_bytes = int(_np_td.prod(tile_shape)) * 2 if _filt_on_shm_hg else 0
         _needed_gb  = (_tile_bytes + _filt_bytes) / 2**30
-        try:
-            import shutil as _shutil_hg
-            _shm_free_gb = _shutil_hg.disk_usage(_shm_dir).free / 2**30
-            _headroom_gb = 2.0   # keep 2 GB in reserve for worker incp files
-            if _shm_free_gb - _needed_gb < _headroom_gb:
-                raise MemoryError(
-                    f'TileDispatcher: insufficient SHM headroom for tile '
-                    f'({tx0}:{tx1},{ty0}:{ty1}): need {_needed_gb:.1f} GB + '
-                    f'{_headroom_gb:.1f} GB reserve, only {_shm_free_gb:.1f} GB free. '
-                    f'Reduce CAIMAN_TILE_SLOTS (currently {_n_slots}) or '
-                    f'increase /dev/shm: sudo mount -o remount,size=60G /dev/shm'
-                )
-        except (OSError, AttributeError):
-            pass  # skip check if disk_usage fails (non-tmpfs /dev/shm)
+        _free_gb    = _shm_headroom_bytes() / 2**30
+        _headroom_gb = 2.0
+        if _free_gb - _needed_gb < _headroom_gb:
+            _hint = (f"Reduce CAIMAN_TILE_SLOTS (currently {_n_slots})"
+                     if _IS_WIN else
+                     f"Reduce CAIMAN_TILE_SLOTS or increase /dev/shm: "
+                     f"sudo mount -o remount,size=60G /dev/shm")
+            raise MemoryError(
+                f'TileDispatcher: insufficient SHM headroom for tile '
+                f'({tx0}:{tx1},{ty0}:{ty1}): need {_needed_gb:.1f} GB + '
+                f'{_headroom_gb:.1f} GB reserve, only {_free_gb:.1f} GB free. '
+                f'{_hint}'
+            )
 
-        tm = _np_td.memmap(tile_path, dtype=_np_td.float32,
-                           mode='w+', shape=tile_shape, order='F')
+        # ── Allocate and write the images tile ─────────────────────────
+        if _IS_WIN:
+            _tile_name = _SHM_NAMES[slot][0]
+            _tile_shm  = _alloc_shm(_tile_name, _tile_bytes, slot, is_filt=False)
+            tm = _np_td.ndarray(tile_shape, dtype=_np_td.float32,
+                                buffer=_tile_shm.buf, order='F')
+            tile_path = _tile_name      # workers receive name, not path
+            filt_path = _SHM_NAMES[slot][1]
+        else:
+            tile_path = tile_path_or_name
+            filt_path = filt_path_or_name
+            tm = _np_td.memmap(tile_path, dtype=_np_td.float32,
+                               mode='w+', shape=tile_shape, order='F')
         if _use_forder:
             tm[:] = _np_td.transpose(
                 _np_td.asarray(_movie_f[tx0:tx1, ty0:ty1, :], dtype=_np_td.float32),
@@ -394,7 +517,12 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                 [(x * d2 + y) for x in range(tx0, tx1) for y in range(ty0, ty1)],
                 dtype=_np_td.int64)
             tm[:] = _Yr[_px_idx, :].reshape(tx1-tx0, ty1-ty0, T).transpose(2, 0, 1)
-        tm.flush(); del tm
+        if not _IS_WIN:
+            tm.flush(); del tm
+        else:
+            # SharedMemory is always in RAM — no flush needed.
+            # Keep reference alive in _slot_shm_handles; del the view only.
+            del tm
         # Drop movie pages from kernel page cache after each tile read.
         # Without this, FUSE pages accumulate to 40+ GB of Cached RAM,
         # crowding out worker SHM pages → workers go D-state.
@@ -416,13 +544,23 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             # Saves 2 × ~3.7 GB = 7.4 GB /dev/shm per slot pair.
             _filt_filename = str(getattr(_filt_full, 'filename', '') or '')
             _filt_on_shm   = _filt_filename.startswith(_shm_dir)
-            if _filt_on_shm:
+            if _filt_on_shm or _IS_WIN:
                 filt_shape = (tx1-tx0, ty1-ty0, T)
-                fm = _np_td.memmap(filt_path, dtype=_np_td.float16,
-                                   mode='w+', shape=filt_shape, order='F')
+                _filt_bytes_w = int(_np_td.prod(filt_shape)) * 2  # float16
+                if _IS_WIN:
+                    _filt_name = _SHM_NAMES[slot][1]
+                    _filt_shm  = _alloc_shm(_filt_name, _filt_bytes_w,
+                                            slot, is_filt=True)
+                    fm = _np_td.ndarray(filt_shape, dtype=_np_td.float16,
+                                       buffer=_filt_shm.buf, order='F')
+                    filt_path = _filt_name
+                else:
+                    fm = _np_td.memmap(filt_path, dtype=_np_td.float16,
+                                      mode='w+', shape=filt_shape, order='F')
                 fm[:] = _filt_full[tx0:tx1, ty0:ty1, :]
-                fm.flush(); del fm
-                filt_path = filt_path
+                if not _IS_WIN:
+                    fm.flush()
+                del fm
             else:
                 filt_shape = (_precomp_result['d1'], _precomp_result['d2'], T)
                 filt_path  = _precomp_result['filtered_path']
@@ -432,18 +570,10 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             except (AttributeError, OSError, NameError): pass
 
         mb = int(_np_td.prod(tile_shape) * 4 // 2**20)
-        try:
-            import shutil as _sh_tl
-            _du_tl = _sh_tl.disk_usage('/dev/shm')
-            logger.info(
-                f'TileDispatcher: tile {tile_id} ({tx0}:{tx1},{ty0}:{ty1}) '
-                f'→ {len(patch_indices)} patches, {mb} MB written to SHM slot {slot} '
-                f'| SHM {_du_tl.used/2**30:.2f}/{_du_tl.total/2**30:.1f}GB '
-                f'free={_du_tl.free/2**30:.2f}GB')
-        except Exception:
-            logger.info(
-                f'TileDispatcher: tile {tile_id} ({tx0}:{tx1},{ty0}:{ty1}) '
-                f'→ {len(patch_indices)} patches, {mb} MB written to SHM slot {slot}')
+        logger.info(
+            f'TileDispatcher: tile {tile_id} ({tx0}:{tx1},{ty0}:{ty1}) '
+            f'→ {len(patch_indices)} patches, {mb} MB written to SHM slot {slot} '
+            f'| {_shm_usage_str()}')
         return tile_path, filt_path, tile_shape, filt_shape, (tx0, tx1, ty0, ty1)
 
     def _build_patch_args(patch_indices, tile_path, filt_path,
@@ -576,11 +706,9 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             if _start_load_thread is not None:
                 _start_load_thread.start()
             try:
-                import shutil as _sh_cb
-                _du_cb = _sh_cb.disk_usage('/dev/shm')
                 logger.info(
                     f'TileDispatcher: result {len(file_res)}/{total} '
-                    f'SHM={_du_cb.used/2**30:.2f}GB free={_du_cb.free/2**30:.2f}GB')
+                    f'{_shm_usage_str()}')
             except Exception: pass
         except Exception as _cb_exc:
             logger.error(f"TileDispatcher: _on_result callback failed: {_cb_exc}")
@@ -607,12 +735,22 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                 return
             _try_submit(slot)
 
-    # ── Clean stale tile files from previous runs ────────────────────────────
-    for _s_idx in range(_n_slots):
-        for _stale_f in _slot_paths[_s_idx]:
-            try:
-                if _os_td.path.exists(_stale_f): _os_td.unlink(_stale_f)
-            except OSError: pass
+    # ── Clean stale tile files / SHM from previous runs ─────────────────────
+    if _IS_WIN:
+        from multiprocessing.shared_memory import SharedMemory as _SHM_cl
+        for _s_idx in range(_n_slots):
+            for _sname in _SHM_NAMES[_s_idx]:
+                try:
+                    _stale = _SHM_cl(name=_sname, create=False)
+                    _stale.close(); _stale.unlink()
+                except Exception: pass
+    else:
+        for _s_idx in range(_n_slots):
+            for _stale_f in _slot_paths[_s_idx]:
+                try:
+                    if _stale_f and _os_td.path.exists(_stale_f):
+                        _os_td.unlink(_stale_f)
+                except OSError: pass
 
     # ── Bootstrap: load first 2 tiles, submit first 2 ──────────────────────
     # Set _next_load BEFORE starting background thread to avoid race where
@@ -644,8 +782,18 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _alive = []
             for _w in pool._pool:
                 try:
-                    _os_wd.kill(_w.pid, 0)  # signal 0 = liveness check
-                    _alive.append(_w.pid)
+                    # Cross-platform liveness check:
+                    # Linux: os.kill(pid, 0) — raises if process gone.
+                    # Windows: os.kill raises NotImplementedError for sig=0;
+                    #   use psutil.pid_exists() instead.
+                    import sys as _sys_wdp
+                    if _sys_wdp.platform == "win32":
+                        import psutil as _psu_wd
+                        if _psu_wd.pid_exists(_w.pid):
+                            _alive.append(_w.pid)
+                    else:
+                        _os_wd.kill(_w.pid, 0)
+                        _alive.append(_w.pid)
                 except (ProcessLookupError, PermissionError):
                     pass  # process gone
             _n_expected = pool._processes
@@ -653,8 +801,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                 _dead = _n_expected - len(_alive)
                 try:
                     import shutil as _shu_wd
-                    _shm_info = (f" SHM={_shu_wd.disk_usage(_shm_dir).used/2**30:.1f}"
-                                 f"/{_shu_wd.disk_usage(_shm_dir).total/2**30:.0f}GB")
+                    _shm_info = " " + _shm_usage_str()
                 except Exception:
                     _shm_info = ""
                 _msg = (f"TileDispatcher watchdog: {_dead} of {_n_expected} "
@@ -676,14 +823,19 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     if _movie_f is not None: del _movie_f
     if _filt_full is not None: del _filt_full
 
-    for _s_idx in range(_n_slots):
-        for _slot_f in _slot_paths[_s_idx]:
-            try:
-                if _os_td.path.exists(_slot_f):
-                    _os_td.unlink(_slot_f)
-                    logger.debug(f'TileDispatcher: freed slot file {_slot_f}')
-            except OSError:
-                pass
+    if _IS_WIN:
+        for _s_idx in range(_n_slots):
+            _free_shm_slot(_s_idx)
+            logger.debug(f'TileDispatcher: freed SHM slot {_s_idx}')
+    else:
+        for _s_idx in range(_n_slots):
+            for _slot_f in _slot_paths[_s_idx]:
+                try:
+                    if _slot_f and _os_td.path.exists(_slot_f):
+                        _os_td.unlink(_slot_f)
+                        logger.debug(f'TileDispatcher: freed slot file {_slot_f}')
+                except OSError:
+                    pass
 
     if _errors:
         raise _errors[0]
@@ -825,7 +977,9 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
         try:
             import psutil as _psu
             _vm       = _psu.virtual_memory()
-            _free_shm = _psu.disk_usage('/dev/shm').free
+            _free_shm = (_psu.disk_usage('/dev/shm').free
+                         if __import__('sys').platform != 'win32'
+                         else _psu.virtual_memory().available)
             # Workers reading from SHM access the movie as a shared
             # mapping — the 27 GB is counted once regardless of how many
             # workers are running.  Their private RSS is compute buffers
@@ -904,7 +1058,7 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 _cached_precomp = {'filtered_path': _pers_path,
                                    'filt_dtype':    'float16',
                                    'd1': dims[0], 'd2': dims[1], 'T': T,
-                                   'filt_order': 'C'}
+                                   'filt_order': 'F'}  # filt_full is F-order
                 # Load companion arrays (sn_full, pnr_full etc.) so
                 # workers skip NaN scan and noise FFT.
                 _npz_path = os.path.splitext(_pers_path)[0] + '_meta.npz'
@@ -1144,17 +1298,19 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                 f"budget={_budget/2**30:.1f} GB  "
                 f"→ {_safe_workers} workers (requested {_actual_workers})"
             )
-            # Warn if /dev/shm is too full for workers
-            try:
-                import shutil as _shu
-                _shm_stat = _shu.disk_usage('/dev/shm')
-                _shm_pct  = _shm_stat.used / _shm_stat.total * 100
-                if _shm_pct > 70:
-                    logger.warning(
-                        f"/dev/shm {_shm_stat.used/2**30:.1f}/{_shm_stat.total/2**30:.1f} GB "
-                        f"({_shm_pct:.0f}% used) — worker SHM files may cause SIGBUS. "
-                        f"Run: rm -f /dev/shm/tmp*.mmap /dev/shm/_caiman_*.mmap")
-            except Exception: pass
+            # Warn if /dev/shm is too full for workers (Linux only)
+            if __import__('sys').platform != 'win32':
+                try:
+                    import shutil as _shu
+                    _shm_stat = _shu.disk_usage('/dev/shm')
+                    _shm_pct  = _shm_stat.used / _shm_stat.total * 100
+                    if _shm_pct > 70:
+                        logger.warning(
+                            f"/dev/shm {_shm_stat.used/2**30:.1f}"
+                            f"/{_shm_stat.total/2**30:.1f} GB "
+                            f"({_shm_pct:.0f}% used) — worker SHM files may cause SIGBUS. "
+                            f"Run: rm -f /dev/shm/tmp*.mmap /dev/shm/_caiman_*.mmap")
+                except Exception: pass
             if _safe_workers < _actual_workers:
                 logger.warning(
                     f"run_CNMF_patches: capping workers {_actual_workers} → "

@@ -1,0 +1,9 @@
+# GPU dependencies — run AFTER requirements.txt.
+# Pick ONE line matching your CUDA driver (nvidia-smi shows driver version):
+#
+#   nvidia-smi:  Driver Version: 525.x  →  CUDA 12.x  →  use cupy-cuda12x
+#   nvidia-smi:  Driver Version: 470.x  →  CUDA 11.x  →  use cupy-cuda11x
+#
+# Uncomment and install:
+# cupy-cuda11x>=11.6
+# cupy-cuda12x>=12.0
