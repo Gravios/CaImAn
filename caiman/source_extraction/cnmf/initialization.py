@@ -1727,7 +1727,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             # filt_full is at full resolution (ssub=1); data_filtered was
             # allocated at (total_frames, d1//ssub, d2//ssub) via Y_ds.
             # When ssub=1 the ::1 slices are identity — no overhead.
-            _fssub = ssub if ssub and ssub > 1 else 1
+            _fssub = max(1, _filt_raw.shape[1] // data_filtered.shape[1])
             data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw
         else:
@@ -1743,7 +1743,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             _d1p, _d2p = data_filtered.shape[1], data_filtered.shape[2]
             _filt_raw = _filt_raw[:, :_d1p, :_d2p]
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
-            _fssub = ssub if ssub and ssub > 1 else 1
+            _fssub = max(1, _filt_raw.shape[1] // data_filtered.shape[1])
             data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw
         # Use precomputed sn, data_max, pnr (no filter loop, no get_noise_fft)
