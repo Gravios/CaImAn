@@ -1,6 +1,6 @@
 {
     "env": {
-        "CAIMAN_TILE_SLOTS": "2",
+        "CAIMAN_TILE_SLOTS": "3",
         "CAIMAN_DATA": "/data/caiman",
         "CAIMAN_TEMP": "/data/caiman/temp",
         "CAIMAN_SHM": "/dev/shm",
@@ -26,41 +26,26 @@
         ]
     },
     "motion_correction": {
-        "max_shifts": [
-            6,
-            6
-        ],
-        "strides": [
-            64,
-            64
-        ],
-        "overlaps": [
-            32,
-            32
-        ],
+        "max_shifts": [  6 , 6],
+        "strides":    [ 64, 64],
+        "overlaps":   [ 32, 32],
         "max_deviation_rigid": 3,
         "pw_rigid": false,
         "shifts_opencv": true,
         "border_nan": "copy"
     },
     "cnmf": {
-        "p": 1,
+        "p":   1,
         "gnb": 2,
-        "merge_thr": 0.7,
-        "rf": 32,
+        "merge_thr": 0.72,
+        "rf":     32,
         "stride": 16,
-        "K": 40,
-        "gSig": [
-            5,
-            5
-        ],
-        "gSiz": [
-            21,
-            21
-        ],
-        "ring_size_factor": 1.59,
-        "min_corr": 0.5,
-        "min_pnr": 6,
+        "K":      12,
+        "gSig": [ 6,  6],
+        "gSiz": [25, 25],
+        "ring_size_factor": 0.9,
+        "min_corr": 0.4,
+        "min_pnr":  5,
         "ssub": 1,
         "tsub": 2,
         "method_init": "corr_pnr",
@@ -88,7 +73,7 @@
     },
     "cluster": {
         "n_processes": 16,
-        "ram_budget_frac": 0.85,
+        "ram_budget_frac": 0.9,
         "worker_overhead_frac": 1.1,
         "blas_threads_per_worker": 1
     },
