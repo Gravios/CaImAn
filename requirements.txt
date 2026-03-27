@@ -40,7 +40,7 @@ nvidia-cuda-nvrtc-cu12
 # (keras is already installed by pip install -e ., but needs a backend)
 # tensorflow
 
-# ── Optional: CNMF Inspector GUI ─────────────────────────────────────────────
-# Required only for bin/cnmf_inspector.py
-# PyQt6
-# pyqtgraph
+# ── CNMF Inspector GUI ────────────────────────────────────────────────────────
+# Required for bin/cnmf_inspector.py
+PyQt6
+pyqtgraph
