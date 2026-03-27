@@ -532,7 +532,7 @@ def _build_overlay(store: ComponentStore,
         else:
             continue   # only draw overlay for selected / pair components
 
-        r, g, b = mcolors.to_rgb(hex_c)
+        _h = hex_c.lstrip('#'); r = int(_h[0:2],16)/255.0; g = int(_h[2:4],16)/255.0; b = int(_h[4:6],16)/255.0
         a_mask  = norm * alpha
         out[..., 0] = np.maximum(out[..., 0], r * a_mask)
         out[..., 1] = np.maximum(out[..., 1], g * a_mask)
