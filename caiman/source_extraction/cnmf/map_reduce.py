@@ -176,8 +176,14 @@ def _cnmf_patches_inner(file_name, idx_, shapes, params, CNMF, logger):
             # dims = FULL movie dims (d1, d2) — idx_ are flat indices into
             # the full FOV, not the tile. tile_shape[1:] is WRONG here.
             _pc = params.get('init', 'precomp') or {}
-            dims = (_pc['d1'], _pc['d2'])  # full movie spatial dims
-            timesteps = _pc.get('T') or _pc.get('tile_shape', (1,))[0]
+            # Use .get() with shapes fallback — when precompute failed,
+            # d1/d2 may be absent from the precomp dict but shapes=(d1,d2,T)
+            # is always passed to the worker from run_CNMF_patches.
+            dims = (
+                _pc.get('d1') or shapes[0],
+                _pc.get('d2') or shapes[1],
+            )
+            timesteps = _pc.get('T') or _pc.get('tile_shape', (1,))[0] or shapes[2]
 
     # ── Spatial patch slicing ──────────────────────────────────────────────
     # Slice out the spatial patch for this worker (same logic as before).
