@@ -337,6 +337,10 @@ def build_cnmf_opts(
     opts.set("quality", {
         "min_SNR"     : float(getattr(q, "min_SNR",     1.5)),
         "rval_thr"    : float(getattr(q, "rval_thr",    0.6)),
+        # use_cnn: if True, also set KERAS_BACKEND=torch (or tensorflow) in the
+        # pipeline JSON env section — the default KERAS_BACKEND=numpy prevents
+        # torch from initialising a CUDA context, which eliminates the
+        # CUDA_ERROR_ILLEGAL_ADDRESS conflict between torch CUDA 13 and cupy-cuda12x.
         "use_cnn"     : bool(getattr(q,  "use_cnn",     False)) and cnn_available,
         "SNR_lowest"  : float(getattr(q, "SNR_lowest",  0.5)),
         "rval_lowest" : float(getattr(q, "rval_lowest", -1.0)),
