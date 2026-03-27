@@ -51,6 +51,7 @@ from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
 from PyQt6.QtGui   import (
     QAction, QColor, QBrush, QFont, QPalette, QKeySequence,
 )
+from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
 
 # ── Colour constants ──────────────────────────────────────────────────────────
 
@@ -528,9 +529,8 @@ class CellViewer(_Canvas):
         self._xlim: tuple | None = None
         self._ylim: tuple | None = None
 
-        # Pan state
-        self._pan_start: tuple | None = None   # (x, y) display px at middle-press
-        self._panning   = False                # True once middle-drag moves
+        # Pan state (managed by Qt mouse overrides, not mpl events)
+        self._pan_start: tuple | None = None
 
         # Zero-margin layout so the image fills the canvas
         self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -539,10 +539,8 @@ class CellViewer(_Canvas):
 
         self._invert_bg = False   # toggled by toolbar button
 
-        self.mpl_connect("button_press_event",   self._on_mpl_press)
-        self.mpl_connect("button_release_event", self._on_mpl_release)
-        self.mpl_connect("motion_notify_event",  self._on_mpl_motion)
-        self.mpl_connect("scroll_event",         self._on_mpl_scroll)
+        self.mpl_connect("button_press_event", self._on_mpl_press)
+        self.mpl_connect("scroll_event",       self._on_mpl_scroll)
         self._redraw()
 
     # ── Selection setters ─────────────────────────────────────────────────────
@@ -562,6 +560,10 @@ class CellViewer(_Canvas):
         self._redraw()
 
     # ── Zoom / pan ────────────────────────────────────────────────────────────
+    # Pan is implemented at the Qt level (mousePressEvent / mouseMoveEvent /
+    # mouseReleaseEvent) because matplotlib's motion_notify_event does not
+    # reliably fire while button-2 is held on Qt backends.
+    # Scroll-zoom and left-click component selection remain as mpl callbacks.
 
     def reset_zoom(self):
         """Reset to full-FOV view."""
@@ -575,6 +577,47 @@ class CellViewer(_Canvas):
             self.ax.set_xlim(self._xlim)
             self.ax.set_ylim(self._ylim)
 
+    # ── Qt mouse overrides (pan) ──────────────────────────────────────────────
+
+    def mousePressEvent(self, event: 'QMouseEvent'):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_start = (event.position().x(), event.position().y())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: 'QMouseEvent'):
+        if (self._pan_start is not None and
+                event.buttons() & Qt.MouseButton.MiddleButton):
+            px, py = event.position().x(), event.position().y()
+            # Matplotlib canvas Y is flipped relative to Qt (Qt 0=top, mpl 0=bottom)
+            h   = self.height()
+            inv = self.ax.transData.inverted()
+            x0d, y0d = inv.transform((self._pan_start[0], h - self._pan_start[1]))
+            x1d, y1d = inv.transform((px,                 h - py))
+            dx = x0d - x1d
+            dy = y0d - y1d
+            xl, xr = self.ax.get_xlim()
+            yb, yt = self.ax.get_ylim()
+            self._xlim = (xl + dx, xr + dx)
+            self._ylim = (yb + dy, yt + dy)
+            self.ax.set_xlim(self._xlim)
+            self.ax.set_ylim(self._ylim)
+            self._pan_start = (px, py)
+            self.draw_idle()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: 'QMouseEvent'):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_start = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    # ── Mpl scroll (zoom) ─────────────────────────────────────────────────────
+
     def _on_mpl_scroll(self, event):
         if event.inaxes is not self.ax:
             return
@@ -584,89 +627,48 @@ class CellViewer(_Canvas):
         xl, xr = self.ax.get_xlim()
         yb, yt = self.ax.get_ylim()
         cx, cy = event.xdata, event.ydata
-        # Scale limits around the cursor position
         self._xlim = (cx + (xl - cx) * factor, cx + (xr - cx) * factor)
         self._ylim = (cy + (yb - cy) * factor, cy + (yt - cy) * factor)
         self.ax.set_xlim(self._xlim)
         self.ax.set_ylim(self._ylim)
         self.draw_idle()
 
+    # ── Mpl left-click (selection) ────────────────────────────────────────────
+
     def _on_mpl_press(self, event):
-        if event.inaxes is not self.ax:
+        if event.button != 1 or event.inaxes is not self.ax:
+            return
+        if event.dblclick:
+            self.reset_zoom()
+            return
+        if event.xdata is None or event.ydata is None:
             return
 
-        if event.button == 2:           # middle-click → start pan
-            # Store in display (pixel) coords so the reference point
-            # stays fixed even as we shift the data-space limits.
-            self._pan_start = (event.x, event.y)
-            self._panning   = False   # motion hasn't started yet
+        # Hit-test: click must land on a pixel where footprint weight > 10 % peak.
+        s  = self.store
+        d1, d2 = s.dims
+        col = int(round(event.xdata))
+        row = int(round(event.ydata))
+        if not (0 <= row < d1 and 0 <= col < d2):
             return
 
-        if event.button == 1:
-            if event.dblclick:          # double left-click → reset zoom
-                self.reset_zoom()
-                return
-            if event.xdata is None or event.ydata is None:
-                return
+        best_idx   = None
+        best_value = 0.0
+        for i in range(s.n):
+            fp   = s.footprint(i)
+            peak = fp.max()
+            if peak < 1e-9:
+                continue
+            val = float(fp[row, col])
+            if val >= peak * 0.10 and val > best_value:
+                best_value = val
+                best_idx   = i
 
-            # Hit-test: the click must land on a pixel whose footprint weight
-            # exceeds 10 % of the component peak.  This prevents any left-click
-            # in empty space from inadvertently selecting the nearest neuron.
-            s  = self.store
-            d1, d2 = s.dims
-            col = int(round(event.xdata))
-            row = int(round(event.ydata))
-            if not (0 <= row < d1 and 0 <= col < d2):
-                return
-
-            best_idx   = None
-            best_value = 0.0
-            for i in range(s.n):
-                fp   = s.footprint(i)   # (d1, d2) row-major
-                peak = fp.max()
-                if peak < 1e-9:
-                    continue
-                val = float(fp[row, col])
-                if val >= peak * 0.10 and val > best_value:
-                    best_value = val
-                    best_idx   = i
-
-            if best_idx is None:        # click was in empty space — ignore
-                return
-
-            ctrl = "control" in (event.modifiers or frozenset())
-            self.component_clicked.emit(best_idx, ctrl)
-
-    def _on_mpl_release(self, event):
-        if event.button == 2:
-            self._pan_start = None
-            self._panning   = False
-
-    def _on_mpl_motion(self, event):
-        # Do NOT check event.inaxes — the cursor drifts outside the axes
-        # bbox into figure margins during a drag, setting inaxes=None and
-        # breaking the pan.  event.x/y are always valid canvas coordinates.
-        if self._pan_start is None:
+        if best_idx is None:
             return
-        self._panning = True
-        # Convert display-pixel delta to data space via the axes transform.
-        # Using display coords avoids the re-computation problem where
-        # event.xdata shifts with the limits we just applied.
-        inv = self.ax.transData.inverted()
-        x0_d, y0_d = inv.transform((self._pan_start[0], self._pan_start[1]))
-        x1_d, y1_d = inv.transform((event.x,            event.y))
-        dx = x0_d - x1_d
-        dy = y0_d - y1_d
-        xl, xr = self.ax.get_xlim()
-        yb, yt = self.ax.get_ylim()
-        self._xlim = (xl + dx, xr + dx)
-        self._ylim = (yb + dy, yt + dy)
-        self.ax.set_xlim(self._xlim)
-        self.ax.set_ylim(self._ylim)
-        # Update pan reference to current display position so each
-        # incremental motion event moves by the right delta.
-        self._pan_start = (event.x, event.y)
-        self.draw_idle()
+
+        ctrl = "control" in (event.modifiers or frozenset())
+        self.component_clicked.emit(best_idx, ctrl)
 
     # ── Centroid cache ────────────────────────────────────────────────────────
 
