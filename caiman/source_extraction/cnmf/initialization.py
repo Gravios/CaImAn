@@ -3075,6 +3075,19 @@ def precompute_corr_pnr_filtered_fov(
         _npz_path = None
 
     logger.info(f'precompute_corr_pnr_filtered_fov: done → {filt_path}')
+
+    # Release all CuPy GPU resources before returning so torch's CUDA context
+    # teardown at process exit doesn't encounter dangling FFT plan module
+    # handles → eliminates CUDA_ERROR_ILLEGAL_ADDRESS at moduleUnload.
+    # cupyx.scipy.ndimage.gaussian_filter caches an FFT execution plan;
+    # clearing it here while the context is still valid prevents the crash.
+    try:
+        cp.fft.config.get_plan_cache().clear()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
     return {
         'filtered_path': filt_path,
         'filt_dtype':    'float16',   # workers must cast on load

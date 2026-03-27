@@ -231,3 +231,36 @@ def cupy_flush(
     except Exception as exc:
         if logger is not None:
             logger.debug(f"cupy_flush failed: {exc}")
+
+
+def cupy_register_cleanup() -> None:
+    """Register an atexit handler that releases all CuPy GPU resources.
+
+    Call this once after CuPy is first used.  The handler clears cached FFT
+    execution plans and frees all CuPy memory pools before Python exits,
+    preventing ``CUDA_ERROR_ILLEGAL_ADDRESS`` at ``moduleUnload`` when both
+    CuPy (CUDA 12) and PyTorch (CUDA 13) share the same process.
+
+    Safe to call multiple times — atexit deduplicates identical handlers.
+    """
+    import atexit as _atexit
+
+    def _cupy_cleanup():
+        try:
+            import cupy as _cp
+            try:
+                _cp.fft.config.get_plan_cache().clear()
+            except Exception:
+                pass
+            try:
+                _cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            try:
+                _cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    _atexit.register(_cupy_cleanup)
