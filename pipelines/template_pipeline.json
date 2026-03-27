@@ -95,5 +95,12 @@
     "gpu": {
         "_comment": "precompute_chunk_frames: frames per GPU filter chunk. Peak VRAM \u2248 2 \u00d7 frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes. Reduce if GPU OOM during precompute.",
         "precompute_chunk_frames": 500
+    },
+    "xcorr_correction": {
+        "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",
+        "enabled": false,
+        "max_shift": 16,
+        "n_frames": 500,
+        "use_gpu": true
     }
 }
