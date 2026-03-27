@@ -280,4 +280,23 @@ if __name__ == "__main__":
         cm.stop_server(dview=dview)
 
     # ── 6. Report ─────────────────────────────────────────────────────────────
-    write_report(timer, session, outdir, logger)
+    # Component counts for the report
+    _n_accepted = _n_rejected = _n_total = None
+    try:
+        _n_total    = int(cnm2.estimates.A.shape[1])
+        _idx_acc    = cnm2.estimates.idx_components
+        _idx_rej    = cnm2.estimates.idx_components_bad
+        _n_accepted = int(len(_idx_acc)) if _idx_acc is not None else _n_total
+        _n_rejected = int(len(_idx_rej)) if _idx_rej is not None else 0
+    except Exception:
+        pass
+
+    _extra = {}
+    if _n_total    is not None: _extra["Components (total)"]    = _n_total
+    if _n_accepted is not None: _extra["Components (accepted)"] = _n_accepted
+    if _n_rejected is not None: _extra["Components (rejected)"] = _n_rejected
+    if _xcorr_enable:
+        _extra["Line-scan X shift"] = (
+            f"enabled  (max_shift={_xcorr_max_shift} px)")
+
+    write_report(timer, session, outdir, logger, extra=_extra)

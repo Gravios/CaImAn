@@ -2987,6 +2987,20 @@ def precompute_corr_pnr_filtered_fov(
     # ── Derive sn and data_max ────────────────────────────────────────────────
     sn_full       = np.sqrt(np.maximum(Y2_acc / T, 1e-10)).astype(np.float32)
     data_max_full = dmax_acc.astype(np.float32)
+    # Diagnostic: log sn and PNR statistics to catch GPU compute failures early.
+    # If sn_median ≈ 0 or PNR_p95 < 1, the GPU accumulation likely fell back to
+    # CPU with wrong data layout → all patches will find 0 components.
+    _pnr_diag = data_max_full / np.maximum(sn_full, 1e-10)
+    logger.info(
+        f'precompute_corr_pnr_filtered_fov: sn  median={np.nanmedian(sn_full):.2f} '
+        f'max={np.nanmax(sn_full):.2f}  nan={np.isnan(sn_full).sum()}'
+    )
+    logger.info(
+        f'precompute_corr_pnr_filtered_fov: PNR median={np.nanmedian(_pnr_diag):.2f} '
+        f'p95={np.nanpercentile(_pnr_diag, 95):.2f}  >5px: '
+        f'{(~np.isnan(_pnr_diag) & (_pnr_diag > 5)).sum()}'
+    )
+    del _pnr_diag
 
     # ── Finalise Cn ───────────────────────────────────────────────────────────
     logger.info('precompute_corr_pnr_filtered_fov: computing Cn on GPU')
