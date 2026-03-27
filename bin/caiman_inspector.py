@@ -848,12 +848,13 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self._img = pg.ImageItem()
         self.vb.addItem(self._img)
 
-        # Column 1: colorbar
+        # Column 1: colorbar — do NOT pass insert_in (expects PlotItem,
+        # not ViewBox).  Link the image manually and place in the grid.
         self._cbar = pg.ColorBarItem(
             colorMap=self._cmap, width=12,
             pen='#333333', hoverPen='#888888', hoverBrush='#888888'
         )
-        self._cbar.setImageItem(self._img, insert_in=self.vb)
+        self._cbar.setImageItem(self._img)   # no insert_in
         self.addItem(self._cbar, row=0, col=1)
         self.ci.layout.setColumnFixedWidth(1, 60)
 
