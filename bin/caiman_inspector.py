@@ -529,7 +529,7 @@ class CellViewer(_Canvas):
         self._ylim: tuple | None = None
 
         # Pan state
-        self._pan_start: tuple | None = None   # (xdata, ydata) at middle-press
+        self._pan_start: tuple | None = None   # (x, y) display px at middle-press
         self._panning   = False                # True once middle-drag moves
 
         # Zero-margin layout so the image fills the canvas
@@ -596,9 +596,10 @@ class CellViewer(_Canvas):
             return
 
         if event.button == 2:           # middle-click → start pan
-            if event.xdata is not None and event.ydata is not None:
-                self._pan_start = (event.xdata, event.ydata)
-                self._panning   = False   # motion hasn't started yet
+            # Store in display (pixel) coords so the reference point
+            # stays fixed even as we shift the data-space limits.
+            self._pan_start = (event.x, event.y)
+            self._panning   = False   # motion hasn't started yet
             return
 
         if event.button == 1:
@@ -644,17 +645,24 @@ class CellViewer(_Canvas):
     def _on_mpl_motion(self, event):
         if self._pan_start is None or event.inaxes is not self.ax:
             return
-        if event.xdata is None or event.ydata is None:
-            return
         self._panning = True
-        dx = self._pan_start[0] - event.xdata
-        dy = self._pan_start[1] - event.ydata
+        # Convert display-pixel delta to data space via the axes transform.
+        # Using display coords avoids the re-computation problem where
+        # event.xdata shifts with the limits we just applied.
+        inv = self.ax.transData.inverted()
+        x0_d, y0_d = inv.transform((self._pan_start[0], self._pan_start[1]))
+        x1_d, y1_d = inv.transform((event.x,            event.y))
+        dx = x0_d - x1_d
+        dy = y0_d - y1_d
         xl, xr = self.ax.get_xlim()
         yb, yt = self.ax.get_ylim()
         self._xlim = (xl + dx, xr + dx)
         self._ylim = (yb + dy, yt + dy)
         self.ax.set_xlim(self._xlim)
         self.ax.set_ylim(self._ylim)
+        # Update pan reference to current display position so each
+        # incremental motion event moves by the right delta.
+        self._pan_start = (event.x, event.y)
         self.draw_idle()
 
     # ── Centroid cache ────────────────────────────────────────────────────────
