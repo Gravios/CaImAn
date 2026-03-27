@@ -504,13 +504,19 @@ class CellViewer(_Canvas):
 
     Interaction
     -----------
-      Left-click          → select the nearest component (by footprint centroid)
-      Ctrl + Left-click   → toggle a second component into / out of the selection
+      Left-click            → select nearest component (footprint centroid)
+      Ctrl + Left-click     → toggle component into / out of the selection
+      Double left-click     → reset zoom to full FOV
+      Scroll wheel          → zoom in / out centred on cursor
+      Middle-click + drag   → pan
     """
 
     # Emitted when the user clicks a component in the image.
     # Arguments: component index (int), Ctrl held (bool)
     component_clicked = pyqtSignal(int, bool)
+
+    # Zoom factor per scroll tick (>1 = zoom in on scroll-up)
+    _ZOOM_FACTOR = 1.25
 
     def __init__(self, store: ComponentStore, parent=None):
         super().__init__(parent)
@@ -519,13 +525,24 @@ class CellViewer(_Canvas):
         self._pair       = None
         self._centroids  = None   # (cy, cx) list, lazily computed, invalidated by n-change
 
+        # View state — None means "use matplotlib default (full FOV)"
+        self._xlim: tuple | None = None
+        self._ylim: tuple | None = None
+
+        # Pan state
+        self._pan_start: tuple | None = None   # (xdata, ydata) at middle-press
+
         # Zero-margin layout so the image fills the canvas
         self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor("black")
 
         self._invert_bg = False   # toggled by toolbar button
-        self.mpl_connect("button_press_event", self._on_mpl_click)
+
+        self.mpl_connect("button_press_event",   self._on_mpl_press)
+        self.mpl_connect("button_release_event", self._on_mpl_release)
+        self.mpl_connect("motion_notify_event",  self._on_mpl_motion)
+        self.mpl_connect("scroll_event",         self._on_mpl_scroll)
         self._redraw()
 
     # ── Selection setters ─────────────────────────────────────────────────────
@@ -543,6 +560,83 @@ class CellViewer(_Canvas):
         """Invert the Cn background greyscale (does not affect overlays or crosses)."""
         self._invert_bg = not self._invert_bg
         self._redraw()
+
+    # ── Zoom / pan ────────────────────────────────────────────────────────────
+
+    def reset_zoom(self):
+        """Reset to full-FOV view."""
+        self._xlim = None
+        self._ylim = None
+        self._redraw()
+
+    def _save_view(self):
+        """Capture current axes limits into _xlim / _ylim."""
+        self._xlim = self.ax.get_xlim()
+        self._ylim = self.ax.get_ylim()
+
+    def _restore_view(self):
+        """Re-apply saved limits after ax.cla() reset them."""
+        if self._xlim is not None:
+            self.ax.set_xlim(self._xlim)
+            self.ax.set_ylim(self._ylim)
+
+    def _on_mpl_scroll(self, event):
+        if event.inaxes is not self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        factor = 1.0 / self._ZOOM_FACTOR if event.step > 0 else self._ZOOM_FACTOR
+        xl, xr = self.ax.get_xlim()
+        yb, yt = self.ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        # Scale limits around the cursor position
+        self._xlim = (cx + (xl - cx) * factor, cx + (xr - cx) * factor)
+        self._ylim = (cy + (yb - cy) * factor, cy + (yt - cy) * factor)
+        self.ax.set_xlim(self._xlim)
+        self.ax.set_ylim(self._ylim)
+        self.draw_idle()
+
+    def _on_mpl_press(self, event):
+        if event.inaxes is not self.ax:
+            return
+        if event.button == 2:           # middle-click → start pan
+            if event.xdata is not None and event.ydata is not None:
+                self._pan_start = (event.xdata, event.ydata)
+            return
+        if event.button == 1:
+            if event.dblclick:          # double left-click → reset zoom
+                self.reset_zoom()
+                return
+            # Single left-click → component selection (existing behaviour)
+            if event.xdata is None or event.ydata is None:
+                return
+            centroids = self._get_centroids()
+            if not centroids:
+                return
+            dists   = [(event.ydata - cy) ** 2 + (event.xdata - cx) ** 2
+                       for cy, cx in centroids]
+            nearest = int(np.argmin(dists))
+            ctrl    = "control" in (event.modifiers or frozenset())
+            self.component_clicked.emit(nearest, ctrl)
+
+    def _on_mpl_release(self, event):
+        if event.button == 2:
+            self._pan_start = None
+
+    def _on_mpl_motion(self, event):
+        if self._pan_start is None or event.inaxes is not self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        dx = self._pan_start[0] - event.xdata
+        dy = self._pan_start[1] - event.ydata
+        xl, xr = self.ax.get_xlim()
+        yb, yt = self.ax.get_ylim()
+        self._xlim = (xl + dx, xr + dx)
+        self._ylim = (yb + dy, yt + dy)
+        self.ax.set_xlim(self._xlim)
+        self.ax.set_ylim(self._ylim)
+        self.draw_idle()
 
     # ── Centroid cache ────────────────────────────────────────────────────────
 
@@ -620,34 +714,11 @@ class CellViewer(_Canvas):
         self._cross_params = params
         return self._cross_params
 
-    # ── Click handler ─────────────────────────────────────────────────────────
-
-    def _on_mpl_click(self, event):
-        if event.inaxes is not self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        # In origin='lower' axes: xdata = column, ydata = row
-        click_col = float(event.xdata)
-        click_row = float(event.ydata)
-
-        centroids = self._get_centroids()
-        if not centroids:
-            return
-
-        # Nearest centroid by squared Euclidean distance
-        dists   = [(click_row - cy) ** 2 + (click_col - cx) ** 2
-                   for cy, cx in centroids]
-        nearest = int(np.argmin(dists))
-
-        ctrl = "control" in (event.modifiers or frozenset())
-        self.component_clicked.emit(nearest, ctrl)
-
     # ── Draw ──────────────────────────────────────────────────────────────────
 
     def _redraw(self):
         ax = self.ax
+        self._save_view()    # preserve zoom/pan before cla() wipes the limits
         ax.cla()
         ax.set_facecolor("black")
         ax.set_xticks([]);  ax.set_yticks([])
@@ -684,6 +755,7 @@ class CellViewer(_Canvas):
                         color=color, lw=0.9, alpha=0.85,
                         solid_capstyle="butt")
 
+        self._restore_view()   # re-apply zoom/pan after imshow reset limits
         self.draw_idle()
 
 
@@ -1243,6 +1315,14 @@ class InspectorWindow(QMainWindow):
         self.act_dist_log.triggered.connect(
             lambda checked: self.dist_view.set_log(checked))
         tb.addAction(self.act_dist_log)
+
+        self.act_reset_zoom = QAction("⟳  Reset zoom", self)
+        self.act_reset_zoom.setToolTip(
+            "Reset cell viewer to full FOV.\n"
+            "Shortcut: double left-click anywhere in the image.")
+        self.act_reset_zoom.triggered.connect(
+            lambda: self.cell_view.reset_zoom())
+        tb.addAction(self.act_reset_zoom)
 
     # ── Central layout ────────────────────────────────────────────────────────
 
