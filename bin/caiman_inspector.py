@@ -66,7 +66,7 @@ CYAN     = "#00FFFF"   # default (unselected) footprint colour
 
 ALPHA_SEL    = 0.55   # overlay alpha for selected components
 ALPHA_DEF    = 0.12   # overlay alpha for unselected components
-CROSS_MIN_ARM = 50    # minimum cross arm length in pixels
+CROSS_MIN_ARM = 25    # minimum cross arm half-length in pixels
 
 BG_DARK  = "#111111"
 AX_BG    = "#0d0d0d"
@@ -461,8 +461,7 @@ def _build_overlay(store: ComponentStore,
             hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
             alpha = ALPHA_SEL
         else:
-            hex_c = CYAN
-            alpha = ALPHA_DEF
+            continue   # only draw overlay for selected / pair components
 
         r, g, b = mcolors.to_rgb(hex_c)
         a_mask  = norm * alpha
@@ -531,6 +530,7 @@ class CellViewer(_Canvas):
 
         # Pan state
         self._pan_start: tuple | None = None   # (xdata, ydata) at middle-press
+        self._panning   = False                # True once middle-drag moves
 
         # Zero-margin layout so the image fills the canvas
         self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
@@ -594,35 +594,59 @@ class CellViewer(_Canvas):
     def _on_mpl_press(self, event):
         if event.inaxes is not self.ax:
             return
+
         if event.button == 2:           # middle-click → start pan
             if event.xdata is not None and event.ydata is not None:
                 self._pan_start = (event.xdata, event.ydata)
+                self._panning   = False   # motion hasn't started yet
             return
+
         if event.button == 1:
             if event.dblclick:          # double left-click → reset zoom
                 self.reset_zoom()
                 return
-            # Single left-click → component selection (existing behaviour)
             if event.xdata is None or event.ydata is None:
                 return
-            centroids = self._get_centroids()
-            if not centroids:
+
+            # Hit-test: the click must land on a pixel whose footprint weight
+            # exceeds 10 % of the component peak.  This prevents any left-click
+            # in empty space from inadvertently selecting the nearest neuron.
+            s  = self.store
+            d1, d2 = s.dims
+            col = int(round(event.xdata))
+            row = int(round(event.ydata))
+            if not (0 <= row < d1 and 0 <= col < d2):
                 return
-            dists   = [(event.ydata - cy) ** 2 + (event.xdata - cx) ** 2
-                       for cy, cx in centroids]
-            nearest = int(np.argmin(dists))
-            ctrl    = "control" in (event.modifiers or frozenset())
-            self.component_clicked.emit(nearest, ctrl)
+
+            best_idx   = None
+            best_value = 0.0
+            for i in range(s.n):
+                fp   = s.footprint(i)   # (d1, d2) row-major
+                peak = fp.max()
+                if peak < 1e-9:
+                    continue
+                val = float(fp[row, col])
+                if val >= peak * 0.10 and val > best_value:
+                    best_value = val
+                    best_idx   = i
+
+            if best_idx is None:        # click was in empty space — ignore
+                return
+
+            ctrl = "control" in (event.modifiers or frozenset())
+            self.component_clicked.emit(best_idx, ctrl)
 
     def _on_mpl_release(self, event):
         if event.button == 2:
             self._pan_start = None
+            self._panning   = False
 
     def _on_mpl_motion(self, event):
         if self._pan_start is None or event.inaxes is not self.ax:
             return
         if event.xdata is None or event.ydata is None:
             return
+        self._panning = True
         dx = self._pan_start[0] - event.xdata
         dy = self._pan_start[1] - event.ydata
         xl, xr = self.ax.get_xlim()
@@ -673,7 +697,7 @@ class CellViewer(_Canvas):
           cy, cx  — footprint centroid in data coordinates (row, col)
           arm     — half-length of each cross arm in pixels
 
-        arm = max(CROSS_MIN_ARM, 1.5 × max(footprint_height, footprint_width))
+        arm = max(CROSS_MIN_ARM, 0.75 × max(footprint_height, footprint_width))
 
         The footprint bounding box is derived from pixels whose weight exceeds
         20 % of the component peak, matching the visual extents of the overlay.
@@ -703,7 +727,7 @@ class CellViewer(_Canvas):
                 continue
             height = int(rows_on.max() - rows_on.min()) + 1
             width  = int(cols_on.max() - cols_on.min()) + 1
-            arm    = max(CROSS_MIN_ARM, 1.5 * max(height, width))
+            arm    = max(CROSS_MIN_ARM, 0.75 * max(height, width))
             params.append((cy, cx, arm))
 
         self._cross_params = params
