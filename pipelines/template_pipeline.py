@@ -162,9 +162,15 @@ if __name__ == "__main__":
 
         run_xcorr()
 
+    # mc_stem: stem of the TIFF actually fed into motion correction.
+    # When xcorr correction is enabled this is e.g. "session_Xcorrected";
+    # otherwise it is the bare session name.  All downstream glob patterns
+    # use mc_stem so they match the correct mmap files.
+    mc_stem = Path(fnames).stem
+
     # ── 2. Motion correction ──────────────────────────────────────────────────
     _mc_existing = sorted(glob.glob(
-        os.path.join(CAIMAN_TEMP, f"*{session}*rig*order_F*.mmap")))
+        os.path.join(CAIMAN_TEMP, f"*{mc_stem}*rig*order_F*.mmap")))
 
     if _mc_existing:
         fname_mc, shifts_rig = _mc_existing[-1], [(0, 0)]
@@ -192,7 +198,7 @@ if __name__ == "__main__":
 
     # ── 3. F→C mmap conversion ────────────────────────────────────────────────
     _cnmf_existing = sorted(glob.glob(
-        os.path.join(CAIMAN_TEMP, f"*{session}_cnmf*order_C*.mmap")))
+        os.path.join(CAIMAN_TEMP, f"*{mc_stem}_cnmf*order_C*.mmap")))
 
     if _cnmf_existing and os.path.getmtime(_cnmf_existing[-1]) >= os.path.getmtime(fname_mc):
         fname_cnmf = _cnmf_existing[-1]
@@ -202,7 +208,7 @@ if __name__ == "__main__":
         Yr_F, dims, T = cm.mmapping.load_memmap(fname_mc)
         n_px = int(np.prod(dims))
         fname_cnmf = cm.paths.fn_relocated(
-            cm.paths.memmap_frames_filename(session + "_cnmf", dims, T, "C"),
+            cm.paths.memmap_frames_filename(mc_stem + "_cnmf", dims, T, "C"),
             force_temp=True,
         )
         Yr_C = np.memmap(fname_cnmf, mode="w+", dtype=np.float32,
