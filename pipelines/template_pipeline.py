@@ -96,7 +96,7 @@ if __name__ == "__main__":
     from caiman.utils.param_summary  import log_params
     from caiman.utils.pipeline_setup import ensure_model_files, setup_logging, clean_stale_shm
     from caiman.utils.timing         import PipelineTimer, write_report
-    from caiman.utils.memory         import malloc_trim, cupy_flush
+    from caiman.utils.memory         import malloc_trim, cupy_flush, cupy_register_cleanup
     from caiman.utils.cnmf_runner    import CNMFRunner
     from caiman.utils.qc             import QCRunner
 
@@ -250,6 +250,10 @@ if __name__ == "__main__":
     Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
     images = np.reshape(Yr.T, [T] + list(dims), order="F")
     images.filename = Yr.filename
+
+    # Register CuPy atexit cleanup to prevent CUDA_ERROR_ILLEGAL_ADDRESS
+    # at process exit when torch (CUDA 13) and cupy-cuda12x coexist.
+    cupy_register_cleanup()
 
     # ── 5. CNMF ───────────────────────────────────────────────────────────────
     clean_stale_shm(CAIMAN_SHM, CAIMAN_TEMP, logger)
