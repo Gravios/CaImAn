@@ -10,7 +10,9 @@
         "OMP_NUM_THREADS": "1",
         "OPENBLAS_NUM_THREADS": "1",
         "NUMEXPR_NUM_THREADS": "1",
-        "MPLBACKEND": "Agg"
+        "MPLBACKEND": "Agg",
+        "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
+        "CUPY_ACCELERATORS": ""
     },
     "session": {
         "_comment": "session_id is intentionally absent \u2014 it is the script filename stem minus _pipeline. Only structural paths live here.",
