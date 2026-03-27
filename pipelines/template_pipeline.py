@@ -91,6 +91,7 @@ if __name__ == "__main__":
     from caiman.motion_correction import MotionCorrect
 
     from caiman.utils.tiff_io        import ensure_multipage_tiff, fc_convert_parallel
+    from caiman.utils.xcorr_correction import correct_line_scan
     from caiman.utils.params_io      import load_pipeline_params
     from caiman.utils.param_summary  import log_params
     from caiman.utils.pipeline_setup import ensure_model_files, setup_logging, clean_stale_shm
@@ -134,6 +135,32 @@ if __name__ == "__main__":
 
     check_tiff()
     qc_raw()
+
+    # ── 1b. Line-scan phase correction ──────────────────────────────────────
+    # Resonant and galvo-resonant scanners acquire alternating rows in opposite
+    # directions.  A mechanical phase delay causes a consistent column shift
+    # between even and odd rows (the "comb" artefact).  Correct before MC so
+    # that registration targets a clean reference frame.
+    _xcorr_cfg    = getattr(_P, "xcorr_correction", None)
+    _xcorr_enable = bool(getattr(_xcorr_cfg, "enabled", False)) if _xcorr_cfg else False
+
+    if _xcorr_enable:
+        _xcorr_max_shift = int(getattr(_xcorr_cfg, "max_shift", 16))
+        _xcorr_n_frames  = int(getattr(_xcorr_cfg, "n_frames",  500))
+
+        @timer.step("Line-scan X correction")
+        def run_xcorr():
+            global fnames
+            fnames = correct_line_scan(
+                fnames,
+                max_shift = _xcorr_max_shift,
+                n_frames  = _xcorr_n_frames,
+                use_gpu   = bool(getattr(_xcorr_cfg, "use_gpu", True)),
+                logger    = logger,
+            )
+            logger.info(f"Line-scan correction done: {Path(fnames).name}")
+
+        run_xcorr()
 
     # ── 2. Motion correction ──────────────────────────────────────────────────
     _mc_existing = sorted(glob.glob(

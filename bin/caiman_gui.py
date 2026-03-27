@@ -378,7 +378,7 @@ def mouseClickEvent(event):
     global mode
     global x, y, i, j, val
 
-    pos = img.mapFromScene(event.pos())
+    pos = img.mapFromScene(event.position().toPoint())  # PyQt6: pos()→QPoint, position()→QPointF
     x = int(pos.x())
     y = int(pos.y())
 
@@ -464,6 +464,9 @@ def show_background_button():
     zeros = np.zeros(estimates.dims, order='F')
     img2.setImage(make_color_img(zeros), autoLevels=False)
 
+    if estimates.f.shape[0] == 0:
+        print("No background components available.")
+        return
     background_num = (background_num + 1) % estimates.f.shape[0]
     mode = "background"
     p2.setTitle(f"mode: {mode} {background_num}")
