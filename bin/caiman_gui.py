@@ -631,9 +631,11 @@ pars_action.sigTreeStateChanged.connect(action_pars_activated)
 #  If anything changes in the tree, print a message
 def change(param, changes):
     global estimates, pars, pars_action
-    # Skip action-type parameters — they have no value in pyqtgraph ≥ 0.13
-    set_par = {k: v for k, (v, _) in pars.getValues().items()
-               if pars.child(k).type() != 'action'}
+    # Iterate children directly — pars.getValues() crashes in pyqtgraph ≥ 0.13
+    # because it calls .value() on action-type params before we can filter them.
+    set_par = {ch.name(): ch.value()
+               for ch in pars.children()
+               if ch.type() != 'action'}
     if pars_action.param('Filter components').value():
         for keyy in set_par.keys():
             params_obj.quality.update({keyy: set_par[keyy]})
