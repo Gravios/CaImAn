@@ -1369,7 +1369,14 @@ def greedyROI_corr(Y, Y_ds, max_number=None, gSiz=None, gSig=None, center_psf=Tr
                     # (d1_full × d2_full elements) while dims = (d1, d2) is the
                     # actual clipped boundary-patch shape.  Reshape via full dims,
                     # then slice to actual patch dims before downscaling.
-                    (sn**2).reshape(Y_ds.shape[:2], order='F')[:d1, :d2]
+                    # sn may cover a larger tile than this edge patch (d1×d2).
+                    # Recover the tile's second dimension from sn.size and d1,
+                    # then slice to the actual patch dims before downscaling.
+                    # (The primary fix is in cnmf.py fit() which clips sn at
+                    # injection time; this guard handles any remaining mismatch.)
+                    (sn**2).reshape(
+                        d1, int(sn.size // d1) if d1 > 0 else sn.size,
+                        order='F')[:d1, :d2]
                     if sn is not None and sn.size != d1 * d2
                     else (sn**2).reshape(dims, order='F'),
                     tuple([ssub] * len(dims))).ravel() / tsub) / ssub,
@@ -1724,9 +1731,9 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             # total_frames = T//tsub; _fd_T = T (full). Downsample by slicing.
             _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
             # Apply temporal AND spatial subsampling.
-            # filt_full is at full resolution (ssub=1); data_filtered was
-            # allocated at (total_frames, d1//ssub, d2//ssub) via Y_ds.
-            # When ssub=1 the ::1 slices are identity — no overhead.
+            # filt_full is at full resolution; data_filtered may be spatially
+            # downsampled. Derive the spatial factor from array shapes directly
+            # — ssub is not in scope here (belongs to greedyROI_corr).
             _fssub = max(1, _filt_raw.shape[1] // data_filtered.shape[1])
             data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw

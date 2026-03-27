@@ -453,7 +453,25 @@ class CNMF(object):
                     and _precomp.get('sn') is not None
                     and self.estimates.sn is None):
                 import numpy as _np
-                self.estimates.sn = _precomp['sn'].flatten(order='F')
+                _sn_precomp = _precomp['sn']
+                # Clip to actual patch spatial dims — edge patches are smaller
+                # than the tile (e.g. tile 65×65 but patch is 65×17 at FOV edge).
+                # Without clipping, sn.flatten() has tile_d1*tile_d2 elements but
+                # greedyROI_corr tries to reshape to patch dims → ValueError.
+                _d1p, _d2p = Y.shape[:2]
+                if _sn_precomp.ndim == 2 and _sn_precomp.shape != (_d1p, _d2p):
+                    _sn_precomp = _sn_precomp[:_d1p, :_d2p]
+                elif _sn_precomp.ndim == 1 and _sn_precomp.size != _d1p * _d2p:
+                    # Flat sn — infer 2D tile shape and slice
+                    _tile_side = int(_np.sqrt(_sn_precomp.size))
+                    if _tile_side * _tile_side == _sn_precomp.size:
+                        _sn_precomp = _sn_precomp.reshape(
+                            _tile_side, _tile_side, order='F')[:_d1p, :_d2p]
+                    else:
+                        _sn_precomp = None  # shape unrecoverable — recompute
+                self.estimates.sn = (
+                    _sn_precomp.flatten(order='F')
+                    if _sn_precomp is not None else None)
             logger.info('preprocessing ...')
             Yr = self.preprocess(Yr)
             logger.warning(f'[pid {os.getpid()}] preprocess done')
