@@ -35,12 +35,7 @@ import scipy.sparse
 
 HISTORY_MAXLEN = 5   # maximum undo / redo steps retained
 
-import matplotlib
-matplotlib.use("QtAgg")
-import matplotlib.colors as mcolors
-from matplotlib.figure   import Figure
-from matplotlib.patches  import Rectangle
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+import pyqtgraph as pg
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QTableWidget,
@@ -71,6 +66,79 @@ CROSS_MIN_ARM = 25    # minimum cross arm half-length in pixels
 
 BG_DARK  = "#111111"
 AX_BG    = "#0d0d0d"
+
+
+
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt6")
+pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
+
+# ── Colour maps ───────────────────────────────────────────────────────────────
+
+def _cmap_rdbu_r():
+    """Red-white-blue diverging, red = +1, blue = -1."""
+    stops  = [0.0, 0.25, 0.5, 0.75, 1.0]
+    colors = [(  5,  48,  97, 255),
+              ( 67, 147, 195, 255),
+              (247, 247, 247, 255),
+              (214,  96,  77, 255),
+              (103,   0,  31, 255)]
+    return pg.ColorMap(pos=stops, color=colors)
+
+def _cmap_viridis_r():
+    """Reversed viridis: yellow (near) → purple (far)."""
+    stops  = [0.0, 0.25, 0.5, 0.75, 1.0]
+    colors = [(253, 231,  37, 255),
+              ( 94, 201,  98, 255),
+              ( 33, 144, 141, 255),
+              ( 59,  82, 139, 255),
+              ( 68,   1,  84, 255)]
+    return pg.ColorMap(pos=stops, color=colors)
+
+CMAP_RDBU_R    = _cmap_rdbu_r()
+CMAP_VIRIDIS_R = _cmap_viridis_r()
+
+
+# ── RGBA overlay builder (pyqtgraph version) ──────────────────────────────────
+
+def _build_overlay(store: 'ComponentStore',
+                   sel: list, pair) -> np.ndarray:
+    """
+    Return (d1, d2, 4) RGBA uint8 composite of selected/pair footprints.
+    Unselected components are skipped entirely.
+    """
+    d1, d2  = store.dims
+    out     = np.zeros((d1, d2, 4), dtype=np.float32)
+    sel_set  = set(sel)
+    pair_set = set(pair) if pair else set()
+
+    for i in range(store.n):
+        if pair and i in pair_set:
+            hex_c = CORR_A if i == pair[0] else CORR_B
+            alpha = ALPHA_SEL
+        elif i in sel_set:
+            hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
+            alpha = ALPHA_SEL
+        else:
+            continue
+
+        fp   = store.footprint(i)
+        peak = fp.max()
+        if peak < 1e-9:
+            continue
+        norm = fp / peak
+
+        h  = hex_c.lstrip('#')
+        r  = int(h[0:2], 16) / 255.0
+        g  = int(h[2:4], 16) / 255.0
+        b  = int(h[4:6], 16) / 255.0
+        am = norm * alpha
+        out[..., 0] = np.maximum(out[..., 0], r * am)
+        out[..., 1] = np.maximum(out[..., 1], g * am)
+        out[..., 2] = np.maximum(out[..., 2], b * am)
+        out[..., 3] = np.maximum(out[..., 3], am)
+
+    return (np.clip(out, 0, 1) * 255).astype(np.uint8)
+
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -474,76 +542,61 @@ def _build_overlay(store: ComponentStore,
     return np.clip(out, 0, 1)
 
 
-# ── Canvas base ───────────────────────────────────────────────────────────────
-
-class _Canvas(FigureCanvas):
-    """Dark-themed matplotlib canvas that expands to fill available space."""
-
-    def __init__(self, parent=None):
-        self.fig = Figure(facecolor=BG_DARK)
-        super().__init__(self.fig)
-        self.setParent(parent)
-        sp = self.sizePolicy()
-        sp.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
-        sp.setVerticalPolicy(QSizePolicy.Policy.Expanding)
-        self.setSizePolicy(sp)
-        self.setMinimumSize(QSize(80, 80))
 
 
 # ── Cell viewer ───────────────────────────────────────────────────────────────
 
-class CellViewer(_Canvas):
+class CellViewer(pg.GraphicsLayoutWidget):
     """
-    Top pane — Cn greyscale background with RGBA footprint overlay.
+    Top-left pane — Cn greyscale background with RGBA footprint overlay
+    and per-component crosses on selected / pair components.
 
-    Colours
-    -------
-      Unselected  → dim cyan
-      Selected    → bright palette colours (no cyan)
-      Corr pair   → orange / magenta
-
-    Interaction
-    -----------
-      Left-click            → select nearest component (footprint centroid)
-      Ctrl + Left-click     → toggle component into / out of the selection
-      Double left-click     → reset zoom to full FOV
-      Scroll wheel          → zoom in / out centred on cursor
-      Middle-click + drag   → pan
+    Interaction (pyqtgraph built-in)
+    ---------------------------------
+      Right-drag     → pan
+      Scroll wheel   → zoom centred on cursor
+      Right-click    → context menu (includes "View All" / reset zoom)
+      Left-click     → select component under cursor (footprint hit-test)
+      Ctrl+Left      → toggle component in/out of selection
     """
 
-    # Emitted when the user clicks a component in the image.
-    # Arguments: component index (int), Ctrl held (bool)
     component_clicked = pyqtSignal(int, bool)
 
-    # Zoom factor per scroll tick (>1 = zoom in on scroll-up)
-    _ZOOM_FACTOR = 1.25
-
-    def __init__(self, store: ComponentStore, parent=None):
+    def __init__(self, store: 'ComponentStore', parent=None):
         super().__init__(parent)
-        self.store       = store
-        self._sel        = []
-        self._pair       = None
-        self._centroids  = None   # (cy, cx) list, lazily computed, invalidated by n-change
+        self.store      = store
+        self._sel       = []
+        self._pair      = None
+        self._centroids = None
+        self._cross_params_cache = None
+        self._invert_bg = False
 
-        # View state — None means "use matplotlib default (full FOV)"
-        self._xlim: tuple | None = None
-        self._ylim: tuple | None = None
+        self.setBackground(BG_DARK)
 
-        # Pan state (managed by Qt mouse overrides, not mpl events)
-        self._pan_start: tuple | None = None
+        # ViewBox: aspect locked, Y not inverted → row 0 at bottom (origin='lower')
+        self.vb = self.addViewBox(row=0, col=0)
+        self.vb.setAspectLocked(True)
+        self.vb.invertY(False)
 
-        # Zero-margin layout so the image fills the canvas
-        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor("black")
+        # Background (Cn)
+        self._img_bg = pg.ImageItem()
+        self._img_bg.setZValue(0)
+        self.vb.addItem(self._img_bg)
 
-        self._invert_bg = False   # toggled by toolbar button
+        # Footprint overlay (RGBA)
+        self._img_ov = pg.ImageItem()
+        self._img_ov.setZValue(1)
+        self.vb.addItem(self._img_ov)
 
-        self.mpl_connect("button_press_event", self._on_mpl_press)
-        self.mpl_connect("scroll_event",       self._on_mpl_scroll)
+        # Cross lines — managed as a list of PlotDataItems
+        self._cross_items: list = []
+
+        # Click detection via scene
+        self.vb.scene().sigMouseClicked.connect(self._on_scene_click)
+
         self._redraw()
 
-    # ── Selection setters ─────────────────────────────────────────────────────
+    # ── Public interface ──────────────────────────────────────────────────────
 
     def set_selection(self, sel):
         self._sel  = list(sel)
@@ -555,100 +608,27 @@ class CellViewer(_Canvas):
         self._redraw()
 
     def toggle_bg(self):
-        """Invert the Cn background greyscale (does not affect overlays or crosses)."""
         self._invert_bg = not self._invert_bg
         self._redraw()
 
-    # ── Zoom / pan ────────────────────────────────────────────────────────────
-    # Pan is implemented at the Qt level (mousePressEvent / mouseMoveEvent /
-    # mouseReleaseEvent) because matplotlib's motion_notify_event does not
-    # reliably fire while button-2 is held on Qt backends.
-    # Scroll-zoom and left-click component selection remain as mpl callbacks.
-
     def reset_zoom(self):
-        """Reset to full-FOV view."""
-        self._xlim = None
-        self._ylim = None
-        self._redraw()
+        self.vb.autoRange()
 
-    def _restore_view(self):
-        """Re-apply saved limits after ax.cla() reset them."""
-        if self._xlim is not None:
-            self.ax.set_xlim(self._xlim)
-            self.ax.set_ylim(self._ylim)
+    # ── Scene click → component selection ────────────────────────────────────
 
-    # ── Qt mouse overrides (pan) ──────────────────────────────────────────────
-
-    def mousePressEvent(self, event: 'QMouseEvent'):
-        if event.button() == Qt.MouseButton.MiddleButton:
-            self._pan_start = (event.position().x(), event.position().y())
-            event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: 'QMouseEvent'):
-        if (self._pan_start is not None and
-                event.buttons() & Qt.MouseButton.MiddleButton):
-            px, py = event.position().x(), event.position().y()
-            # Matplotlib canvas Y is flipped relative to Qt (Qt 0=top, mpl 0=bottom)
-            h   = self.height()
-            inv = self.ax.transData.inverted()
-            x0d, y0d = inv.transform((self._pan_start[0], h - self._pan_start[1]))
-            x1d, y1d = inv.transform((px,                 h - py))
-            dx = x0d - x1d
-            dy = y0d - y1d
-            xl, xr = self.ax.get_xlim()
-            yb, yt = self.ax.get_ylim()
-            self._xlim = (xl + dx, xr + dx)
-            self._ylim = (yb + dy, yt + dy)
-            self.ax.set_xlim(self._xlim)
-            self.ax.set_ylim(self._ylim)
-            self._pan_start = (px, py)
-            self.draw_idle()
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: 'QMouseEvent'):
-        if event.button() == Qt.MouseButton.MiddleButton:
-            self._pan_start = None
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
-
-    # ── Mpl scroll (zoom) ─────────────────────────────────────────────────────
-
-    def _on_mpl_scroll(self, event):
-        if event.inaxes is not self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        factor = 1.0 / self._ZOOM_FACTOR if event.step > 0 else self._ZOOM_FACTOR
-        xl, xr = self.ax.get_xlim()
-        yb, yt = self.ax.get_ylim()
-        cx, cy = event.xdata, event.ydata
-        self._xlim = (cx + (xl - cx) * factor, cx + (xr - cx) * factor)
-        self._ylim = (cy + (yb - cy) * factor, cy + (yt - cy) * factor)
-        self.ax.set_xlim(self._xlim)
-        self.ax.set_ylim(self._ylim)
-        self.draw_idle()
-
-    # ── Mpl left-click (selection) ────────────────────────────────────────────
-
-    def _on_mpl_press(self, event):
-        if event.button != 1 or event.inaxes is not self.ax:
-            return
-        if event.dblclick:
+    def _on_scene_click(self, event):
+        if event.double():
             self.reset_zoom()
             return
-        if event.xdata is None or event.ydata is None:
+        if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        # Hit-test: click must land on a pixel where footprint weight > 10 % peak.
-        s  = self.store
+        pt  = self.vb.mapSceneToView(event.scenePos())
+        col = int(round(pt.x()))
+        row = int(round(pt.y()))
+
+        s   = self.store
         d1, d2 = s.dims
-        col = int(round(event.xdata))
-        row = int(round(event.ydata))
         if not (0 <= row < d1 and 0 <= col < d2):
             return
 
@@ -667,26 +647,20 @@ class CellViewer(_Canvas):
         if best_idx is None:
             return
 
-        ctrl = "control" in (event.modifiers or frozenset())
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         self.component_clicked.emit(best_idx, ctrl)
 
-    # ── Centroid cache ────────────────────────────────────────────────────────
+    # ── Centroid / cross-arm caches ───────────────────────────────────────────
 
     def _get_centroids(self):
-        """
-        Return a list of (cy, cx) centroid coordinates for each component,
-        in data-space (row, col) matching origin='lower'.
-        Recomputed whenever the number of components changes.
-        """
         s = self.store
         if self._centroids is not None and len(self._centroids) == s.n:
             return self._centroids
 
         d1, d2 = s.dims
-        # For Fortran-order flattening: pixel index p → row = p % d1, col = p // d1
-        p     = np.arange(d1 * d2)
-        rows  = (p % d1).astype(np.float32)
-        cols  = (p // d1).astype(np.float32)
+        p      = np.arange(d1 * d2)
+        rows   = (p % d1).astype(np.float32)
+        cols   = (p // d1).astype(np.float32)
 
         centroids = []
         for i in range(s.n):
@@ -702,111 +676,107 @@ class CellViewer(_Canvas):
         self._centroids = centroids
         return self._centroids
 
-    # ── Cross-arm geometry ────────────────────────────────────────────────────
-
     def _get_cross_params(self):
-        """
-        Return a list of (cy, cx, arm) for each component, where:
-          cy, cx  — footprint centroid in data coordinates (row, col)
-          arm     — half-length of each cross arm in pixels
-
-        arm = max(CROSS_MIN_ARM, 0.75 × max(footprint_height, footprint_width))
-
-        The footprint bounding box is derived from pixels whose weight exceeds
-        20 % of the component peak, matching the visual extents of the overlay.
-        Cached and invalidated when the component count changes.
-        """
         s = self.store
-        # Reuse centroid cache check — both have the same invalidation condition
         if (self._centroids is not None and len(self._centroids) == s.n
-                and hasattr(self, '_cross_params')
-                and len(self._cross_params) == s.n):
-            return self._cross_params
+                and self._cross_params_cache is not None
+                and len(self._cross_params_cache) == s.n):
+            return self._cross_params_cache
 
-        centroids = self._get_centroids()   # ensures self._centroids is populated
-        d1, d2    = s.dims
+        centroids = self._get_centroids()
         params    = []
         for i in range(s.n):
             cy, cx = centroids[i]
-            fp     = s.footprint(i)          # (d1, d2) in data-space (row, col)
+            fp     = s.footprint(i)
             peak   = fp.max()
             if peak < 1e-9:
                 params.append((cy, cx, CROSS_MIN_ARM))
                 continue
-            mask = fp > peak * 0.2
-            rows_on, cols_on = np.where(mask)
-            if rows_on.size == 0:
+            mask     = fp > peak * 0.2
+            ry, cx_ = np.where(mask)
+            if ry.size == 0:
                 params.append((cy, cx, CROSS_MIN_ARM))
                 continue
-            height = int(rows_on.max() - rows_on.min()) + 1
-            width  = int(cols_on.max() - cols_on.min()) + 1
-            arm    = max(CROSS_MIN_ARM, 0.75 * max(height, width))
+            h   = int(ry.max() - ry.min()) + 1
+            w   = int(cx_.max() - cx_.min()) + 1
+            arm = max(CROSS_MIN_ARM, 0.75 * max(h, w))
             params.append((cy, cx, arm))
 
-        self._cross_params = params
-        return self._cross_params
+        self._cross_params_cache = params
+        return self._cross_params_cache
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
     def _redraw(self):
-        ax = self.ax
-        ax.cla()
-        ax.set_facecolor("black")
-        ax.set_xticks([]);  ax.set_yticks([])
         s = self.store
 
-        bg_cmap = "gray_r" if self._invert_bg else "gray"
-        ax.imshow(s.Cn, cmap=bg_cmap, origin="lower",
-                  interpolation="nearest", aspect="equal")
-        rgba = _build_overlay(s, self._sel, self._pair)
-        ax.imshow(rgba, origin="lower", interpolation="nearest", aspect="equal")
+        # Background
+        cn = s.Cn.copy()
+        if self._invert_bg:
+            cn = cn.max() - cn
+        lo, hi = cn.min(), cn.max()
+        if hi > lo:
+            cn8 = ((cn - lo) / (hi - lo) * 255).astype(np.uint8)
+        else:
+            cn8 = np.zeros_like(cn, dtype=np.uint8)
+        self._img_bg.setImage(cn8)
 
-        # Draw a cross only on currently selected / pair components.
-        # When nothing is selected no crosses are drawn at all.
+        # RGBA overlay (selected + pair only)
+        rgba = _build_overlay(s, self._sel, self._pair)
+        self._img_ov.setImage(rgba)
+
+        # Crosses
+        self._draw_crosses()
+
+    def _draw_crosses(self):
+        # Remove old cross line items
+        for item in self._cross_items:
+            self.vb.removeItem(item)
+        self._cross_items = []
+
         sel_set  = set(self._sel)
         pair_set = set(self._pair) if self._pair else set()
         active   = sel_set | pair_set
-        if active:
-            cross_p = self._get_cross_params()
-            for i in active:
-                if i >= len(cross_p):
-                    continue
-                cy, cx, arm = cross_p[i]
-                if self._pair and i in pair_set:
-                    color = CORR_A if i == self._pair[0] else CORR_B
-                else:
-                    k     = self._sel.index(i) if i in sel_set else 0
-                    color = PALETTE_HEX[k % len(PALETTE_HEX)]
-                # Horizontal arm (x = col axis, y = row axis in data space)
-                ax.plot([cx - arm, cx + arm], [cy, cy],
-                        color=color, lw=0.9, alpha=0.85,
-                        solid_capstyle="butt")
-                # Vertical arm
-                ax.plot([cx, cx], [cy - arm, cy + arm],
-                        color=color, lw=0.9, alpha=0.85,
-                        solid_capstyle="butt")
+        if not active:
+            return
 
-        self._restore_view()   # re-apply zoom/pan after imshow reset limits
-        self.draw_idle()
+        cross_p = self._get_cross_params()
+        for i in active:
+            if i >= len(cross_p):
+                continue
+            cy, cx, arm = cross_p[i]
+
+            if self._pair and i in pair_set:
+                color = CORR_A if i == self._pair[0] else CORR_B
+            else:
+                k     = self._sel.index(i) if i in sel_set else 0
+                color = PALETTE_HEX[k % len(PALETTE_HEX)]
+
+            pen = pg.mkPen(color, width=1.5)
+            h = pg.PlotDataItem([cx - arm, cx + arm], [cy,       cy      ], pen=pen)
+            v = pg.PlotDataItem([cx,       cx      ], [cy - arm, cy + arm], pen=pen)
+            h.setZValue(2)
+            v.setZValue(2)
+            self.vb.addItem(h)
+            self.vb.addItem(v)
+            self._cross_items.extend([h, v])
 
 
 # ── Trace viewer ──────────────────────────────────────────────────────────────
 
-class TraceViewer(_Canvas):
+class TraceViewer(pg.PlotWidget):
     """Bottom-left — stacked normalised traces for selected components."""
 
-    # Fixed axes position derived from subplots_adjust margins:
-    #   left=0.05  right=0.97  →  width  = 0.92
-    #   bottom=0.12  top=0.95  →  height = 0.83
-    _AX_POS = [0.05, 0.12, 0.92, 0.83]   # [left, bottom, width, height]
-
-    def __init__(self, store: ComponentStore, parent=None):
-        super().__init__(parent)
+    def __init__(self, store: 'ComponentStore', parent=None):
+        super().__init__(parent, background=BG_DARK)
         self.store = store
-        self.ax    = self.fig.add_subplot(111)
-        self.ax.set_facecolor(AX_BG)
-        self.ax.set_position(self._AX_POS)   # pin immediately
         self._sel  = []
+        self.getAxis('bottom').setLabel('Frame', color='#888888')
+        self.getAxis('bottom').setTextPen(pg.mkPen('#888888'))
+        self.getAxis('left').hide()
+        self._legend = self.addLegend(labelTextColor='white',
+                                      brush=pg.mkBrush(BG_DARK + 'cc'),
+                                      pen=pg.mkPen('#333333'))
         self._redraw()
 
     def set_selection(self, sel):
@@ -814,311 +784,229 @@ class TraceViewer(_Canvas):
         self._redraw()
 
     def _redraw(self):
-        ax = self.ax
-        ax.cla()
-        ax.set_position(self._AX_POS)   # cla() resets bbox; re-pin it
-        ax.set_facecolor(AX_BG)
+        self.clear()
+        self._legend = self.addLegend(labelTextColor='white',
+                                      brush=pg.mkBrush(BG_DARK + 'cc'),
+                                      pen=pg.mkPen('#333333'))
         s = self.store
-
         if not self._sel:
-            ax.text(0.5, 0.5, "Select component(s)",
-                    transform=ax.transAxes, ha="center", va="center",
-                    color="#555555", fontsize=9)
-            ax.set_xticks([]);  ax.set_yticks([])
-            self.draw_idle()
+            ti = pg.TextItem("Select component(s)", color='#555555',
+                             anchor=(0.5, 0.5))
+            self.addItem(ti)
+            self.getViewBox().setRange(xRange=(0, 1), yRange=(0, 1))
             return
 
         try:
-            T = s.C.shape[1]
-            t = np.arange(T)
+            T      = s.C.shape[1]
+            t      = np.arange(T, dtype=np.float32)
             offset = 0.0
             for k, i in enumerate(self._sel):
                 color = PALETTE_HEX[k % len(PALETTE_HEX)]
                 trace = s.C[i]
                 span  = trace.max() - trace.min()
                 tr    = (trace - trace.min()) / (span + 1e-9)
-                ax.plot(t, tr + offset, color=color, lw=0.7, label=s.labels[i])
+                self.plot(t, (tr + offset).astype(np.float32),
+                          pen=pg.mkPen(color, width=1),
+                          name=s.labels[i])
                 offset += 1.3
-
-            ax.set_xlim(0, T)
-            ax.set_ylim(-0.3, offset)
-            ax.set_xlabel("Frame", color="#888888", fontsize=7)
-            ax.tick_params(colors="#666666", labelsize=6)
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#333333")
-            ax.legend(fontsize=6, loc="upper right",
-                      facecolor=BG_DARK, edgecolor="#333333",
-                      labelcolor="white", framealpha=0.8)
+            self.setXRange(0, T, padding=0)
+            self.setYRange(-0.3, offset, padding=0)
         except Exception as exc:
-            ax.cla()
-            ax.set_facecolor(AX_BG)
-            ax.text(0.5, 0.5, f"Draw error: {exc}",
-                    transform=ax.transAxes, ha="center", va="center",
-                    color="#ff4444", fontsize=7, wrap=True)
-            ax.set_xticks([]); ax.set_yticks([])
-        finally:
-            self.draw_idle()   # always flush, even if plotting raised
+            self.clear()
+            ti = pg.TextItem(f"Draw error: {exc}", color='#ff4444',
+                             anchor=(0.5, 0.5))
+            self.addItem(ti)
+
+
+# ── Shared matrix widget base ─────────────────────────────────────────────────
+
+class _MatrixWidget(pg.GraphicsLayoutWidget):
+    """
+    Base for CorrMatrix and DistMatrix.
+    Displays a K×K symmetric matrix as a heat-map with a fixed colorbar.
+    Clicking any off-diagonal cell emits pair_clicked(i, j).
+    """
+
+    pair_clicked = pyqtSignal(int, int)
+
+    def __init__(self, store: 'ComponentStore', cmap: pg.ColorMap,
+                 parent=None):
+        super().__init__(parent)
+        self.store      = store
+        self._cmap      = cmap
+        self._highlight = None
+        self._hl_items: list = []
+
+        self.setBackground(BG_DARK)
+
+        # Column 0: matrix ViewBox (no mouse zoom/pan — leave for table/corr UX)
+        self.vb = self.addViewBox(row=0, col=0)
+        self.vb.invertY(True)            # row 0 at top (matrix convention)
+        self.vb.setAspectLocked(True)
+        self.vb.setMouseEnabled(x=False, y=False)
+
+        self._img = pg.ImageItem()
+        self.vb.addItem(self._img)
+
+        # Column 1: colorbar
+        self._cbar = pg.ColorBarItem(
+            colorMap=self._cmap, width=12,
+            pen='#333333', hoverPen='#888888', hoverBrush='#888888'
+        )
+        self._cbar.setImageItem(self._img, insert_in=self.vb)
+        self.addItem(self._cbar, row=0, col=1)
+        self.ci.layout.setColumnFixedWidth(1, 60)
+
+        # Click
+        self.vb.scene().sigMouseClicked.connect(self._on_scene_click)
+
+    def refresh(self):
+        self._highlight = None
+        for item in self._hl_items:
+            self.vb.removeItem(item)
+        self._hl_items = []
+        self._render()
+
+    def _levels(self, mat: np.ndarray):
+        raise NotImplementedError
+
+    def _matrix(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def _render(self):
+        mat    = self._matrix()          # (K, K) float32, diag=NaN
+        vmin, vmax = self._levels(mat)
+        # NaN → midpoint colour so diagonal is neutral
+        display = np.where(np.isnan(mat), (vmin + vmax) / 2.0, mat)
+        self._img.setImage(display.astype(np.float32))
+        self._img.setLookupTable(self._cmap.getLookupTable(nPts=256))
+        self._img.setLevels((vmin, vmax))
+        self._cbar.setLevels((vmin, vmax))
+
+        # Highlight pair
+        if self._highlight:
+            hi, hj = self._highlight
+            for item in self._hl_items:
+                self.vb.removeItem(item)
+            self._hl_items = []
+            for band, col in [(hi, CORR_A), (hj, CORR_B)]:
+                lh = pg.PlotDataItem(
+                    [0, mat.shape[1]], [band, band],
+                    pen=pg.mkPen(col, width=1.5))
+                lv = pg.PlotDataItem(
+                    [band, band], [0, mat.shape[0]],
+                    pen=pg.mkPen(col, width=1.5))
+                for li in (lh, lv):
+                    li.setZValue(2)
+                    self.vb.addItem(li)
+                    self._hl_items.append(li)
+            for (ri, ci_), col in [((hi, hj), CORR_A), ((hj, hi), CORR_B)]:
+                box = pg.PlotDataItem(
+                    [ci_ - 0.5, ci_ + 0.5, ci_ + 0.5, ci_ - 0.5, ci_ - 0.5],
+                    [ri  - 0.5, ri  - 0.5, ri  + 0.5, ri  + 0.5, ri  - 0.5],
+                    pen=pg.mkPen(col, width=2))
+                box.setZValue(3)
+                self.vb.addItem(box)
+                self._hl_items.append(box)
+
+        # Tick labels (thin out for large K)
+        n    = self.store.n
+        step = max(1, n // 12)
+        tks  = list(range(0, n, step))
+
+    def _on_scene_click(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pt = self.vb.mapSceneToView(event.scenePos())
+        j  = int(round(pt.x()))
+        i  = int(round(pt.y()))
+        n  = self.store.n
+        if 0 <= i < n and 0 <= j < n and i != j:
+            self._highlight = (i, j)
+            self._render()
+            self.pair_clicked.emit(i, j)
 
 
 # ── Correlation matrix ────────────────────────────────────────────────────────
 
-class CorrMatrix(_Canvas):
-    """
-    Bottom-right — pairwise correlation heat-map.
-    Clicking any off-diagonal cell emits pair_clicked(i, j) and draws
-    orange / magenta cross-hairs and bounding boxes on that pair.
-    """
+class CorrMatrix(_MatrixWidget):
+    """Bottom-right — pairwise Pearson correlation heat-map (RdBu_r)."""
 
-    pair_clicked = pyqtSignal(int, int)
+    def __init__(self, store: 'ComponentStore', parent=None):
+        super().__init__(store, CMAP_RDBU_R, parent)
+        self._render()
 
-    # Fixed layout constants (in figure-fraction coordinates):
-    #   image axes: [left, bottom, width, height]
-    #   colorbar:   thin strip to the right, separated by a gap
-    _IM_POS  = [0.08, 0.12, 0.78, 0.84]   # image axes position
-    _CB_POS  = [0.89, 0.12, 0.02, 0.84]   # colorbar axes position (fixed, never moves)
+    def _matrix(self) -> np.ndarray:
+        return self.store.corr.copy()
 
-    def __init__(self, store: ComponentStore, parent=None):
-        super().__init__(parent)
-        self.store      = store
-        self._highlight = None
-
-        # Create both axes once at fixed positions.
-        # Using cax= in colorbar() keeps the image axes bbox stable —
-        # fig.colorbar(ax=ax) steals space from ax on every call and
-        # causes the plot to shrink with each redraw.
-        self.ax    = self.fig.add_axes(self._IM_POS)
-        self._cbax = self.fig.add_axes(self._CB_POS)
-        self.ax.set_facecolor(BG_DARK)
-        self._cbax.set_facecolor(BG_DARK)
-
-        self.mpl_connect("button_press_event", self._on_click)
-        self._redraw()
-
-    def refresh(self):
-        self._highlight = None
-        self._redraw()
-
-    def _redraw(self):
-        ax = self.ax
-        ax.cla()
-        self._cbax.cla()   # clear but keep the axes; its position is fixed
-        s    = self.store
-        corr = s.corr.copy()
-
-        # Auto colour axis: symmetric around zero, clipped to [-1, 1].
-        # Use the 99th-percentile absolute off-diagonal value so a single
-        # perfectly-correlated pair does not collapse the dynamic range.
-        off_diag = corr[~np.isnan(corr)]
-        clim = float(np.clip(
-            np.percentile(np.abs(off_diag), 99), 0.05, 1.0
-        )) if off_diag.size > 0 else 1.0
-
-        im = ax.imshow(corr, cmap="RdBu_r", vmin=-clim, vmax=clim,
-                       origin="upper", aspect="auto",
-                       interpolation="nearest")
-
-        # cax= draws into our pre-allocated axes — image axes bbox never changes
-        cb = self.fig.colorbar(im, cax=self._cbax)
-        cb.ax.tick_params(colors="#888888", labelsize=6)
-        cb.outline.set_edgecolor("#333333")
-
-        if self._highlight:
-            hi, hj = self._highlight
-            for band, col in [(hi, CORR_A), (hj, CORR_B)]:
-                ax.axhline(band, color=col, lw=1.0, alpha=0.6)
-                ax.axvline(band, color=col, lw=1.0, alpha=0.6)
-            ax.add_patch(Rectangle((hj - 0.5, hi - 0.5), 1, 1,
-                                   lw=2.0, edgecolor=CORR_A, facecolor="none"))
-            ax.add_patch(Rectangle((hi - 0.5, hj - 0.5), 1, 1,
-                                   lw=2.0, edgecolor=CORR_B, facecolor="none"))
-
-        n    = s.n
-        step = max(1, n // 12)
-        tks  = list(range(0, n, step))
-        lbls = [s.labels[t] for t in tks]
-        ax.set_xticks(tks)
-        ax.set_xticklabels(lbls, rotation=45, ha="right",
-                           fontsize=5, color="#aaaaaa")
-        ax.set_yticks(tks)
-        ax.set_yticklabels(lbls, fontsize=5, color="#aaaaaa")
-        ax.tick_params(colors="#666666")
-        self.draw_idle()
-
-    def _on_click(self, event):
-        if event.inaxes is not self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        j = int(round(event.xdata))
-        i = int(round(event.ydata))
-        n = self.store.n
-        if 0 <= i < n and 0 <= j < n and i != j:
-            self._highlight = (i, j)
-            self._redraw()
-            self.pair_clicked.emit(i, j)
-
+    def _levels(self, mat):
+        off  = mat[~np.isnan(mat)]
+        clim = float(np.clip(np.percentile(np.abs(off), 99), 0.05, 1.0)) \
+               if off.size > 0 else 1.0
+        return -clim, clim
 
 
 # ── Distance matrix ───────────────────────────────────────────────────────────
 
-class DistMatrix(_Canvas):
-    """
-    Top-right pane — pairwise Euclidean distance between component centroids.
+class DistMatrix(_MatrixWidget):
+    """Top-right — pairwise centroid distance heat-map (viridis_r)."""
 
-    The matrix is symmetric; the diagonal is NaN.  Colour scale auto-adjusts
-    to the 99th percentile of off-diagonal values each redraw.
-
-    A linear / log10 toggle is available via set_log(bool).  In log mode zero
-    distances (identical centroids) are shown as NaN (white) to avoid -inf.
-    Clicking a cell highlights that pair in orange / magenta on the cell viewer,
-    identical to the correlation matrix click behaviour.
-
-    The matrix is recomputed from scratch whenever store.n changes (after any
-    merge, delete, undo, or redo), because the centroid list is invalidated at
-    that point.
-    """
-
-    pair_clicked = pyqtSignal(int, int)
-
-    # Fixed layout — mirrors CorrMatrix proportions
-    _IM_POS = [0.08, 0.12, 0.78, 0.84]
-    _CB_POS = [0.89, 0.12, 0.02, 0.84]
-
-    def __init__(self, store: ComponentStore, parent=None):
-        super().__init__(parent)
-        self.store      = store
-        self._highlight = None
-        self._log       = False
-
-        self.ax    = self.fig.add_axes(self._IM_POS)
-        self._cbax = self.fig.add_axes(self._CB_POS)
-        self.ax.set_facecolor(BG_DARK)
-        self._cbax.set_facecolor(BG_DARK)
-
-        self.mpl_connect("button_press_event", self._on_click)
-        self._redraw()
-
-    # ── Public interface ──────────────────────────────────────────────────────
-
-    def refresh(self):
-        """Full redraw — call after any store mutation."""
-        self._highlight = None
-        self._redraw()
+    def __init__(self, store: 'ComponentStore', parent=None):
+        super().__init__(store, CMAP_VIRIDIS_R, parent)
+        self._log = False
+        self._render()
 
     def set_log(self, log: bool):
-        """Switch between linear and log10 colour scale."""
         if log != self._log:
             self._log = log
-            self._redraw()
+            self._render()
 
-    # ── Geometry ──────────────────────────────────────────────────────────────
+    def _matrix(self) -> np.ndarray:
+        dist = DistMatrix._compute_dist(self.store)
+        if self._log:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return np.where(dist > 0, np.log10(dist), np.nan)
+        return dist
+
+    def _levels(self, mat):
+        off = mat[~np.isnan(mat)]
+        if off.size == 0:
+            return 0.0, 1.0
+        if self._log:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                off = np.where(off > 0, np.log10(off), np.nan)
+            off = off[~np.isnan(off)]
+        vmax = float(np.clip(np.percentile(off, 99), 1e-3, None)) \
+               if off.size > 0 else 1.0
+        vmin = float(off.min()) if self._log and off.size > 0 else 0.0
+        return vmin, vmax
 
     @staticmethod
-    def _compute_dist(store: ComponentStore) -> np.ndarray:
-        """
-        Return (K, K) symmetric matrix of Euclidean centroid distances in px.
-        Diagonal is NaN.  Uses the footprint centroid (weighted centroid of
-        the spatial component A) in (row, col) data space.
-        """
-        s   = store
-        K   = s.n
+    def _compute_dist(store: 'ComponentStore') -> np.ndarray:
+        K   = store.n
         mat = np.full((K, K), np.nan, dtype=np.float32)
         if K == 0:
             return mat
-
-        d1, d2 = s.dims
+        d1, d2 = store.dims
         p      = np.arange(d1 * d2, dtype=np.float32)
         rows   = p % d1
         cols   = p // d1
-
-        cy_cx = np.empty((K, 2), dtype=np.float32)
+        cy_cx  = np.empty((K, 2), dtype=np.float32)
         for i in range(K):
-            fp    = s._A[:, i]
+            fp    = store._A[:, i]
             total = fp.sum()
             if total > 1e-9:
                 cy_cx[i, 0] = (fp * rows).sum() / total
                 cy_cx[i, 1] = (fp * cols).sum() / total
             else:
-                cy_cx[i, 0] = d1 / 2.0
-                cy_cx[i, 1] = d2 / 2.0
-
+                cy_cx[i] = [d1 / 2.0, d2 / 2.0]
         for i in range(K):
             for j in range(i + 1, K):
                 d = float(np.sqrt(((cy_cx[i] - cy_cx[j]) ** 2).sum()))
-                mat[i, j] = d
-                mat[j, i] = d
+                mat[i, j] = mat[j, i] = d
         return mat
 
-    # ── Draw ──────────────────────────────────────────────────────────────────
 
-    def _redraw(self):
-        ax = self.ax
-        ax.cla()
-        self._cbax.cla()
-
-        s    = self.store
-        dist = self._compute_dist(s)
-
-        if self._log:
-            # log10; zero distances (identical centroids) → NaN (shown as white)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                disp = np.where(dist > 0, np.log10(dist), np.nan)
-            cb_label = "log₁₀ distance (px)"
-        else:
-            disp     = dist
-            cb_label = "Distance (px)"
-
-        off = disp[~np.isnan(disp)]
-        if off.size > 0:
-            vmax = float(np.clip(np.percentile(off, 99), 1e-3, None))
-            vmin = float(off.min()) if self._log else 0.0
-        else:
-            vmin, vmax = 0.0, 1.0
-
-        im = ax.imshow(disp, cmap="viridis_r", vmin=vmin, vmax=vmax,
-                       origin="upper", aspect="auto",
-                       interpolation="nearest")
-        cb = self.fig.colorbar(im, cax=self._cbax)
-        cb.set_label(cb_label, color="#aaaaaa", fontsize=5, labelpad=4)
-        cb.ax.tick_params(colors="#888888", labelsize=6)
-        cb.outline.set_edgecolor("#333333")
-
-        if self._highlight:
-            hi, hj = self._highlight
-            for band, col in [(hi, CORR_A), (hj, CORR_B)]:
-                ax.axhline(band, color=col, lw=1.0, alpha=0.6)
-                ax.axvline(band, color=col, lw=1.0, alpha=0.6)
-            ax.add_patch(Rectangle((hj - 0.5, hi - 0.5), 1, 1,
-                                   lw=2.0, edgecolor=CORR_A, facecolor="none"))
-            ax.add_patch(Rectangle((hi - 0.5, hj - 0.5), 1, 1,
-                                   lw=2.0, edgecolor=CORR_B, facecolor="none"))
-
-        n    = s.n
-        step = max(1, n // 12)
-        tks  = list(range(0, n, step))
-        lbls = [s.labels[t] for t in tks]
-        ax.set_xticks(tks)
-        ax.set_xticklabels(lbls, rotation=45, ha="right",
-                           fontsize=5, color="#aaaaaa")
-        ax.set_yticks(tks)
-        ax.set_yticklabels(lbls, fontsize=5, color="#aaaaaa")
-        ax.tick_params(colors="#666666")
-        ax.set_title("Centroid distance", color="#888888",
-                     fontsize=6, pad=3)
-        self.draw_idle()
-
-    def _on_click(self, event):
-        if event.inaxes is not self.ax:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        j = int(round(event.xdata))
-        i = int(round(event.ydata))
-        n = self.store.n
-        if 0 <= i < n and 0 <= j < n and i != j:
-            self._highlight = (i, j)
-            self._redraw()
-            self.pair_clicked.emit(i, j)
 
 # ── Component table ───────────────────────────────────────────────────────────
 
