@@ -2979,6 +2979,25 @@ def precompute_corr_pnr_filtered_fov(
         del _msub, chunk_gpu, _Yconv
 
     filt_full.flush()
+    # Validate filt_full after filtering pass — detect zero-data before Y2 loop.
+    # Zeros here indicate: (a) CuPy CUDA memory allocation failed silently,
+    # (b) wrong F-order mmap was read (e.g. filename mismatch), or
+    # (c) the movie mmap contains zeros (corrupted or wrong file).
+    _filt_sample = np.abs(filt_full[:, :, T // 2].astype(np.float32))
+    _filt_max    = float(_filt_sample.max())
+    _filt_median = float(np.median(_filt_sample))
+    logger.info(
+        f'precompute_corr_pnr_filtered_fov: filt_full mid-frame check '
+        f'abs_median={_filt_median:.3f}  abs_max={_filt_max:.3f}'
+    )
+    if _filt_max < 1e-3:
+        logger.error(
+            'precompute_corr_pnr_filtered_fov: filt_full is all-zero after '
+            'filtering pass — check that forder_movie_path points to a valid '
+            'F-order mmap with non-zero data, and that LD_LIBRARY_PATH '
+            'includes the nvidia-cufft-cu12 library path so CuPy uses GPU.'
+        )
+    del _filt_sample, _filt_max, _filt_median
     del mean_gpu
     # Single small D2H: (d1,d2) float32 arrays = 1 MB each
     Y2_acc   = cp.asnumpy(Y2_acc_gpu);   del Y2_acc_gpu

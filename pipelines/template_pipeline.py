@@ -170,7 +170,7 @@ if __name__ == "__main__":
 
     # ── 2. Motion correction ──────────────────────────────────────────────────
     _mc_existing = sorted(glob.glob(
-        os.path.join(CAIMAN_TEMP, f"*{mc_stem}*rig*order_F*.mmap")))
+        os.path.join(CAIMAN_TEMP, f"{mc_stem}_rig*order_F*.mmap")))
 
     if _mc_existing:
         fname_mc, shifts_rig = _mc_existing[-1], [(0, 0)]
@@ -198,7 +198,7 @@ if __name__ == "__main__":
 
     # ── 3. F→C mmap conversion ────────────────────────────────────────────────
     _cnmf_existing = sorted(glob.glob(
-        os.path.join(CAIMAN_TEMP, f"*{mc_stem}_cnmf*order_C*.mmap")))
+        os.path.join(CAIMAN_TEMP, f"{mc_stem}_cnmf*order_C*.mmap")))
 
     if _cnmf_existing and os.path.getmtime(_cnmf_existing[-1]) >= os.path.getmtime(fname_mc):
         fname_cnmf = _cnmf_existing[-1]

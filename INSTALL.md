@@ -202,7 +202,7 @@ pip install tensorflow  # keras backend
 pip install pynwb>=2.3
 ```
 
-**CNMF Inspector GUI** (`bin/cnmf_inspector.py`):
+**CNMF Inspector GUI** (`bin/cnmf_inspector.py`) — included in `requirements.txt`:
 
 ```bash
 pip install PyQt6 pyqtgraph

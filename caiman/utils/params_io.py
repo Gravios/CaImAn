@@ -270,6 +270,13 @@ def build_cnmf_opts(
         "blas_threads_per_worker": _blas_threads,
     })
 
+    # precompute_chunk_frames: read from cnmf section first, then gpu section.
+    # Kept in the gpu section of the JSON template for discoverability,
+    # but also accepted in the cnmf section if placed there.
+    _pcf = (
+        getattr(c, "precompute_chunk_frames", None)
+        or getattr(getattr(P, "gpu", None), "precompute_chunk_frames", None)
+    )
     opts.set("init", {
         "K"              : getattr(c, "K", 30),
         "gSig"           : getattr(c, "gSig", [8, 8]),
@@ -295,7 +302,8 @@ def build_cnmf_opts(
                            else getattr(c, "normalize_init", True),
         "rolling_sum"    : getattr(c, "rolling_sum",  True),
         "ssub_B"         : getattr(c, "ssub_B",       2),
-    })
+        # precompute_chunk_frames: read from cnmf or gpu JSON section (see _pcf above).
+        **({"precompute_chunk_frames": int(_pcf)} if _pcf is not None else {}),    })
 
     opts.set("preprocess", {
         "p"          : 0,       # p=0 during initial fit; set to c.p at refit
