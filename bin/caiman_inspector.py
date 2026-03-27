@@ -1313,10 +1313,42 @@ class InspectorWindow(QMainWindow):
             self._in_table_sel = False
 
     def _on_corr_click(self, i: int, j: int):
+        """
+        Handle a click on the correlation or distance matrix.
+
+        Both components are programmatically selected in the table so that
+        the Merge and Delete toolbar buttons become active immediately —
+        tint_pair() alone is purely cosmetic and does not update the Qt
+        selection model, leaving the buttons disabled.
+
+        set_pair() must be called *after* _on_table_sel() because
+        cell_view.set_selection() (called inside _on_table_sel) resets
+        self._pair to None; re-applying set_pair() afterwards restores
+        the orange / magenta pair overlay on top of the palette colours.
+        """
         self._pair = (i, j)
+
+        # Programmatically select both rows in the Qt selection model so
+        # the merge / delete buttons are enabled via _on_table_sel.
+        sm    = self.table.selectionModel()
+        flags = (QItemSelectionModel.SelectionFlag.Select
+                 | QItemSelectionModel.SelectionFlag.Rows)
+        self.table.blockSignals(True)
+        sm.clearSelection()
+        for row in (i, j):
+            if 0 <= row < self.store.n:
+                sm.select(self.table.model().index(row, 0), flags)
+        self.table.blockSignals(False)
+
+        # Propagate selection → enables toolbar, updates trace viewer,
+        # and calls cell_view.set_selection([i, j]) which clears _pair.
+        self._on_table_sel()
+
+        # Re-apply the pair overlay (orange / magenta) on top of the
+        # palette selection colours that _on_table_sel just painted.
         self.cell_view.set_pair((i, j))
-        self.trace_view.set_selection([i, j])   # show both traces
         self.table.tint_pair(i, j)
+
         r = self.store.corr[i, j]
         self.statusBar().showMessage(
             f"Pair  {self.store.labels[i]}  ↔  {self.store.labels[j]}   "
