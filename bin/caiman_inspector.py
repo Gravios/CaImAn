@@ -643,7 +643,10 @@ class CellViewer(_Canvas):
             self._panning   = False
 
     def _on_mpl_motion(self, event):
-        if self._pan_start is None or event.inaxes is not self.ax:
+        # Do NOT check event.inaxes — the cursor drifts outside the axes
+        # bbox into figure margins during a drag, setting inaxes=None and
+        # breaking the pan.  event.x/y are always valid canvas coordinates.
+        if self._pan_start is None:
             return
         self._panning = True
         # Convert display-pixel delta to data space via the axes transform.
