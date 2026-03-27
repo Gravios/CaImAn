@@ -569,11 +569,6 @@ class CellViewer(_Canvas):
         self._ylim = None
         self._redraw()
 
-    def _save_view(self):
-        """Capture current axes limits into _xlim / _ylim."""
-        self._xlim = self.ax.get_xlim()
-        self._ylim = self.ax.get_ylim()
-
     def _restore_view(self):
         """Re-apply saved limits after ax.cla() reset them."""
         if self._xlim is not None:
@@ -718,7 +713,6 @@ class CellViewer(_Canvas):
 
     def _redraw(self):
         ax = self.ax
-        self._save_view()    # preserve zoom/pan before cla() wipes the limits
         ax.cla()
         ax.set_facecolor("black")
         ax.set_xticks([]);  ax.set_yticks([])
