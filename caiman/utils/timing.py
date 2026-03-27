@@ -321,6 +321,7 @@ def write_report(
     session: str,
     outdir: Union[str, Path],
     logger: logging.Logger,
+    extra: Optional[dict] = None,
 ) -> None:
     """Write a human-readable timing table and a JSON summary.
 
@@ -342,6 +343,10 @@ def write_report(
         Output directory — same folder as the pipeline results.
     logger
         Logger to announce the written paths.
+    extra : dict, optional
+        Additional key/value pairs written into the header section of the
+        text report (e.g. ``{"Components accepted": 47, "rejected": 12}``)
+        and into the JSON summary under the ``"extra"`` key.
     """
     outdir = Path(outdir)
     report_path = outdir / f"{session}_report.txt"
@@ -357,6 +362,9 @@ def write_report(
     lines.append(f"  Session   : {session}")
     lines.append(f"  Generated : {now}")
     lines.append(f"  Wall time : {fmt_elapsed(total_elapsed)}  ({total_elapsed:.1f} s)")
+    if extra:
+        for k, v in extra.items():
+            lines.append(f"  {k:<10}: {v}")
     lines.append("=" * 72)
     lines.append("")
 
@@ -413,6 +421,8 @@ def write_report(
         "peak_shm_gb":      round(peak_shm, 2),
         "peak_vram_mb":     round(peak_vram, 1),
     }
+    if extra:
+        summary["extra"] = {str(k): v for k, v in extra.items()}
     with json_path.open("w") as fh:
         json.dump(summary, fh, indent=2)
 

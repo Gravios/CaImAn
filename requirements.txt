@@ -1,34 +1,46 @@
-# ── Core pipeline ─────────────────────────────────────────────────────────────
-# Required for all pipeline steps (motion correction, CNMF, QC, dF/F).
-numpy>=1.20
-scipy>=1.7
-scikit-image>=0.19
-scikit-learn>=1.0
-opencv-python>=4.5
-tifffile>=2022.2
-matplotlib>=3.5
-psutil>=5.9
-h5py>=3.6
+# ── Gravios/CaImAn drop-in patch — additional requirements ──────────────────
+#
+# The main Python dependencies are declared in pyproject.toml and are installed
+# automatically by:
+#
+#     pip install -e .
+#
+# This file lists only what pyproject.toml does NOT cover and must be
+# installed separately.  See INSTALL.md for the full step-by-step guide.
+#
+# ── Required: not in pyproject.toml ──────────────────────────────────────────
+
+# Multiprocessing serialisation — replaces pickle for lambdas and closures
 dill>=0.3
 
-# ── GPU ───────────────────────────────────────────────────────────────────────
-# Required for GPU motion correction and GPU Cn/PNR precompute.
-# Install the variant matching your CUDA driver version:
-#
-#   CUDA 11.x:   pip install cupy-cuda11x
-#   CUDA 12.x:   pip install cupy-cuda12x
-#
-# Check your driver version with: nvidia-smi | head -1
-#
+# GPU support — choose the variant matching your CUDA driver (nvidia-smi):
+#   CUDA 12.x  →  cupy-cuda12x   (Blackwell, Ada, Ampere, most modern GPUs)
+#   CUDA 11.x  →  cupy-cuda11x   (Turing, Volta)
 cupy-cuda12x>=12.0
 
-# ── Optional: NWB output ──────────────────────────────────────────────────────
-# Required if NWB export is enabled (pending feature).
-# pynwb>=2.3
+# CUDA 12 runtime shared libraries for cupy-cuda12x.
+#
+# WHY: pip install -e . installs torch, which pulls in nvidia-cublas-13.*
+# (a CUDA 13 build).  cupy-cuda12x requires libcublas.so.12, not .so.13.
+# Installing the -cu12 wheels below makes both coexist correctly.
+#
+# After installing, run:
+#   python scripts/set_ld_library_path.py
+# to register the .so paths so CuPy can find them at runtime.
+nvidia-cublas-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cusolver-cu12
+nvidia-cusparse-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
 
-# ── Optional: widefield pipeline ─────────────────────────────────────────────
-# Required for the widefield calcium imaging analysis pipeline.
-# ipyparallel>=8.4
+# ── Optional: CNN component evaluation ────────────────────────────────────────
+# Required only when use_cnn: true is set in the pipeline JSON.
+# (keras is already installed by pip install -e ., but needs a backend)
+# tensorflow
 
-# ── Note: 'logging' is Python standard library ───────────────────────────────
-# It ships with every Python installation — no pip install needed.
+# ── Optional: CNMF Inspector GUI ─────────────────────────────────────────────
+# Required only for bin/cnmf_inspector.py
+# PyQt6
+# pyqtgraph
