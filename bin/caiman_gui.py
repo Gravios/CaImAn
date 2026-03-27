@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# Qt6 port: set backend before any pyqtgraph import
+import os
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt6")
 
 import cv2
 from datetime import datetime
@@ -628,10 +631,12 @@ pars_action.sigTreeStateChanged.connect(action_pars_activated)
 #  If anything changes in the tree, print a message
 def change(param, changes):
     global estimates, pars, pars_action
-    set_par = pars.getValues()
+    # Skip action-type parameters — they have no value in pyqtgraph ≥ 0.13
+    set_par = {k: v for k, (v, _) in pars.getValues().items()
+               if pars.child(k).type() != 'action'}
     if pars_action.param('Filter components').value():
         for keyy in set_par.keys():
-            params_obj.quality.update({keyy: set_par[keyy][0]})
+            params_obj.quality.update({keyy: set_par[keyy]})
     else:
             params_obj.quality.update({'cnn_lowest': .1,
                                        'min_cnn_thr': 0.99,
@@ -658,7 +663,7 @@ t.setWindowTitle('Parameter Quality')
 w.show()
 
 #  Start the Qt event loop
-app.exec_()
+app.exec()
 
 # Rotate back
 if estimates.rotation:
