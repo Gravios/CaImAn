@@ -2894,9 +2894,12 @@ def precompute_corr_pnr_filtered_fov(
                     pass
             result_gpu = _apply_filter(batch_gpu);  del batch_gpu
             result_np  = cp.asnumpy(result_gpu);    del result_gpu
-            # Return VRAM immediately — _apply_filter peaks at 4×batch_size.
-            # Without this free the pool retains all chunks across the loop
-            # and the second chunk OOMs on a 16 GB GPU (4×3 GB + 3 GB MC).
+            # Synchronise before freeing — ensures all GPU kernels writing
+            # to pool-owned memory are complete before the blocks are recycled.
+            # Without synchronise(), large chunks (>5000 frames) can trigger
+            # CUDA_ERROR_ILLEGAL_ADDRESS when the next chunk's cp.asarray
+            # receives a block still being written by an in-flight kernel.
+            cp.cuda.Device().synchronize()
             cp.get_default_memory_pool().free_all_blocks()
             filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) → F-order slice
             mean_acc += result_np.sum(axis=2)   # bsz is axis 2
