@@ -30,7 +30,8 @@ def main():
     cn_path   = Path(sys.argv[2])
 
     print(f"Loading estimates: {hdf5_path}")
-    cnm = caiman.source_extraction.cnmf.load_CNMF(str(hdf5_path))
+    from caiman.source_extraction.cnmf.cnmf import load_CNMF
+    cnm = load_CNMF(str(hdf5_path))
 
     print(f"Loading Cn:        {cn_path}")
     Cn = np.load(str(cn_path))
