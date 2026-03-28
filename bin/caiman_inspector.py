@@ -480,6 +480,15 @@ def _active_pearson_corr(C: np.ndarray,
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
 def load_from_hdf5(path: str) -> ComponentStore:
+    import os as _os
+    # Ensure CAIMAN_TEMP is set to a writable directory before load_CNMF
+    # calls fn_relocated.  If the current value is missing or unwritable,
+    # fall back to the directory that contains the HDF5 file.
+    _ct = _os.environ.get("CAIMAN_TEMP", "")
+    if not (_ct and _os.path.isdir(_ct) and _os.access(_ct, _os.W_OK)):
+        _fallback = _os.path.abspath(_os.path.dirname(path)) or "."
+        _os.environ["CAIMAN_TEMP"] = _fallback
+
     from caiman.source_extraction.cnmf.cnmf import load_CNMF
     cnm  = load_CNMF(path)
     est  = cnm.estimates
