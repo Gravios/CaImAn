@@ -212,6 +212,7 @@ class MotionCorrect(object):
             logger.warning("cuda is no longer supported; this kwarg will be removed in a future version of caiman")
         # use_gpu=None means auto-detect: use GPU if CuPy + CUDA available
         self.use_gpu = gpu_available() if use_gpu is None else bool(use_gpu)
+        self.gpu_batch_size = None  # set externally; None = auto-detect from VRAM
 
     def __str__(self):
         ret = f"Caiman MotionCorrect Object. Subfields:{list(self.__dict__.keys())}"
@@ -325,7 +326,8 @@ class MotionCorrect(object):
                 is3D=self.is3D,
                 indices=self.indices,
                 shifts_interpolate=self.shifts_interpolate,
-                use_gpu=self.use_gpu)
+                use_gpu=self.use_gpu,
+                gpu_batch_size=getattr(self, 'gpu_batch_size', None))
             if template is None:
                 self.total_template_rig = _total_template_rig
 
@@ -2780,7 +2782,8 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
                                template=None, shifts_opencv=False, save_movie_rigid=False, add_to_movie=None,
                                nonneg_movie=False, gSig_filt=None, subidx=slice(None, None, 1), use_cuda=False,
                                border_nan=True, var_name_hdf5='mov', is3D=False, indices=(slice(None), slice(None)),
-                               shifts_interpolate=False, use_gpu=None):
+                               shifts_interpolate=False, use_gpu=None,
+                               gpu_batch_size=None):
     """
     Function that perform memory efficient hyper parallelized rigid motion corrections while also saving a memory mappable file
 
@@ -2900,7 +2903,8 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
                                                              dview=dview, save_movie=save_movie, base_name=base_name, subidx = subidx,
                                                              num_splits=num_splits_to_process, shifts_opencv=shifts_opencv, nonneg_movie=nonneg_movie, gSig_filt=gSig_filt,
                                                              use_cuda=use_cuda, border_nan=border_nan, var_name_hdf5=var_name_hdf5, is3D=is3D,
-                                                             indices=indices, shifts_interpolate=shifts_interpolate, use_gpu=use_gpu)
+                                                             indices=indices, shifts_interpolate=shifts_interpolate, use_gpu=use_gpu,
+                                                             gpu_batch_size=gpu_batch_size)
         if is3D:
             new_templ = np.nanmedian(np.stack([r[-1] for r in res_rig]), 0)           
         else:
@@ -3153,7 +3157,8 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
                                 base_name=None, subidx = None, num_splits=None, shifts_opencv=False, nonneg_movie=False, gSig_filt=None,
                                 use_cuda=False, border_nan=True, var_name_hdf5='mov', is3D=False,
                                 indices=(slice(None), slice(None)), shifts_interpolate=False,
-                                use_shared_memory=True, use_gpu=None):
+                                use_shared_memory=True, use_gpu=None,
+                                gpu_batch_size=None):
     """
     Parameters
     ----------
@@ -3252,6 +3257,7 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
                 shifts_opencv=shifts_opencv,
                 shifts_interpolate=shifts_interpolate,
                 var_name_hdf5=var_name_hdf5,
+                gpu_batch_size=gpu_batch_size,
             )
         except Exception as _par_exc:
             logger.warning(
@@ -3277,6 +3283,7 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
                 shifts_opencv=shifts_opencv,
                 shifts_interpolate=shifts_interpolate,
                 var_name_hdf5=var_name_hdf5,
+                gpu_batch_size=gpu_batch_size,
             )
         return fname_tot, res
 

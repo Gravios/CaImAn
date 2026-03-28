@@ -612,7 +612,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             patch_indices = sorted(patch_indices, key=_patch_cost, reverse=True)
         patch_args = []
         for i in patch_indices:
-            fn, id_f, id_2d, p = args_in[i]
+            fn, id_f, id_2d, p, _ = args_in[i]  # _cost not needed here
             x0, x1, y0, y1 = patch_boxes[i]
             lx0, lx1 = x0 - tx0, x1 - tx0
             ly0, ly1 = y0 - ty0, y1 - ty0
@@ -1161,10 +1161,17 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
             )
             file_name_or_handle = file_name
 
+    # Baseline precomp dict always carrying full-FOV dims so tile workers
+    # can reconstruct dims even when precompute failed (_precomp_result=None).
+    _baseline_precomp = {'d1': dims[0], 'd2': dims[1], 'T': T}
+
     args_in = []
     patch_centers = []
     for id_f, id_2d in zip(idx_flat, idx_2d):
         _p = deepcopy(params_copy)
+        # Always seed precomp with d1/d2/T so tile workers never fall back
+        # to shapes (id_2d) when deriving full-FOV dims.
+        _p.init['precomp'] = dict(_baseline_precomp)
         if _precomp_result is not None:
             # Derive bounding box from idx_flat (sorted F-order pixel indices).
             # extract_patch_coordinates returns shapes (not meshgrid) as idx_2d.

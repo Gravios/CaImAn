@@ -80,8 +80,14 @@ def _require_gpu(fn_name: str) -> None:
 
 # ── VRAM auto-sizing ─────────────────────────────────────────────────────────
 
-def _auto_batch_size(frame_shape: tuple, vram_fraction: float = 0.40) -> int:
-    """Largest batch that fits in *vram_fraction* of free VRAM."""
+def _auto_batch_size(frame_shape: tuple, vram_fraction: float = 0.85) -> int:
+    """Largest batch that fits in *vram_fraction* of free VRAM.
+
+    The cap was previously 2000 frames (calibrated for 16 GB GPUs).
+    On large-VRAM cards (≥48 GB) this is far too conservative — at
+    7 MB/frame, 96 GB × 0.85 → ~11900 frames, reducing PCIe round-trips
+    from 14 to 3 for a 27720-frame session on the RTX 6000 Pro.
+    """
     if not _CUPY_AVAILABLE:
         return 256
     try:
@@ -89,7 +95,7 @@ def _auto_batch_size(frame_shape: tuple, vram_fraction: float = 0.40) -> int:
         usable = int(free * vram_fraction)
         # 3 complex64 buffers (src, products, cross_corr) + 1 float32 output
         bytes_per_frame = int(np.prod(frame_shape)) * (8 * 3 + 4)
-        return max(32, min(usable // bytes_per_frame, 2000))
+        return max(32, min(usable // bytes_per_frame, 32768))
     except Exception:
         return 256
 

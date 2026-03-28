@@ -179,6 +179,11 @@ if __name__ == "__main__":
         mc = MotionCorrect(fnames, dview=None, use_gpu=True, nonneg_movie=True,
                            **{k: v for k, v in _P.motion_correction.items()
                               if not k.startswith("_")})
+        # Pass GPU batch size from JSON gpu section (None = auto from VRAM)
+        mc.gpu_batch_size = (
+            int(getattr(getattr(_P, "gpu", None), "mc_batch_size", None) or 0)
+            or None
+        )
 
         @timer.step("Motion correction")
         def run_mc():
