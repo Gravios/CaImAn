@@ -894,18 +894,23 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self._img.setLevels((vmin, vmax))
         self._cbar.setLevels((vmin, vmax))
 
-        # Highlight pair
+        # Highlight pair.
+        # Each pixel [row, col] is placed at corner (col, row) by ImageItem
+        # and spans to (col+1, row+1), so its centre is at (col+0.5, row+0.5).
+        # All highlight coordinates are offset by +0.5 accordingly.
         if self._highlight:
             hi, hj = self._highlight
             for item in self._hl_items:
                 self.vb.removeItem(item)
             self._hl_items = []
+            K = mat.shape[0]
             for band, col in [(hi, CORR_A), (hj, CORR_B)]:
+                c = band + 0.5   # centre of the band-th row/col
                 lh = pg.PlotDataItem(
-                    [0, mat.shape[1]], [band, band],
+                    [-0.5, K + 0.5], [c, c],
                     pen=pg.mkPen(col, width=1.5))
                 lv = pg.PlotDataItem(
-                    [band, band], [0, mat.shape[0]],
+                    [c, c], [-0.5, K + 0.5],
                     pen=pg.mkPen(col, width=1.5))
                 for li in (lh, lv):
                     li.setZValue(2)
@@ -913,8 +918,8 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
                     self._hl_items.append(li)
             for (ri, ci_), col in [((hi, hj), CORR_A), ((hj, hi), CORR_B)]:
                 box = pg.PlotDataItem(
-                    [ci_ - 0.5, ci_ + 0.5, ci_ + 0.5, ci_ - 0.5, ci_ - 0.5],
-                    [ri  - 0.5, ri  - 0.5, ri  + 0.5, ri  + 0.5, ri  - 0.5],
+                    [ci_, ci_ + 1, ci_ + 1, ci_, ci_],
+                    [ri,  ri,      ri  + 1, ri + 1, ri],
                     pen=pg.mkPen(col, width=2))
                 box.setZValue(3)
                 self.vb.addItem(box)
