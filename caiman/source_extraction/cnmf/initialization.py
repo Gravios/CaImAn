@@ -2863,12 +2863,25 @@ def precompute_corr_pnr_filtered_fov(
     # through Pass 2.  This eliminates 2 PCIe round-trips (54 GB) at the cost
     # of holding 27 GB of filtered data in VRAM during the accumulation loop.
     _filt_bytes_f32   = d1 * d2 * T * 4  # filtered movie float32
-    _VRAM_HEADROOM    = 2.2  # peak = input (27 GB) + output (27 GB); ×1.1 margin
+    # Peak VRAM during filter depends on background_filter type:
+    #   None (gaussian only): input + output = 2×
+    #   disk / gaussian_bg:   input + gb + bx + result = 4×
+    # We must hold the movie + all intermediates simultaneously.
+    # Peak VRAM: ndimage separable convolution uses internal workspace per axis.
+    # Disk / gaussian-bg filter peaks at ~6 buffers:
+    #   batch + gaussian_workspace + gb + uniform_workspace + bx + result
+    # Simple gaussian (no background subtraction): batch + workspace + result = 3 buffers
+    _n_filter_bufs    = 3 if background_filter is None else 6
+    _VRAM_HEADROOM    = _n_filter_bufs * 1.1  # peak × 10% safety margin
     _VRAM_RESIDENT_OK = 1.1  # just holding the result after freeing input
     _vram_resident  = False
     _filt_gpu_held  = None              # set if GPU-resident path taken
     if chunk_frames >= T:
         try:
+            # Flush pool before measuring so CUDA driver sees freed blocks.
+            # Pool-retained free blocks still count as "allocated" to the driver,
+            # causing the auto-chunk to over-estimate available VRAM.
+            cp.get_default_memory_pool().free_all_blocks()
             _free_vram, _ = cp.cuda.runtime.memGetInfo()
             # Peak VRAM during filter: movie (27 GB) + filtered result (27 GB)
             # must both fit simultaneously. GPU-resident path then holds the
@@ -2887,8 +2900,8 @@ def precompute_corr_pnr_filtered_fov(
             elif _free_vram < _filt_bytes_f32:
                 # Not enough even for one chunk — split into smaller chunks
                 # to avoid OOM. Compute safe chunk size from free VRAM.
-                _bytes_per_frame = d1 * d2 * 4 * 2  # input + output
-                chunk_frames = max(256, int(_free_vram * 0.8 / _bytes_per_frame))
+                _bytes_per_frame = d1 * d2 * 4 * _n_filter_bufs  # varies by filter type
+                chunk_frames = max(256, int(_free_vram * 0.6 / _bytes_per_frame))
                 logger.warning(
                     f'precompute_corr_pnr_filtered_fov: insufficient VRAM '
                     f'({_free_vram/2**30:.1f} GB free) for single-chunk pass — '
