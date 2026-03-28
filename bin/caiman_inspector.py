@@ -852,7 +852,8 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self.vb = self.addViewBox(row=0, col=0)
         self.vb.invertY(True)            # row 0 at top (matrix convention)
         self.vb.setAspectLocked(True)
-        self.vb.setMouseEnabled(x=False, y=False)
+        self.vb.setMouseEnabled(x=True, y=True)
+        self.vb.setMenuEnabled(True)    # right-click → "View All" reset zoom
 
         self._img = pg.ImageItem()
         self.vb.addItem(self._img)
@@ -925,7 +926,11 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         tks  = list(range(0, n, step))
 
     def _on_scene_click(self, event):
+        # Require Ctrl+Left-click for pair selection so plain left-drag
+        # is free for panning (handled by ViewBox natively).
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             return
         pt = self.vb.mapSceneToView(event.scenePos())
         j  = int(round(pt.x()))
