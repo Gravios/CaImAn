@@ -943,8 +943,8 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             return
         pt = self.vb.mapSceneToView(event.scenePos())
-        j  = int(round(pt.x()))
-        i  = int(round(pt.y()))
+        j  = int(pt.x())   # floor: pixel [r,c] occupies [c, c+1)
+        i  = int(pt.y())   # floor: pixel [r,c] occupies [r, r+1)
         n  = self.store.n
         if 0 <= i < n and 0 <= j < n and i != j:
             self._highlight = (i, j)
@@ -1337,6 +1337,14 @@ class InspectorWindow(QMainWindow):
             self.act_merge.setEnabled(n >= 2)
             self.act_delete.setEnabled(n >= 1)
             self._sel_lbl.setText(f"  {n} selected  |  {self.store.n} total")
+            # Update matrix highlights from table selection:
+            # exactly 2 selected → highlight that pair; anything else → clear.
+            if n == 2:
+                self.corr_view.highlight_pair(sel[0], sel[1])
+                self.dist_view.highlight_pair(sel[0], sel[1])
+            else:
+                self.corr_view.refresh()
+                self.dist_view.refresh()
         finally:
             self._in_table_sel = False
 
