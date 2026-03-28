@@ -659,9 +659,10 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     total        = sum(len(v) for _, v in sorted_tiles)
 
     n             = len(sorted_tiles)
-    _slot_meta    = [None] * _n_slots
-    _slot_err     = [None] * _n_slots
-    _slot_count   = [0]    * _n_slots
+    _slot_meta     = [None] * _n_slots
+    _slot_err      = [None] * _n_slots
+    _slot_count    = [0]    * _n_slots
+    _slot_tile_idx = [-1]   * _n_slots  # which tile index is loaded in each slot
     _next_load    = [0]     # next tile index to load into SHM
     _next_submit  = [0]     # next tile index to submit to pool
     _load_threads = {}      # k_tile → Thread
@@ -670,11 +671,17 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         tid, pidx = sorted_tiles[k_tile]
         try:
             _slot_meta[slot] = _write_tile(tid, pidx, slot)
+            _slot_tile_idx[slot] = k_tile  # record which tile is now in this slot
         except Exception as e:
             _slot_err[slot] = e
 
     def _try_submit(slot):
-        """Submit the next pending tile into `slot` if it is ready. Must hold _lock."""
+        """Submit the next pending tile into `slot` if it is ready. Must hold _lock.
+
+        Guards against the bootstrap race: threads loading tiles 1..N-1 may call
+        _try_submit in any order, so the slot may contain a different tile than
+        _next_submit expects.  We verify the match before submitting.
+        """
         k = _next_submit[0]
         if k >= n:
             return
@@ -684,6 +691,19 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             _errors.append(RuntimeError(f"tile load failed: {_slot_err[slot]}"))
             _done_event.set()
             return
+        # Guard: slot must contain exactly tile k.
+        # With N>2 slots the bootstrap starts N-1 background threads; they
+        # can finish in any order, so slot s may hold tile s+delta, not tile k.
+        if _slot_tile_idx[slot] != k:
+            # This slot has a different tile — scan all slots for one with tile k.
+            for _scan_s in range(_n_slots):
+                if (_slot_tile_idx[_scan_s] == k
+                        and _slot_meta[_scan_s] is not None
+                        and _slot_err[_scan_s] is None):
+                    # Found the correct slot — submit from there recursively.
+                    _try_submit(_scan_s)
+                    return
+            return  # tile k not loaded in any slot yet — will retry when it arrives
         _, pidx = sorted_tiles[k]
         patch_args = _build_patch_args(pidx, *_slot_meta[slot])
         _slot_count[slot] = len(patch_args)
