@@ -1062,7 +1062,24 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                         break
             if _pers_path is None:
                 _pers_path = os.path.join(_get_td(), _fname_filt)  # fallback
+            # Invalidate stale cache: if the source movie is newer than
+            # the filt_full, the cache was computed from a different MC run.
             if os.path.exists(_pers_path):
+                try:
+                    _src_mtime  = os.path.getmtime(file_name)
+                    _filt_mtime = os.path.getmtime(_pers_path)
+                    if _src_mtime > _filt_mtime:
+                        logger.warning(
+                            f'run_CNMF_patches: precomp cache '
+                            f'({_pers_path}) is older than source movie '
+                            f'— cache invalidated, will recompute')
+                        os.unlink(_pers_path)
+                        _npz = os.path.splitext(_pers_path)[0] + '_meta.npz'
+                        if os.path.exists(_npz): os.unlink(_npz)
+                        _pers_path = None
+                except Exception:
+                    pass  # if mtime check fails, proceed with cache as-is
+            if _pers_path is not None and os.path.exists(_pers_path):
                 logger.info(
                     f'run_CNMF_patches: reusing persistent precomp '
                     f'({_pers_path})')
