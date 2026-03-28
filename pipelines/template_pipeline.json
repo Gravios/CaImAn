@@ -13,7 +13,8 @@
         "MPLBACKEND": "Agg",
         "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
         "CUPY_ACCELERATORS": "",
-        "KERAS_BACKEND": "numpy"
+        "KERAS_BACKEND": "numpy",
+        "CAIMAN_TILE_N": "4"
     },
     "session": {
         "_comment": "session_id is intentionally absent \u2014 it is the script filename stem minus _pipeline. Only structural paths live here.",
