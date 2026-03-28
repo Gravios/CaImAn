@@ -369,7 +369,16 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     ys = sorted(set(b[2] for b in patch_boxes))
     stride_x = (xs[1] - xs[0]) if len(xs) > 1 else (patch_boxes[0][1] - patch_boxes[0][0])
     stride_y = (ys[1] - ys[0]) if len(ys) > 1 else (patch_boxes[0][3] - patch_boxes[0][2])
-    tile_n   = 3
+    # Patches per tile row/column. tile_n=3 → 3×3=9 patches/tile.
+    # Increase to keep workers busier per tile and reduce idle time between tiles.
+    # Rule of thumb: tile_n = ceil(n_workers / n_tiles_total) per axis.
+    # Exposed via CAIMAN_TILE_N env var or cluster.tile_n JSON key.
+    tile_n = int(
+        _os_td.environ.get('CAIMAN_TILE_N')
+        or (params.get('patch', 'tile_n') if hasattr(params, 'patch')
+            and 'tile_n' in getattr(params, 'patch', {}) else None)
+        or 3
+    )
     tile_dx  = tile_n * stride_x
     tile_dy  = tile_n * stride_y
 
