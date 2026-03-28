@@ -612,7 +612,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             patch_indices = sorted(patch_indices, key=_patch_cost, reverse=True)
         patch_args = []
         for i in patch_indices:
-            fn, id_f, id_2d, p, _ = args_in[i]  # _cost not needed here
+            fn, id_f, id_2d, p = args_in[i]
             x0, x1, y0, y1 = patch_boxes[i]
             lx0, lx1 = x0 - tx0, x1 - tx0
             ly0, ly1 = y0 - ty0, y1 - ty0
