@@ -1186,10 +1186,10 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
     patch_centers = []
     for id_f, id_2d in zip(idx_flat, idx_2d):
         _p = deepcopy(params_copy)
-        # Always seed precomp with d1/d2/T so tile workers never fall back
-        # to shapes (id_2d) when deriving full-FOV dims.
-        _p.init['precomp'] = dict(_baseline_precomp)
         if _precomp_result is not None:
+            # Seed precomp with d1/d2/T so tile workers always have full-FOV
+            # dims even when their patch dict is further modified below.
+            _p.init['precomp'] = dict(_baseline_precomp)
             # Derive bounding box from idx_flat (sorted F-order pixel indices).
             # extract_patch_coordinates returns shapes (not meshgrid) as idx_2d.
             # F-order: pixel p → row = p % d1, col = p // d1

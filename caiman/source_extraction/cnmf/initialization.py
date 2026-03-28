@@ -2868,15 +2868,29 @@ def precompute_corr_pnr_filtered_fov(
     if chunk_frames >= T:
         try:
             _free_vram, _ = cp.cuda.runtime.memGetInfo()
-            # Need filt_f32 (27 GB) to stay after freeing movie (27 GB).
-            # Check free > 1.1× filt_f32 to leave headroom for Cn accum.
-            if _free_vram >= int(_filt_bytes_f32 * 1.1):
+            # Peak VRAM during filter: movie (27 GB) + filtered result (27 GB)
+            # must both fit simultaneously. GPU-resident path then holds the
+            # filtered result through Pass 2 (movie freed after filter).
+            # Require: free >= 2.2× movie to cover peak + 10% headroom.
+            _peak_needed = int(_filt_bytes_f32 * 2.2)  # input + output + margin
+            _resident_needed = int(_filt_bytes_f32 * 1.1)  # just hold result
+            if _free_vram >= _peak_needed:
                 _vram_resident = True
                 logger.info(
                     f'precompute_corr_pnr_filtered_fov: GPU-resident path '
                     f'(free={_free_vram/2**30:.1f} GB ≥ '
-                    f'{_filt_bytes_f32*1.1/2**30:.1f} GB needed) — '
+                    f'{_peak_needed/2**30:.1f} GB peak needed) — '
                     f'skipping intermediate D2H/H2D round-trips'
+                )
+            elif _free_vram < _filt_bytes_f32:
+                # Not enough even for one chunk — split into smaller chunks
+                # to avoid OOM. Compute safe chunk size from free VRAM.
+                _bytes_per_frame = d1 * d2 * 4 * 2  # input + output
+                chunk_frames = max(256, int(_free_vram * 0.8 / _bytes_per_frame))
+                logger.warning(
+                    f'precompute_corr_pnr_filtered_fov: insufficient VRAM '
+                    f'({_free_vram/2**30:.1f} GB free) for single-chunk pass — '
+                    f'chunking at {chunk_frames} frames'
                 )
         except Exception:
             pass
