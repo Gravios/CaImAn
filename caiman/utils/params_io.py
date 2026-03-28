@@ -303,7 +303,10 @@ def build_cnmf_opts(
         "rolling_sum"    : getattr(c, "rolling_sum",  True),
         "ssub_B"         : getattr(c, "ssub_B",       2),
         # precompute_chunk_frames: read from cnmf or gpu JSON section (see _pcf above).
-        **({"precompute_chunk_frames": int(_pcf)} if _pcf is not None else {}),    })
+        # Always forward: None/absent → 0 → map_reduce.py sees 0 → `0 or T` = T.
+        # Without this, CNMFParams default (500) is returned and `500 or T` = 500.
+        **{"precompute_chunk_frames": int(_pcf) if _pcf is not None else 0},
+    })
 
     opts.set("preprocess", {
         "p"          : 0,       # p=0 during initial fit; set to c.p at refit
