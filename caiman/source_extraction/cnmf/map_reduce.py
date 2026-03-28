@@ -831,6 +831,10 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                     pass  # process gone
             _n_expected = pool._processes
             _pending = total - len(file_res)
+            try:
+                _shm_info = " " + _shm_usage_str()
+            except Exception:
+                _shm_info = ""
             if _pending > 0 and len(_alive) >= _n_expected:
                 # All workers alive but slow — heartbeat so user sees progress
                 logger.info(
@@ -839,11 +843,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                     f"{len(_alive)} workers alive{_shm_info}")
             if len(_alive) < _n_expected and len(file_res) < total:
                 _dead = _n_expected - len(_alive)
-                try:
-                    import shutil as _shu_wd
-                    _shm_info = " " + _shm_usage_str()
-                except Exception:
-                    _shm_info = ""
+                # _shm_info already computed above
                 _msg = (f"TileDispatcher watchdog: {_dead} of {_n_expected} "
                         f"workers died (OOM-kill?). "
                         f"Completed {len(file_res)}/{total} patches.{_shm_info} "
