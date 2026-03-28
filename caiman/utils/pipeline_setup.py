@@ -151,8 +151,7 @@ def _strip_pipeline_suffix(stem: str) -> str:
     and any other capitalisation.  Returns *stem* unchanged if no marker
     is found.
     """
-    import re as _re
-    return _re.sub(r'[._][Pp]ipeline$', '', stem)
+    return re.sub(r'[._][Pp]ipeline$', '', stem)
 
 
 def _find_script_path() -> Path:

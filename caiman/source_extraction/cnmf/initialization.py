@@ -2779,7 +2779,7 @@ def precompute_corr_pnr_filtered_fov(
         try:
             import shutil as _shutil_flt
             _shm_free = _shutil_flt.disk_usage(_shm_dir).free
-            if _shm_free >= _filt_full_bytes * 1.1:
+            if _shm_free >= _filt_full_bytes * 1.1:  # noqa: keep literal (different context)
                 _shm_ok = True
             else:
                 logger.warning(
@@ -2862,7 +2862,9 @@ def precompute_corr_pnr_filtered_fov(
     # intermediate D2H write of filt_full and keep the filtered data on-GPU
     # through Pass 2.  This eliminates 2 PCIe round-trips (54 GB) at the cost
     # of holding 27 GB of filtered data in VRAM during the accumulation loop.
-    _filt_bytes_f32 = d1 * d2 * T * 4  # filtered movie float32
+    _filt_bytes_f32   = d1 * d2 * T * 4  # filtered movie float32
+    _VRAM_HEADROOM    = 2.2  # peak = input (27 GB) + output (27 GB); ×1.1 margin
+    _VRAM_RESIDENT_OK = 1.1  # just holding the result after freeing input
     _vram_resident  = False
     _filt_gpu_held  = None              # set if GPU-resident path taken
     if chunk_frames >= T:
@@ -2872,8 +2874,8 @@ def precompute_corr_pnr_filtered_fov(
             # must both fit simultaneously. GPU-resident path then holds the
             # filtered result through Pass 2 (movie freed after filter).
             # Require: free >= 2.2× movie to cover peak + 10% headroom.
-            _peak_needed = int(_filt_bytes_f32 * 2.2)  # input + output + margin
-            _resident_needed = int(_filt_bytes_f32 * 1.1)  # just hold result
+            _peak_needed = int(_filt_bytes_f32 * _VRAM_HEADROOM)  # input + output + margin
+            _resident_needed = int(_filt_bytes_f32 * _VRAM_RESIDENT_OK)  # just hold result
             if _free_vram >= _peak_needed:
                 _vram_resident = True
                 logger.info(
@@ -2892,8 +2894,9 @@ def precompute_corr_pnr_filtered_fov(
                     f'({_free_vram/2**30:.1f} GB free) for single-chunk pass — '
                     f'chunking at {chunk_frames} frames'
                 )
-        except Exception:
-            pass
+        except Exception as _vram_exc:
+            logger.debug(f'precompute_corr_pnr_filtered_fov: VRAM check failed '
+                         f'({_vram_exc}) — proceeding without GPU-resident path')
 
     logger.info(f'precompute_corr_pnr_filtered_fov: filtering {T} frames '
                 f'({d1}×{d2}) on GPU in chunks of {chunk_frames}')
@@ -2935,13 +2938,10 @@ def precompute_corr_pnr_filtered_fov(
             cp.cuda.Device().synchronize()
             if _vram_resident:
                 # GPU-resident path: keep filtered data on GPU — no D2H.
-                # Accumulate mean on GPU side; store filt slice for Pass 2.
-                mean_acc += cp.asnumpy(result_gpu).sum(axis=2)
-                if _filt_gpu_held is None:
-                    _filt_gpu_held = result_gpu  # single chunk = whole movie
-                else:
-                    _filt_gpu_held = cp.concatenate(
-                        [_filt_gpu_held, result_gpu], axis=2)
+                # chunk_frames >= T guarantees the loop runs exactly once.
+                # Accumulate mean on GPU (result.sum stays on device) — no D2H.
+                mean_acc += cp.asnumpy(result_gpu.sum(axis=2))  # (d1,d2) = 1 MB D2H
+                _filt_gpu_held = result_gpu
                 del result_gpu
             else:
                 # Standard path: D2H, write float16 to /dev/shm.
@@ -3015,9 +3015,10 @@ def precompute_corr_pnr_filtered_fov(
             chunk_gpu = _filt_gpu_held[:, :, t0:t1] - mean_gpu[:, :, cp.newaxis]
         else:
             # Standard: H2D from /dev/shm filt_full.
+            # H2D float16 slice then cast on GPU: 13.5 GB H2D vs 27 GB if cast on CPU first
             chunk_gpu = cp.asarray(
-                filt_full[:, :, t0:t1].astype(np.float32)
-            ) - mean_gpu[:, :, cp.newaxis]
+                filt_full[:, :, t0:t1]          # float16: 13.5 GB H2D
+            ).astype(cp.float32) - mean_gpu[:, :, cp.newaxis]  # cast on GPU
         # All stats computed on GPU — zero D2H until end of loop
         Y2_acc_gpu   += (chunk_gpu ** 2).sum(axis=2)
         cp.maximum(dmax_acc_gpu, chunk_gpu.max(axis=2), out=dmax_acc_gpu)
@@ -3081,9 +3082,9 @@ def precompute_corr_pnr_filtered_fov(
         # cn[x,y] = sum_k[ cov(Y_xy, Y_k) / (std_xy * std_k) ] / n_neighbors
         # = YYc[x,y] / (sqrt(Y2_xy) * sqrt(Y2_neighbors_sum / MASK) * T)
         # Using Y2_neighbor (spatial sum of Y2_acc) as the neighbor variance.
-        _sz3_flat = cp.ones((3,3,1), dtype=cp.float32); _sz3_flat[1,1,0] = 0
+        # Reuse _sz3 kernel (same 3×3 neighbour mask, built in Pass 1)
         _Y2_gpu      = cp.asarray(Y2_acc)
-        _Y2_neigh    = _cpnd.convolve(_Y2_gpu[:,:,cp.newaxis], _sz3_flat,
+        _Y2_neigh    = _cpnd.convolve(_Y2_gpu[:,:,cp.newaxis], _sz3,
                                        mode='constant').squeeze()
         _denom       = cp.sqrt(_Y2_gpu * _Y2_neigh / cp.maximum(_MASK_gpu, 1)) * T
         _denom       = cp.where(_denom == 0, cp.inf, _denom)

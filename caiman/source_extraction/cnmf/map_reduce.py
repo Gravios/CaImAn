@@ -665,7 +665,6 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     _slot_tile_idx = [-1]   * _n_slots  # which tile index is loaded in each slot
     _next_load    = [0]     # next tile index to load into SHM
     _next_submit  = [0]     # next tile index to submit to pool
-    _load_threads = {}      # k_tile → Thread
 
     def _load_slot(k_tile, slot):
         tid, pidx = sorted_tiles[k_tile]
@@ -695,15 +694,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
         # With N>2 slots the bootstrap starts N-1 background threads; they
         # can finish in any order, so slot s may hold tile s+delta, not tile k.
         if _slot_tile_idx[slot] != k:
-            # This slot has a different tile — scan all slots for one with tile k.
-            for _scan_s in range(_n_slots):
-                if (_slot_tile_idx[_scan_s] == k
-                        and _slot_meta[_scan_s] is not None
-                        and _slot_err[_scan_s] is None):
-                    # Found the correct slot — submit from there recursively.
-                    _try_submit(_scan_s)
-                    return
-            return  # tile k not loaded in any slot yet — will retry when it arrives
+            return  # slot has a different tile; forward-chain handles ordering
         _, pidx = sorted_tiles[k]
         patch_args = _build_patch_args(pidx, *_slot_meta[slot])
         _slot_count[slot] = len(patch_args)
@@ -714,6 +705,15 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             pool.apply_async(cnmf_patches, (pa,),
                              callback=lambda r, s=slot: _on_result(r, s),
                              error_callback=lambda e, s=slot: _on_error(e, s))
+        # After submitting tile k, immediately submit any subsequent tiles
+        # that are already loaded into other slots (bootstrap race: threads
+        # may have loaded tiles k+1..k+N before tile k was submitted).
+        for _fwd_s in range(_n_slots):
+            if (_slot_tile_idx[_fwd_s] == _next_submit[0]
+                    and _slot_meta[_fwd_s] is not None
+                    and _slot_err[_fwd_s] is None):
+                _try_submit(_fwd_s)
+                break
 
     def _on_result(result, slot):
         """Fires in pool result-handler thread when a worker completes."""
@@ -732,7 +732,6 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                         _next_load[0] += 1
                         t = _thr.Thread(target=_load_and_submit,
                                         args=(nk, slot), daemon=True)
-                        _load_threads[nk] = t
                         _start_load_thread = t   # start after releasing lock
                     elif _next_submit[0] >= n and len(file_res) >= total:
                         _done_event.set()
@@ -799,7 +798,6 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
             if n > _s:
                 _next_load[0] = _s + 1
                 _bgt = _thr.Thread(target=_load_and_submit, args=(_s, _s), daemon=True)
-                _load_threads[_s] = _bgt
                 _bgt.start()
 
     # Guard: if no patches at all, unblock immediately
@@ -810,7 +808,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     # Watchdog: if a worker is OOM-killed its result never arrives and
     # _done_event never fires. Poll every 60s and check pool worker pids.
     import os as _os_wd
-    _timeout_s = 60    # seconds between liveness checks
+    _timeout_s = 15    # seconds between liveness checks
     while not _done_event.wait(timeout=_timeout_s):
         # Check whether any pool workers have died unexpectedly
         try:
@@ -832,6 +830,13 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                 except (ProcessLookupError, PermissionError):
                     pass  # process gone
             _n_expected = pool._processes
+            _pending = total - len(file_res)
+            if _pending > 0 and len(_alive) >= _n_expected:
+                # All workers alive but slow — heartbeat so user sees progress
+                logger.info(
+                    f"TileDispatcher: waiting for {_pending} patch(es) "
+                    f"({len(file_res)}/{total} done), "
+                    f"{len(_alive)} workers alive{_shm_info}")
             if len(_alive) < _n_expected and len(file_res) < total:
                 _dead = _n_expected - len(_alive)
                 try:
@@ -842,6 +847,7 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
                 _msg = (f"TileDispatcher watchdog: {_dead} of {_n_expected} "
                         f"workers died (OOM-kill?). "
                         f"Completed {len(file_res)}/{total} patches.{_shm_info} "
+                        f"Pending: {total-len(file_res)} patches. "
                         f"Reduce n_processes (currently {_n_expected}) "
                         f"or free RAM before running.")
                 logger.error(_msg)

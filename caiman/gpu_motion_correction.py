@@ -84,17 +84,22 @@ def _auto_batch_size(frame_shape: tuple, vram_fraction: float = 0.85) -> int:
     """Largest batch that fits in *vram_fraction* of free VRAM.
 
     The cap was previously 2000 frames (calibrated for 16 GB GPUs).
-    On large-VRAM cards (≥48 GB) this is far too conservative — at
-    7 MB/frame, 96 GB × 0.85 → ~11900 frames, reducing PCIe round-trips
-    from 14 to 3 for a 27720-frame session on the RTX 6000 Pro.
+    After removing redundant astype copies, peak VRAM is 24 bytes/pixel
+    (down from 28).  At 96 GB × 0.85 / 6 MB/frame → ~13900 frames,
+    reducing PCIe round-trips from 14 to 2 for a 27720-frame session.
     """
     if not _CUPY_AVAILABLE:
         return 256
     try:
         free, _ = cp.cuda.runtime.memGetInfo()
         usable = int(free * vram_fraction)
-        # 3 complex64 buffers (src, products, cross_corr) + 1 float32 output
-        bytes_per_frame = int(np.prod(frame_shape)) * (8 * 3 + 4)
+        # After removing redundant astype copies, peak VRAM per frame:
+        #   frames_gpu   float32: 4 bytes
+        #   src_freqs    complex64: 8 bytes  (fft2 output)
+        #   products     complex64: 8 bytes  (freq-domain product)
+        #   corrected    float32: 4 bytes  (ifft2 real output)
+        # Peak simultaneous = 4+8+8+4 = 24 bytes/pixel
+        bytes_per_frame = int(np.prod(frame_shape)) * 24
         return max(32, min(usable // bytes_per_frame, 32768))
     except Exception:
         return 256
@@ -185,14 +190,14 @@ def _batch_register(
     """
     N, H, W = frames_gpu.shape
 
-    src_freqs = cp.fft.fft2(frames_gpu.astype(cp.float32)).astype(cp.complex64)
+    src_freqs = cp.fft.fft2(frames_gpu)  # float32 input → complex64 output, no cast needed
 
     if template_freq.ndim == 2:
         products = src_freqs * cp.conj(template_freq)[None, :, :]
     else:
         products = src_freqs * cp.conj(template_freq)               # per-patch
 
-    cross = cp.fft.ifft2(products).astype(cp.complex64)
+    cross = cp.fft.ifft2(products)       # ifft2 output is already complex64
     mag   = cp.abs(cross)
 
     # Mask out-of-range shifts
@@ -467,7 +472,7 @@ def motion_correction_piecewise_gpu(
         from caiman.motion_correction import high_pass_filter_space
         tmpl_np = high_pass_filter_space(tmpl_np, gSig_filt)
     tmpl_gpu  = cp.asarray(tmpl_np + float(add_to_movie))
-    tmpl_freq = cp.fft.fft2(tmpl_gpu).astype(cp.complex64)
+    tmpl_freq = cp.fft.fft2(tmpl_gpu)
     _grids(H, W)  # warm cache
 
     # ── PW-Rigid: pre-compute template patch FFTs & grid geometry ─────────
@@ -488,7 +493,7 @@ def motion_correction_piecewise_gpu(
         patches_np      = np.stack(patches_list).astype(np.float32)
         patch_shape     = patches_np.shape[1:]
         patch_corners   = np.array(corners_list)                     # (P, 2)
-        tmpl_patch_freq = cp.fft.fft2(cp.asarray(patches_np)).astype(cp.complex64)
+        tmpl_patch_freq = cp.fft.fft2(cp.asarray(patches_np))
         patch_centers_orig = get_patch_centers((H, W), overlaps, strides)
         newstrides_eff  = tuple(
             np.round(np.divide(strides, upsample_factor_grid)).astype(int)
@@ -558,7 +563,7 @@ def motion_correction_piecewise_gpu(
         if rigid_mode:
             # Apply shifts
             if gSig_filt is not None:
-                sf = cp.fft.fft2(frames_gpu.astype(cp.complex64))
+                sf = cp.fft.fft2(frames_gpu)  # float32 input → complex64, no pre-cast needed
                 corrected = _batch_apply_dft(sf, neg_sh, dphase_g, border_nan)
             elif shifts_opencv:
                 corrected = _batch_warp(frames_gpu, neg_sh, border_nan)
@@ -805,7 +810,7 @@ def motion_correction_piecewise_gpu_parallel(
         from caiman.motion_correction import high_pass_filter_space
         tmpl_np = high_pass_filter_space(tmpl_np, gSig_filt)
     tmpl_gpu  = cp.asarray(tmpl_np + float(add_to_movie))
-    tmpl_freq = cp.fft.fft2(tmpl_gpu).astype(cp.complex64)
+    tmpl_freq = cp.fft.fft2(tmpl_gpu)
     _grids(H, W)
 
     # ── PW-Rigid patch geometry ───────────────────────────────────────────
@@ -827,7 +832,7 @@ def motion_correction_piecewise_gpu_parallel(
         patches_np      = np.stack(patches_list).astype(np.float32)
         patch_shape     = patches_np.shape[1:]
         patch_corners   = np.array(corners_list)
-        tmpl_patch_freq = cp.fft.fft2(cp.asarray(patches_np)).astype(cp.complex64)
+        tmpl_patch_freq = cp.fft.fft2(cp.asarray(patches_np))
         patch_centers_orig = get_patch_centers((H, W), overlaps, strides)
         newstrides_eff  = tuple(
             np.round(np.divide(strides, upsample_factor_grid)).astype(int)
@@ -956,7 +961,7 @@ def motion_correction_piecewise_gpu_parallel(
 
         if rigid_mode:
             if gSig_filt is not None:
-                sf        = cp.fft.fft2(frames_gpu.astype(cp.complex64))
+                sf        = cp.fft.fft2(frames_gpu)  # float32→complex64, no pre-cast
                 corrected = _batch_apply_dft(sf, neg_sh, dphase_g, border_nan)
             elif shifts_opencv:
                 corrected = _batch_warp(frames_gpu, neg_sh, border_nan)
