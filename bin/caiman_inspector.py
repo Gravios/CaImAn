@@ -878,6 +878,11 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self._hl_items = []
         self._render()
 
+    def highlight_pair(self, i: int, j: int):
+        """Highlight (i, j) without emitting pair_clicked (avoids signal loop)."""
+        self._highlight = (i, j)
+        self._render()
+
     def _levels(self, mat: np.ndarray):
         raise NotImplementedError
 
@@ -1298,6 +1303,10 @@ class InspectorWindow(QMainWindow):
         root.addWidget(right)
         root.setSizes([1, 5])
 
+        # Link corr and dist ViewBoxes so zoom/pan stays in sync
+        self.corr_view.vb.setXLink(self.dist_view.vb)
+        self.corr_view.vb.setYLink(self.dist_view.vb)
+
         self.setCentralWidget(root)
         self.statusBar().showMessage(f"Loaded {s.n} components")
 
@@ -1367,6 +1376,12 @@ class InspectorWindow(QMainWindow):
         # palette selection colours that _on_table_sel just painted.
         self.cell_view.set_pair((i, j))
         self.table.tint_pair(i, j)
+
+        # Mirror the highlight to both matrices (whichever was clicked
+        # already updated itself via _on_scene_click; this call is
+        # idempotent so calling it twice on the same widget is harmless).
+        self.corr_view.highlight_pair(i, j)
+        self.dist_view.highlight_pair(i, j)
 
         r = self.store.corr[i, j]
         self.statusBar().showMessage(
