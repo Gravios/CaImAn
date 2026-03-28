@@ -2856,6 +2856,31 @@ def precompute_corr_pnr_filtered_fov(
     except Exception as _warm_exc:
         logger.debug(f'cache warm skipped: {_warm_exc}')
 
+    # ── Choose GPU-resident path if VRAM allows ──────────────────────────────
+    # If chunk_frames >= T (single-chunk mode) and free VRAM can hold both the
+    # filtered movie (27 GB float32) AND the movie input (27 GB), we skip the
+    # intermediate D2H write of filt_full and keep the filtered data on-GPU
+    # through Pass 2.  This eliminates 2 PCIe round-trips (54 GB) at the cost
+    # of holding 27 GB of filtered data in VRAM during the accumulation loop.
+    _filt_bytes_f32 = d1 * d2 * T * 4  # filtered movie float32
+    _vram_resident  = False
+    _filt_gpu_held  = None              # set if GPU-resident path taken
+    if chunk_frames >= T:
+        try:
+            _free_vram, _ = cp.cuda.runtime.memGetInfo()
+            # Need filt_f32 (27 GB) to stay after freeing movie (27 GB).
+            # Check free > 1.1× filt_f32 to leave headroom for Cn accum.
+            if _free_vram >= int(_filt_bytes_f32 * 1.1):
+                _vram_resident = True
+                logger.info(
+                    f'precompute_corr_pnr_filtered_fov: GPU-resident path '
+                    f'(free={_free_vram/2**30:.1f} GB ≥ '
+                    f'{_filt_bytes_f32*1.1/2**30:.1f} GB needed) — '
+                    f'skipping intermediate D2H/H2D round-trips'
+                )
+        except Exception:
+            pass
+
     logger.info(f'precompute_corr_pnr_filtered_fov: filtering {T} frames '
                 f'({d1}×{d2}) on GPU in chunks of {chunk_frames}')
     try:
@@ -2893,20 +2918,28 @@ def precompute_corr_pnr_filtered_fov(
                 except Exception:
                     pass
             result_gpu = _apply_filter(batch_gpu);  del batch_gpu
-            result_np  = cp.asnumpy(result_gpu);    del result_gpu
-            # Synchronise before freeing — ensures all GPU kernels writing
-            # to pool-owned memory are complete before the blocks are recycled.
-            # Without synchronise(), large chunks (>5000 frames) can trigger
-            # CUDA_ERROR_ILLEGAL_ADDRESS when the next chunk's cp.asarray
-            # receives a block still being written by an in-flight kernel.
             cp.cuda.Device().synchronize()
-            cp.get_default_memory_pool().free_all_blocks()
-            filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) → F-order slice
-            mean_acc += result_np.sum(axis=2)   # bsz is axis 2
-            del result_np
+            if _vram_resident:
+                # GPU-resident path: keep filtered data on GPU — no D2H.
+                # Accumulate mean on GPU side; store filt slice for Pass 2.
+                mean_acc += cp.asnumpy(result_gpu).sum(axis=2)
+                if _filt_gpu_held is None:
+                    _filt_gpu_held = result_gpu  # single chunk = whole movie
+                else:
+                    _filt_gpu_held = cp.concatenate(
+                        [_filt_gpu_held, result_gpu], axis=2)
+                del result_gpu
+            else:
+                # Standard path: D2H, write float16 to /dev/shm.
+                result_np  = cp.asnumpy(result_gpu);    del result_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                filt_full[:, :, t0:t1] = result_np  # (d1,d2,bsz) → F-order slice
+                mean_acc += result_np.sum(axis=2)   # bsz is axis 2
+                del result_np
             if (t0 // chunk_frames) % 3 == 0:
                 logger.info(f'  filtered {t1}/{T} frames')
-        filt_full.flush()
+        if not _vram_resident:
+            filt_full.flush()
     except Exception as _e:
         logger.warning(f'precompute_corr_pnr_filtered_fov: GPU filter failed '
                        f'({_e}) — workers will filter per-patch')
@@ -2962,25 +2995,28 @@ def precompute_corr_pnr_filtered_fov(
 
     for t0 in range(0, T, chunk_frames):
         t1  = min(t0 + chunk_frames, T)
-        # Read filt_full chunk from DRAM cache — one H2D transfer
-        # filt_full on /dev/shm — pass F-order slice directly to cp.asarray.
-        # np.ascontiguousarray was making a 3 GB C-order CPU copy per chunk
-        # before H2D transfer — completely unnecessary.
-        chunk_gpu = cp.asarray(
-            filt_full[:, :, t0:t1].astype(np.float32)
-        ) - mean_gpu[:, :, cp.newaxis]
+        if _vram_resident and _filt_gpu_held is not None:
+            # GPU-resident: filtered data already on GPU — no H2D needed.
+            # Mean-subtract in-place on the GPU-resident array.
+            chunk_gpu = _filt_gpu_held[:, :, t0:t1] - mean_gpu[:, :, cp.newaxis]
+        else:
+            # Standard: H2D from /dev/shm filt_full.
+            chunk_gpu = cp.asarray(
+                filt_full[:, :, t0:t1].astype(np.float32)
+            ) - mean_gpu[:, :, cp.newaxis]
         # All stats computed on GPU — zero D2H until end of loop
         Y2_acc_gpu   += (chunk_gpu ** 2).sum(axis=2)
         cp.maximum(dmax_acc_gpu, chunk_gpu.max(axis=2), out=dmax_acc_gpu)
         _Yconv   = _cpnd.convolve(chunk_gpu, _sz3, mode='constant')
         YYc_acc += (chunk_gpu * _Yconv).sum(axis=2)
-        # Write mean-subtracted data back to float16 mmap directly from
-        # chunk_gpu (already has mean subtracted). Avoids a separate mmap
-        # read-modify-write cycle and gives clean float16 output.
+        # Write mean-subtracted data to filt_full as float16 for workers.
         _msub = cp.asnumpy(chunk_gpu).astype(np.float16)
         filt_full[:, :, t0:t1] = _msub
         del _msub, chunk_gpu, _Yconv
 
+    if _vram_resident and _filt_gpu_held is not None:
+        del _filt_gpu_held  # release ~27 GB VRAM after final D2H write
+        _filt_gpu_held = None
     filt_full.flush()
     # Validate filt_full after filtering pass — detect zero-data before Y2 loop.
     # Zeros here indicate: (a) CuPy CUDA memory allocation failed silently,
