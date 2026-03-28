@@ -1105,8 +1105,11 @@ def run_CNMF_patches(file_name, shape, params, gnb=1, dview=None,
                     dims              = (dims[0], dims[1], T),
                     gSig              = list(params.get('init', 'gSig')),
                     center_psf        = params.get('init', 'center_psf') or True,
+                    # null / 0 / missing → use all frames in one GPU pass
+                    # (safe when VRAM ≥ 2 × d1 × d2 × T × 4 bytes;
+                    # for 512² × 27720 frames that is 54 GB, fits in 96 GB).
                     chunk_frames      = int(
-                        params.get('init', 'precompute_chunk_frames') or 1000),
+                        params.get('init', 'precompute_chunk_frames') or T),
                     forder_movie_path = params.init.get('forder_movie_path'),
                 )
                 if _precomp_result is not None:
