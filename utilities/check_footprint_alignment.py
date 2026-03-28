@@ -30,8 +30,27 @@ def main():
     cn_path   = Path(sys.argv[2])
 
     print(f"Loading estimates: {hdf5_path}")
-    from caiman.source_extraction.cnmf.cnmf import load_CNMF
-    cnm = load_CNMF(str(hdf5_path))
+    from caiman.utils.utils import load_dict_from_hdf5
+    import types, scipy.sparse
+
+    d = load_dict_from_hdf5(str(hdf5_path))
+
+    # Build a minimal namespace with just what we need
+    cnm = types.SimpleNamespace()
+    cnm.dims = tuple(int(x) for x in d['dims'])
+
+    estimates = types.SimpleNamespace()
+    # A is stored as a sparse matrix dict or dense array
+    A_raw = d['estimates']['A']
+    if isinstance(A_raw, dict) and 'data' in A_raw:
+        estimates.A = scipy.sparse.csc_matrix(
+            (A_raw['data'], A_raw['indices'], A_raw['indptr']),
+            shape=tuple(int(x) for x in A_raw['shape']))
+    elif scipy.sparse.issparse(A_raw):
+        estimates.A = A_raw.tocsc()
+    else:
+        estimates.A = scipy.sparse.csc_matrix(A_raw)
+    cnm.estimates = estimates
 
     print(f"Loading Cn:        {cn_path}")
     Cn = np.load(str(cn_path))
