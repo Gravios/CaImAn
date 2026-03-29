@@ -99,6 +99,7 @@ if __name__ == "__main__":
     from caiman.utils.memory         import malloc_trim, cupy_flush, cupy_register_cleanup
     from caiman.utils.cnmf_runner    import CNMFRunner
     from caiman.utils.qc             import QCRunner
+    from caiman.utils.oscillation    import OscillationAnalyzer
 
     import dill as _dill
     import multiprocessing.reduction as _mpr
@@ -141,6 +142,9 @@ if __name__ == "__main__":
     # directions.  A mechanical phase delay causes a consistent column shift
     # between even and odd rows (the "comb" artefact).  Correct before MC so
     # that registration targets a clean reference frame.
+    # Save original TIFF path so the xcorr QC figure can show before/after
+    fnames_orig = fnames
+
     _xcorr_cfg    = getattr(_P, "xcorr_correction", None)
     _xcorr_enable = bool(getattr(_xcorr_cfg, "enabled", False)) if _xcorr_cfg else False
 
@@ -161,6 +165,16 @@ if __name__ == "__main__":
             logger.info(f"Line-scan correction done: {Path(fnames).name}")
 
         run_xcorr()
+
+        @timer.step("QC: line-scan correction")
+        def qc_xcorr():
+            qc.xcorr_correction(
+                fnames_orig, fnames,
+                max_shift=_xcorr_max_shift,
+                n_frames=_xcorr_n_frames,
+            )
+
+        qc_xcorr()
 
     # mc_stem: stem of the TIFF actually fed into motion correction.
     # When xcorr correction is enabled this is e.g. "session_Xcorrected";
@@ -307,5 +321,51 @@ if __name__ == "__main__":
     if _xcorr_enable:
         _extra["Line-scan X shift"] = (
             f"enabled  (max_shift={_xcorr_max_shift} px)")
+
+    # ── 7. Oscillation analysis ───────────────────────────────────────────
+    _osc_npz = None
+    _osc_cfg = getattr(_P, "oscillation", None)
+    _osc_enable = bool(getattr(_osc_cfg, "enabled", True))
+
+    if _osc_enable:
+        _osc_fs       = float(_P.data.fr)
+        _osc_NW       = float(getattr(_osc_cfg, "NW",       4.0))
+        _osc_win_s    = float(getattr(_osc_cfg, "win_s",    4.0))
+        _osc_overlap  = getattr(_osc_cfg, "overlap_s", None)
+        _osc_overlap  = float(_osc_overlap) if _osc_overlap is not None else None
+        _osc_gpu      = bool(getattr(_osc_cfg, "use_gpu",   True))
+        _osc_adaptive = bool(getattr(_osc_cfg, "adaptive",  True))
+
+        @timer.step("Oscillation analysis")
+        def run_oscillation():
+            global _osc_npz
+            osc = OscillationAnalyzer(
+                cnm2.estimates,
+                fs       = _osc_fs,
+                NW       = _osc_NW,
+                adaptive = _osc_adaptive,
+                use_gpu  = _osc_gpu,
+            )
+            summary = osc.run_all(
+                output_dir = str(outdir),
+                session_id = session,
+                win_s      = _osc_win_s,
+                overlap_s  = _osc_overlap,
+            )
+            _osc_npz = str(outdir / f"{session}_oscillations.npz")
+            logger.info(f"Oscillation analysis done: {_osc_npz}")
+            return summary
+
+        @timer.step("QC: oscillation")
+        def qc_oscillation_step():
+            if _osc_npz:
+                qc.oscillation(_osc_npz)
+
+        run_oscillation()
+        qc_oscillation_step()
+
+    # ── 8. Report ─────────────────────────────────────────────────────────
+    if _osc_enable and _osc_npz:
+        _extra["Oscillation NPZ"] = Path(_osc_npz).name
 
     write_report(timer, session, outdir, logger, extra=_extra)

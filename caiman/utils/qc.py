@@ -37,6 +37,12 @@ qc_traces(cnm2, fr, out_path)
 qc_pnr_image(Cn, pnr, out_path)
     Side-by-side Cn and PNR images for corr_pnr threshold tuning.
 
+qc_xcorr_correction(src_tif, corrected_tif, out_path)
+    Before/after mean frames and column profiles for line-scan phase correction.
+
+qc_oscillation(npz_path, out_path)
+    PSD, spectrogram preview, and band-power summary from the oscillation .npz.
+
 save_all_post_cnmf(cnm2, Cn, fr, out_dir, session)
     Convenience wrapper: calls refit + evaluation + traces in one shot.
 """
@@ -705,6 +711,329 @@ def qc_traces(
     return _save(fig, out_path)
 
 
+
+# -----------------------------------------------------------------------------
+# Step 1b -- Line-scan (raster) phase correction
+# -----------------------------------------------------------------------------
+
+@_guard
+def qc_xcorr_correction(
+    src_tif,
+    corrected_tif,
+    out_path,
+    max_shift: int = 16,
+    n_frames: int = 500,
+) -> Optional[str]:
+    """Save a before/after QC figure for line-scan phase correction.
+
+    Two rows of panels:
+
+    * **Row 0** -- temporal mean frames: raw | corrected | difference
+    * **Row 1** -- column profiles of even rows vs odd rows: before | after |
+      residual odd-minus-even (with RMS annotation)
+
+    The column-profile panels directly show whether the comb artefact has been
+    removed: misaligned even/odd profiles before correction should overlap
+    after correction.  The estimated circular column shift is annotated in
+    the title of the before-profile panel.
+
+    Parameters
+    ----------
+    src_tif
+        Path to the original (uncorrected) TIFF.
+    corrected_tif
+        Path written by
+        :func:`~caiman.utils.xcorr_correction.correct_line_scan`.
+    out_path
+        Output PNG path.
+    max_shift
+        Search range when estimating shift (match the value passed to
+        ``correct_line_scan``).  Default 16.
+    n_frames
+        Maximum frames subsampled for mean projection.  Default 500.
+
+    Returns
+    -------
+    str or None
+        Absolute path of the saved PNG, or ``None`` on failure.
+    """
+    import tifffile
+
+    def _mean_proj(path, n):
+        with tifffile.TiffFile(str(path)) as tf:
+            T   = len(tf.pages)
+            idx = np.linspace(0, T - 1, min(n, T), dtype=int)
+            return np.mean(
+                [tf.pages[i].asarray().astype(np.float32) for i in idx],
+                axis=0,
+            )
+
+    mean_raw  = _mean_proj(src_tif,       n_frames)
+    mean_corr = _mean_proj(corrected_tif, n_frames)
+    diff      = mean_corr - mean_raw
+
+    def _profiles(mean):
+        return mean[::2, :].mean(axis=0), mean[1::2, :].mean(axis=0)
+
+    even_b, odd_b = _profiles(mean_raw)
+    even_a, odd_a = _profiles(mean_corr)
+
+    lags   = np.arange(-max_shift, max_shift + 1)
+    scores = np.array([np.dot(even_b, np.roll(odd_b, k)) for k in lags])
+    shift  = int(lags[np.argmax(scores)])
+
+    fig = plt.figure(figsize=(16, 9), facecolor="k")
+    gs  = gridspec.GridSpec(
+        2, 3, figure=fig,
+        hspace=0.45, wspace=0.3,
+        left=0.05, right=0.97, top=0.92, bottom=0.07,
+    )
+
+    vlim_diff = float(np.nanpercentile(np.abs(diff), 99)) or 1.0
+    ax_raw = _dark_ax(fig, gs[0, 0])
+    ax_cor = _dark_ax(fig, gs[0, 1])
+    ax_dif = _dark_ax(fig, gs[0, 2])
+    _imshow(ax_raw, mean_raw,  title="Mean raw",       colorbar=True)
+    _imshow(ax_cor, mean_corr, title="Mean corrected", colorbar=True)
+    _imshow(ax_dif, diff, cmap="RdBu_r",
+            vmin=-vlim_diff, vmax=vlim_diff,
+            title="Corrected - Raw", colorbar=True)
+
+    cols = np.arange(mean_raw.shape[1])
+
+    ax_pb = _dark_ax(fig, gs[1, 0])
+    ax_pb.plot(cols, even_b, color="#4fc3f7", lw=0.9, label="even rows")
+    ax_pb.plot(cols, odd_b,  color="#f48fb1", lw=0.9, label="odd rows")
+    ax_pb.set_xlabel("column", color="0.6", fontsize=7)
+    ax_pb.set_ylabel("mean intensity", color="0.6", fontsize=7)
+    ax_pb.set_title(
+        f"Column profiles -- before  (est. shift = {shift:+d} px)",
+        color="0.85", fontsize=8,
+    )
+    ax_pb.legend(fontsize=7, facecolor="0.15", labelcolor="0.85", framealpha=0.8)
+    ax_pb.margins(x=0)
+
+    ax_pa = _dark_ax(fig, gs[1, 1])
+    ax_pa.plot(cols, even_a, color="#4fc3f7", lw=0.9, label="even rows")
+    ax_pa.plot(cols, odd_a,  color="#f48fb1", lw=0.9, label="odd rows")
+    ax_pa.set_xlabel("column", color="0.6", fontsize=7)
+    ax_pa.set_title("Column profiles -- after", color="0.85", fontsize=8)
+    ax_pa.legend(fontsize=7, facecolor="0.15", labelcolor="0.85", framealpha=0.8)
+    ax_pa.margins(x=0)
+
+    residual_b = odd_b - even_b
+    residual_a = odd_a - even_a
+    rms_b = float(np.sqrt(np.mean(residual_b ** 2)))
+    rms_a = float(np.sqrt(np.mean(residual_a ** 2)))
+    ax_res = _dark_ax(fig, gs[1, 2])
+    ax_res.plot(cols, residual_b, color="#ce93d8", lw=0.8,
+                label=f"before  (RMS={rms_b:.2f})")
+    ax_res.plot(cols, residual_a, color="#a5d6a7", lw=0.8,
+                label=f"after   (RMS={rms_a:.2f})")
+    ax_res.axhline(0, color="0.35", lw=0.5, ls="--")
+    ax_res.set_xlabel("column", color="0.6", fontsize=7)
+    ax_res.set_ylabel("odd - even", color="0.6", fontsize=7)
+    ax_res.set_title("Residual odd-even alignment", color="0.85", fontsize=8)
+    ax_res.legend(fontsize=6, facecolor="0.15", labelcolor="0.85", framealpha=0.8)
+    ax_res.margins(x=0)
+
+    fig.suptitle(
+        f"Line-scan (raster) phase correction QC  --  shift = {shift:+d} px",
+        color="0.85", fontsize=11,
+    )
+    return _save(fig, out_path)
+
+
+# -----------------------------------------------------------------------------
+# Step 8 -- Oscillation analysis summary
+# -----------------------------------------------------------------------------
+
+_OSC_BANDS       = ("infra_slow", "slow", "delta", "theta", "alpha_beta")
+_OSC_BAND_LABELS = (
+    "infra-slow\n0.01-0.1 Hz", "slow\n0.1-1 Hz",
+    "delta\n1-4 Hz",  "theta\n4-8 Hz", "alpha-beta\n8-15 Hz",
+)
+_OSC_SIG_COLORS = {
+    "background": "#2196F3",
+    "neural_pop": "#E91E63",
+    "spike_rate": "#4CAF50",
+}
+_OSC_SIG_LABELS = {
+    "background": "Background",
+    "neural_pop": "Population",
+    "spike_rate": "Spike rate",
+}
+_OSC_BAND_EDGES = [
+    ("infra-slow", 0.01, 0.1),
+    ("slow",       0.1,  1.0),
+    ("delta",      1.0,  4.0),
+    ("theta",      4.0,  8.0),
+    ("alpha-beta", 8.0, 15.0),
+]
+
+
+@_guard
+def qc_oscillation(
+    npz_path,
+    out_path,
+) -> Optional[str]:
+    """Save a one-page oscillation analysis QC summary.
+
+    Three panels:
+
+    * **Top (full width)** -- multitaper PSD for all available signals with
+      frequency band shading and F-test significant spectral lines (green
+      dashed verticals).
+    * **Bottom left** -- mean band power per frequency band (grouped bars,
+      log scale).
+    * **Bottom right** -- background spectrogram preview clipped to the
+      first 120 s (or full session if shorter).
+
+    Parameters
+    ----------
+    npz_path
+        Path to the ``*_oscillations.npz`` written by
+        :meth:`~caiman.utils.oscillation.OscillationAnalyzer.run_all`.
+    out_path
+        Output PNG path.
+
+    Returns
+    -------
+    str or None
+        Absolute path of the saved PNG, or ``None`` on failure.
+    """
+    data  = dict(np.load(str(npz_path), allow_pickle=False))
+    fmax  = float(data.get("meta_fmax",      15.0))
+    NW    = float(data.get("meta_NW",          4.0))
+    K     = int(  data.get("meta_K",            7))
+    fs    = float(data.get("meta_fs",          30.0))
+    gpu   = bool( data.get("meta_gpu",        False))
+    win_s = float(data.get("meta_win_s",        4.0))
+    ov_s  = float(data.get("meta_overlap_s",    2.0))
+
+    T = 0
+    for _tkey in ("background_t_ax", "neural_pop_t_ax", "spike_rate_t_ax"):
+        if _tkey in data:
+            T = int(data[_tkey].shape[0])
+            break
+    bw = NW / (T / fs) if T > 0 else 0.0
+
+    fig = plt.figure(figsize=(14, 9), facecolor="k")
+    gs  = gridspec.GridSpec(
+        2, 2, figure=fig,
+        hspace=0.45, wspace=0.3,
+        left=0.07, right=0.97, top=0.92, bottom=0.07,
+        height_ratios=[1.2, 1],
+    )
+
+    # PSD -- full-width top panel
+    ax_psd = fig.add_subplot(gs[0, :])
+    ax_psd.set_facecolor("k")
+    ax_psd.tick_params(colors="0.6", labelsize=7)
+    for sp in ax_psd.spines.values():
+        sp.set_edgecolor("0.3")
+
+    band_colors = plt.cm.tab10.colors
+    for i, (bname, flo, fhi) in enumerate(_OSC_BAND_EDGES):
+        if fhi <= fmax:
+            ax_psd.axvspan(flo, fhi, alpha=0.07,
+                           color=band_colors[i % len(band_colors)],
+                           label=bname)
+
+    for sig, color in _OSC_SIG_COLORS.items():
+        fkey, pkey = f"{sig}_psd_freqs", f"{sig}_psd"
+        if fkey in data and pkey in data:
+            ax_psd.semilogy(data[fkey], data[pkey], lw=1.4,
+                            color=color, label=_OSC_SIG_LABELS[sig])
+
+    if "background_ftest_sigf" in data:
+        sig_f = data["background_ftest_sigf"]
+        for sf in sig_f:
+            ax_psd.axvline(float(sf), color="limegreen",
+                           lw=0.9, ls="--", alpha=0.8)
+        if len(sig_f):
+            ax_psd.axvline(float("nan"), color="limegreen", lw=0.9, ls="--",
+                           label=f"F-test lines (n={len(sig_f)})")
+
+    ax_psd.set_xlabel("Frequency (Hz)", color="0.6", fontsize=8)
+    ax_psd.set_ylabel("Power spectral density", color="0.6", fontsize=8)
+    ax_psd.set_xlim(0, fmax)
+    ax_psd.legend(fontsize=7, facecolor="0.1", labelcolor="0.85",
+                  framealpha=0.85, ncol=3, loc="upper right")
+    ax_psd.set_title(
+        f"Multitaper PSD   NW={NW}  K={K}  half-BW~{bw:.3f} Hz"
+        f"  ({'GPU' if gpu else 'CPU'})",
+        color="0.85", fontsize=9,
+    )
+
+    # Band power bar chart -- bottom left
+    ax_bar = _dark_ax(fig, gs[1, 0])
+    avail   = [s for s in _OSC_SIG_COLORS
+               if f"{s}_bp_{_OSC_BANDS[0]}" in data]
+    n_sigs  = max(len(avail), 1)
+    x       = np.arange(len(_OSC_BANDS))
+    bar_w   = 0.75 / n_sigs
+
+    for i, sig in enumerate(avail):
+        means = [float(np.mean(data[f"{sig}_bp_{b}"]))
+                 if f"{sig}_bp_{b}" in data else 0.0
+                 for b in _OSC_BANDS]
+        off = (i - (n_sigs - 1) / 2.0) * bar_w
+        ax_bar.bar(x + off, means, bar_w * 0.9,
+                   color=_OSC_SIG_COLORS[sig], alpha=0.8,
+                   label=_OSC_SIG_LABELS[sig])
+
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(_OSC_BAND_LABELS, color="0.7", fontsize=6)
+    ax_bar.set_ylabel("Mean instantaneous power", color="0.6", fontsize=7)
+    ax_bar.set_title("Band power summary", color="0.85", fontsize=8)
+    if avail:
+        ax_bar.legend(fontsize=7, facecolor="0.15",
+                      labelcolor="0.85", framealpha=0.8)
+    ax_bar.set_yscale("log")
+
+    # Spectrogram preview -- bottom right
+    ax_sg = _dark_ax(fig, gs[1, 1])
+    if "background_sg_Sxx_db" in data:
+        Sdb  = data["background_sg_Sxx_db"]
+        sg_t = data["background_sg_t"]
+        sg_f = data["background_sg_freqs"]
+
+        t_max  = min(120.0, float(sg_t[-1]))
+        t_mask = sg_t <= t_max
+        Sdb_c  = Sdb[:, t_mask]
+        sg_t_c = sg_t[t_mask]
+
+        med = float(np.median(Sdb_c))
+        im  = ax_sg.pcolormesh(sg_t_c, sg_f, Sdb_c,
+                                cmap="inferno", shading="gouraud",
+                                vmin=med - 20, vmax=med + 20,
+                                rasterized=True)
+        cb = plt.colorbar(im, ax=ax_sg, pad=0.01)
+        cb.set_label("Power (dB)", fontsize=7, color="0.6")
+        cb.ax.tick_params(colors="0.6", labelsize=6)
+
+        df      = 2 * NW / win_s
+        preview = (f"{t_max:.0f} s" if t_max < float(sg_t[-1])
+                   else "full session")
+        ax_sg.set_xlabel("Time (s)", color="0.6", fontsize=7)
+        ax_sg.set_ylabel("Frequency (Hz)", color="0.6", fontsize=7)
+        ax_sg.set_ylim(0, fmax)
+        ax_sg.set_title(
+            f"Background spectrogram ({preview})"
+            f"   win={win_s}s  step={win_s - ov_s}s  df~{df:.1f} Hz",
+            color="0.85", fontsize=7,
+        )
+    else:
+        ax_sg.text(0.5, 0.5, "Spectrogram not available",
+                   ha="center", va="center", color="0.5",
+                   transform=ax_sg.transAxes, fontsize=9)
+        ax_sg.set_title("Background spectrogram", color="0.85", fontsize=8)
+
+    fig.suptitle("Oscillation analysis QC", color="0.85", fontsize=11)
+    return _save(fig, out_path)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -786,20 +1115,24 @@ class QCRunner:
     >>> qc.correlation_image(Cn)
     >>> qc.cnmf_fit(cnm, Cn)
     >>> qc.cnmf_refit(cnm2, Cn)
+    >>> qc.xcorr_correction(src_tif, corrected_tif)
     >>> qc.component_evaluation(cnm2, Cn)
     >>> qc.traces(cnm2)
+    >>> qc.oscillation(npz_path)
     """
 
     # Filename templates — NN is zero-padded step number, label is human name.
     _STEPS = {
-        "raw_sample":          ("01", "raw_sample"),
-        "motion_correction":   ("02", "motion_correction"),
-        "correlation_image":   ("03", "correlation_image"),
-        "pnr_image":           ("03b", "pnr_image"),
-        "cnmf_fit":            ("04", "fit_footprints"),
-        "cnmf_refit":          ("05", "refit_footprints"),
-        "component_evaluation":("06", "evaluation"),
-        "traces":              ("07", "traces"),
+        "raw_sample":           ("01",  "raw_sample"),
+        "xcorr_correction":     ("01b", "xcorr_correction"),
+        "motion_correction":    ("02",  "motion_correction"),
+        "correlation_image":    ("03",  "correlation_image"),
+        "pnr_image":            ("03b", "pnr_image"),
+        "cnmf_fit":             ("04",  "fit_footprints"),
+        "cnmf_refit":           ("05",  "refit_footprints"),
+        "component_evaluation": ("06",  "evaluation"),
+        "traces":               ("07",  "traces"),
+        "oscillation":          ("08",  "oscillation"),
     }
 
     def __init__(self, P, session: str, outdir: Union[str, Path]) -> None:
@@ -933,6 +1266,48 @@ class QCRunner:
         """
         return qc_traces(cnm2, self._fr, self._path("traces"),
                          n_show=n_show)
+
+    def xcorr_correction(
+        self,
+        src_tif,
+        corrected_tif,
+        max_shift: int = 16,
+        n_frames: int = 500,
+    ) -> Optional[str]:
+        """Save the line-scan phase correction QC figure.
+
+        Parameters
+        ----------
+        src_tif
+            Path to the original (uncorrected) TIFF.
+        corrected_tif
+            Path returned by
+            :func:`~caiman.utils.xcorr_correction.correct_line_scan`.
+        max_shift
+            Search range used during correction (default 16 px).
+        n_frames
+            Frames to subsample for mean projection (default 500).
+        """
+        return qc_xcorr_correction(
+            src_tif, corrected_tif,
+            self._path("xcorr_correction"),
+            max_shift=max_shift,
+            n_frames=n_frames,
+        )
+
+    def oscillation(
+        self,
+        npz_path,
+    ) -> Optional[str]:
+        """Save the oscillation analysis QC summary figure.
+
+        Parameters
+        ----------
+        npz_path
+            Path to the ``*_oscillations.npz`` written by
+            :meth:`~caiman.utils.oscillation.OscillationAnalyzer.run_all`.
+        """
+        return qc_oscillation(npz_path, self._path("oscillation"))
 
     def all_post_cnmf(
         self,

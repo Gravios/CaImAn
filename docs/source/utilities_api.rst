@@ -39,9 +39,9 @@ qc
 --
 
 .. automodule:: caiman.utils.qc
-   :members: QCRunner, qc_raw_sample, qc_motion_correction, qc_correlation_image,
-             qc_pnr_image, qc_cnmf_fit, qc_cnmf_refit, qc_component_evaluation,
-             qc_traces, save_all_post_cnmf
+   :members: QCRunner, qc_raw_sample, qc_xcorr_correction, qc_motion_correction,
+             qc_correlation_image, qc_pnr_image, qc_cnmf_fit, qc_cnmf_refit,
+             qc_component_evaluation, qc_traces, qc_oscillation, save_all_post_cnmf
    :undoc-members:
    :show-inheritance:
 
