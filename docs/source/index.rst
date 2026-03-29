@@ -44,6 +44,7 @@ Contents:
    file_formats
    core_functions
    utilities_api
+   oscillation_analysis
 
 .. toctree::
    :maxdepth: 3

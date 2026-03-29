@@ -19,6 +19,7 @@ params_estimator            Data-driven estimation of gSig, min_corr, min_pnr, r
 cnmf_runner                 CNMFRunner: config-driven CNMF orchestrator
 qc                          QC figure generation (raw, MC, Cn, footprints, evaluation, traces)
 timing                      PipelineTimer context manager, step decorator, log_call, write_report
+oscillation                 Multitaper (DPSS) oscillation analysis — OscillationAnalyzer, load_npz
 utils                       Miscellaneous helpers (download, SI metadata, …)
 visualization               Component and patch visualisation (bokeh/holoviews)
 """
@@ -65,6 +66,7 @@ from caiman.utils.memory import (
     madvise_dontneed,
     cupy_flush,
 )
+from caiman.utils.oscillation import OscillationAnalyzer, load_npz
 
 __all__ = [
     # params_io
@@ -107,4 +109,7 @@ __all__ = [
     "malloc_trim",
     "madvise_dontneed",
     "cupy_flush",
+    # oscillation
+    "OscillationAnalyzer",
+    "load_npz",
 ]
