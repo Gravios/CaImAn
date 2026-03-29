@@ -108,5 +108,14 @@
         "max_shift": 16,
         "n_frames": 500,
         "use_gpu": true
+    },
+    "oscillation": {
+        "_comment": "Multitaper (DPSS) oscillation analysis run after CNMF on the accepted component traces and neuropil background. enabled=true runs OscillationAnalyzer.run_all and saves a QC figure. NW: DPSS time-bandwidth product (2=fine resolution, 4=low variance). win_s: spectrogram window length in seconds (Delta_f ~ 2*NW/win_s). overlap_s: window overlap in seconds; null = win_s/2 (50%). adaptive: use adaptive taper weighting (recommended). use_gpu: accelerate via CuPy when available.",
+        "enabled": true,
+        "NW": 4.0,
+        "win_s": 4.0,
+        "overlap_s": null,
+        "adaptive": true,
+        "use_gpu": true
     }
 }
