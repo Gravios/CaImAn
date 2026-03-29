@@ -76,3 +76,11 @@ param_summary
    :members: log_params
    :undoc-members:
    :show-inheritance:
+
+oscillation
+-----------
+
+.. automodule:: caiman.utils.oscillation
+   :members: OscillationAnalyzer, load_npz
+   :undoc-members:
+   :show-inheritance:
