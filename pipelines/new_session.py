@@ -67,6 +67,68 @@ import sys
 from pathlib import Path
 
 
+
+# ── YAML reader ───────────────────────────────────────────────────────────────
+
+def _read_yaml(path) -> dict:
+    """Load an acquisition YAML and return a flat dict of useful defaults.
+
+    Reads:
+      acquisition_system.settings.sample_rate.value  → fr
+      acquisition_system.settings.magnification.value → magnification ("25x")
+      subject.species                                  → species ("mouse"/"rat")
+      caiman_recommended.gSig                          → gSig (int, if present)
+      caiman_recommended.rf                            → rf   (int, if present)
+      caiman_recommended.decay_time                    → decay_time (float, if present)
+
+    Returns an empty dict if the file cannot be parsed or lacks expected keys.
+    """
+    try:
+        import yaml as _yaml
+        doc = _yaml.safe_load(path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out: dict = {}
+    acq = doc.get("acquisition_system", {}).get("settings", {})
+    sr  = acq.get("sample_rate", {})
+    if isinstance(sr.get("value"), (int, float)):
+        out["fr"] = float(sr["value"])
+    mag = acq.get("magnification", {})
+    if isinstance(mag.get("value"), (int, float)):
+        out["magnification"] = f"{int(mag['value'])}x"
+    species_raw = (doc.get("subject", {}) or {}).get("species", "") or ""
+    if species_raw:
+        out["species"] = "rat" if "rat" in species_raw.lower() else "mouse"
+    rec = doc.get("caiman_recommended") or {}
+    if isinstance(rec.get("gSig"), int):
+        out["gSig"] = rec["gSig"]
+    if isinstance(rec.get("rf"), int):
+        out["rf"] = rec["rf"]
+    if isinstance(rec.get("decay_time"), (int, float)):
+        out["decay_time"] = float(rec["decay_time"])
+    return out
+
+
+def _find_yaml(session: str, dest) -> "Path | None":
+    """Locate the acquisition YAML for a session.
+
+    Layout::
+
+        <date>/<TL_dir>/              ← dest.parent
+          <TL_dir>.yaml              ← YAML (stem = TL dir name)
+          <TL_dir>-C00-fc*.tif       ← source TIF
+          <TL_dir>-C00-fc*/          ← dest (session dir)
+
+    Returns ``dest.parent / (dest.parent.name + ".yaml")`` if it exists.
+    """
+    candidate = dest.parent / (dest.parent.name + ".yaml")
+    if candidate.exists() and ".bak" not in candidate.suffixes:
+        return candidate
+    return None
+
+
 # ── Locate templates ──────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -213,6 +275,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # Session / data
     p.add_argument("--data-root", metavar="PATH",
         help="Override inferred data_root in the JSON (default: auto)")
+    p.add_argument("--yaml", metavar="PATH",
+        help="Acquisition YAML to read defaults from. "
+             "Auto-detected from dest parent if omitted.")
     p.add_argument("--fr", type=float, metavar="HZ",
         help="Acquisition frame rate [Hz]")
     p.add_argument("--decay-time", type=float, metavar="S",
@@ -321,6 +386,13 @@ def main(argv: list[str] | None = None) -> int:
     session = args.session
     dest    = Path(args.dest).resolve()
 
+    # ── Load YAML defaults (fr, magnification, species, gSig, rf, decay_time) ──
+    _yaml_path = Path(args.yaml).resolve() if getattr(args, "yaml", None) else _find_yaml(session, dest)
+    _yd: dict = _read_yaml(_yaml_path) if _yaml_path and _yaml_path.exists() else {}
+    if _yd:
+        print("  YAML       :", _yaml_path.name)
+        for _k, _v in _yd.items(): print(f"    {_k} = {_v}")
+
     # ── Locate templates ──────────────────────────────────────────────────────
     try:
         tpl_py, tpl_json = _find_templates()
@@ -343,19 +415,26 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted.")
             return 0
 
-    # ── Build CLI overrides dict ───────────────────────────────────────────────
+    # ── Build overrides (YAML defaults < CLI flags) ───────────────────────────
+    _fr      = args.fr         if args.fr         is not None else _yd.get("fr")
+    _decay   = args.decay_time if args.decay_time is not None else _yd.get("decay_time")
+    _rf      = args.rf         if args.rf         is not None else _yd.get("rf")
+    _gSig    = args.gSig       if args.gSig       is not None else _yd.get("gSig")
+    _species = args.species    if args.species    != "mouse"  else _yd.get("species", args.species)
+    _magnif  = args.magnification if args.magnification != "20x" else _yd.get("magnification", args.magnification)
+
     overrides: dict = {}
-    if args.fr           is not None: overrides["data.fr"]            = args.fr
-    if args.decay_time   is not None: overrides["data.decay_time"]    = args.decay_time
-    if args.rf           is not None: overrides["cnmf.rf"]            = args.rf
+    if _fr      is not None: overrides["data.fr"]             = _fr
+    if _decay   is not None: overrides["data.decay_time"]     = _decay
+    if _rf      is not None: overrides["cnmf.rf"]             = _rf
     if args.K            is not None: overrides["cnmf.K"]             = args.K
     if args.min_corr     is not None: overrides["cnmf.min_corr"]      = args.min_corr
     if args.min_pnr      is not None: overrides["cnmf.min_pnr"]       = args.min_pnr
     if args.method_init  is not None: overrides["cnmf.method_init"]   = args.method_init
     if args.n_processes  is not None: overrides["cluster.n_processes"] = args.n_processes
 
-    if args.gSig is not None:
-        g = args.gSig
+    if _gSig is not None:
+        g = _gSig
         overrides["cnmf.gSig"] = [g, g]
         overrides["cnmf.gSiz"] = [g * 4 + 1, g * 4 + 1]
 
@@ -483,8 +562,8 @@ def main(argv: list[str] | None = None) -> int:
                         from caiman.utils.params_estimator import estimate_params, apply_suggestions
                         _suggestions = estimate_params(
                             _mc_path[-1],
-                            species       = args.species,
-                            magnification = args.magnification,
+                            species       = _species,
+                            magnification = _magnif,
                             n_frames      = args.n_frames,
                             out_path      = out_json.parent / f"{session}_qc_00_param_estimate.png",
                             logger        = _est_logger,
