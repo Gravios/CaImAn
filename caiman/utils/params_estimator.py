@@ -50,8 +50,10 @@ logger = logging.getLogger("caiman")
 # ── Species × magnification priors ────────────────────────────────────────────
 _PRIORS: dict[tuple, dict] = {
     ("mouse", "20x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
+    ("mouse", "25x"): {"gsig_min": 5, "gsig_max": 11, "fallback": 8},
     ("mouse", "40x"): {"gsig_min": 6, "gsig_max": 14, "fallback": 9},
     ("rat",   "20x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
+    ("rat",   "25x"): {"gsig_min": 5, "gsig_max": 13, "fallback": 9},
     ("rat",   "40x"): {"gsig_min": 7, "gsig_max": 16, "fallback": 10},
 }
 
@@ -65,6 +67,7 @@ _MERGE_THR        = 0.85  # validated for 2P soma (0.7 merges neighbouring cells
 def estimate_params(
     fname_mc:      Union[str, Path],
     *,
+    yaml_path:     Optional[Union[str, Path]] = None,
     species:       str                       = "mouse",
     magnification: str                       = "20x",
     gSig_hint:     Optional[int]             = None,
@@ -99,6 +102,31 @@ def estimate_params(
         Ready-to-use suggestions for the pipeline JSON cnmf section.
     """
     import caiman.mmapping as _mmap
+
+    # ── Read YAML defaults (override defaults but not explicit caller args) ──
+    if yaml_path is not None:
+        try:
+            import yaml as _yaml
+            _yd = _yaml.safe_load(Path(yaml_path).read_text()) or {}
+            _acq = _yd.get("acquisition_system", {}).get("settings", {})
+            _sr  = _acq.get("sample_rate", {})
+            if fr == 30.0 and isinstance(_sr.get("value"), (int, float)):
+                fr = float(_sr["value"])
+            _mag = _acq.get("magnification", {})
+            if magnification == "20x" and isinstance(_mag.get("value"), (int, float)):
+                magnification = f"{int(_mag['value'])}x"
+            _sp_raw = (_yd.get("subject") or {}).get("species", "") or ""
+            if species == "mouse" and _sp_raw:
+                species = "rat" if "rat" in _sp_raw.lower() else "mouse"
+            _rec = _yd.get("caiman_recommended") or {}
+            if gSig_hint is None and isinstance(_rec.get("gSig"), int):
+                gSig_hint = _rec["gSig"]
+                logger.info(f"  yaml gSig hint: {gSig_hint}")
+            logger.info(
+                f"  yaml: fr={fr} Hz  magnification={magnification}  species={species}"
+            )
+        except Exception as _ye:
+            logger.warning(f"  Could not read YAML {yaml_path}: {_ye}")
 
     prior_key = (species.lower(), magnification.lower())
     if prior_key not in _PRIORS:
