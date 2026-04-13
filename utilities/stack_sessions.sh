@@ -102,7 +102,7 @@ for session_dir in "${session_dirs[@]}"; do
     fi
 
     for ch in $channels; do
-        output="${session_dir}${session_name}-C${ch}-fc${frameCount}-fs${samplingRate}.tif"
+        output="${session_dir}${session_name}-C${ch}-fc${frameCount}.tif"
 
         if [[ -f "$output" ]]; then
             echo "    C${ch}: already exists, skipping"
@@ -127,6 +127,17 @@ for session_dir in "${session_dirs[@]}"; do
                 --output "$output" \
                 --preallocate \
                 --compression none
+
+            # Update Trial.yaml with OME metadata (only once, on first channel)
+            if [[ "$ch" == "$(echo "$channels" | head -1)" ]]; then
+                yaml_path="${session_dir}${session_name}.yaml"
+                if [[ -f "$yaml_path" ]]; then
+                    echo "    yaml: updating $yaml_path with OME metadata"
+                    python "$OME_META" "$master" --update-yaml "$yaml_path" || echo "    yaml: WARNING ome_meta update failed"
+                else
+                    echo "    yaml: $yaml_path not found, skipping OME update"
+                fi
+            fi
         fi
     done
 
