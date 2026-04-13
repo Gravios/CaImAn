@@ -373,12 +373,8 @@ def _tile_dispatch(pool, args_in, file_name, dims, T, _precomp_result, logger,
     # Increase to keep workers busier per tile and reduce idle time between tiles.
     # Rule of thumb: tile_n = ceil(n_workers / n_tiles_total) per axis.
     # Exposed via CAIMAN_TILE_N env var or cluster.tile_n JSON key.
-    tile_n = int(
-        _os_td.environ.get('CAIMAN_TILE_N')
-        or (params.get('patch', 'tile_n') if hasattr(params, 'patch')
-            and 'tile_n' in getattr(params, 'patch', {}) else None)
-        or 3
-    )
+    tile_n = int(_os_td.environ.get('CAIMAN_TILE_N') or 3)
+    
     tile_dx  = tile_n * stride_x
     tile_dy  = tile_n * stride_y
 
