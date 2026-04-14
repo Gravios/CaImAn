@@ -74,8 +74,25 @@ for session_dir in "${session_dirs[@]}"; do
     session_name="$(basename "$session")"
     echo "==> $session_name"
 
-    # Find the master OME-TIFF — sort and take first (t0000 = master with OME-XML)
-    master="$(ls "${session_dir}"*.ome.tif 2>/dev/null | sort | head -1 || true)"
+    # Find the master OME-TIFF — must be an actual frame file (contains OME-XML
+    # and real pixel data).  Companion/descriptor files from some acquisition
+    # software (e.g. FluoView, ScanImage redirect stubs) share the .ome.tif
+    # extension but are plain text and will fail tifffile.  Prefer *_t0000.ome.tif
+    # (first time-point), which is always a real frame; fall back to any .ome.tif
+    # only when no _t0000 files exist.
+    master=""
+    for _candidate in \
+        "$(ls "${session_dir}"*_t0000.ome.tif 2>/dev/null | sort | head -1)" \
+        "$(ls "${session_dir}"*.ome.tif        2>/dev/null | sort | head -1)"
+    do
+        [[ -z "$_candidate" || ! -f "$_candidate" ]] && continue
+        # Quick magic-byte check: TIFF files start with 'II' (0x4949) or 'MM' (0x4d4d)
+        _magic="$(head -c 2 "$_candidate" 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+        if [[ "$_magic" == "4949" || "$_magic" == "4d4d" ]]; then
+            master="$_candidate"
+            break
+        fi
+    done
     if [[ -z "$master" ]]; then
         echo "    No OME-TIFF files found, skipping"
         continue

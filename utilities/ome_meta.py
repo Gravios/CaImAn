@@ -70,7 +70,13 @@ def _resolve_ns(root: ET.Element) -> str:
 # ---------------------------------------------------------------------------
 def extract_pixels(path: Path) -> dict:
     """Parse OME-XML and return a dict of all useful Pixels fields."""
-    with tifffile.TiffFile(str(path)) as tf:
+    try:
+        tf_handle = tifffile.TiffFile(str(path))
+    except tifffile.TiffFileError as exc:
+        print(f"Error: {path.name} is not a valid TIFF file ({exc})", file=sys.stderr)
+        sys.exit(1)
+
+    with tf_handle as tf:
         if not tf.is_ome:
             print(f"Error: {path} does not contain OME-XML metadata", file=sys.stderr)
             sys.exit(2)
