@@ -437,6 +437,13 @@ def main(argv: list[str] | None = None) -> int:
         g = _gSig
         overrides["cnmf.gSig"] = [g, g]
         overrides["cnmf.gSiz"] = [g * 4 + 1, g * 4 + 1]
+        # Auto-derive rf and stride from gSig when not explicitly supplied:
+        #   rf = 5 × gSig  (guarantees ring fits: 0.9 × gSiz < rf for all gSig≥2)
+        #   stride = rf // 2
+        if _rf is None and args.rf is None:
+            _rf_auto = 5 * g
+            overrides.setdefault("cnmf.rf",     _rf_auto)
+            overrides.setdefault("cnmf.stride", _rf_auto // 2)
 
     # ── Patch JSON ────────────────────────────────────────────────────────────
     patched = _patch_json(

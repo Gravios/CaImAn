@@ -114,6 +114,14 @@ def parse_args():
         help="Overwrite output file if it already exists"
     )
     parser.add_argument(
+        "--keep-sources", action="store_true",
+        help=(
+            "Do not delete the source frame TIFFs after a successful write. "
+            "By default the source frames are removed once the output file "
+            "has been verified on disk."
+        )
+    )
+    parser.add_argument(
         "--preallocate", action="store_true",
         help=(
             "Preallocate the full output file before writing via tifffile.memmap. "
@@ -428,7 +436,11 @@ def main():
         logger.error(f"--input is not a directory: {input_dir}")
         sys.exit(1)
 
-    output_path = Path(args.output)
+    # Place the output TIF inside a directory named after its own stem:
+    #   --output /data/stack.tif  →  write to  /data/stack/stack.tif
+    _raw_output = Path(args.output)
+    output_path = _raw_output.parent / _raw_output.stem / _raw_output.name
+
     if output_path.exists() and not args.overwrite:
         logger.error(
             f"Output file already exists: {output_path}\n"
@@ -470,10 +482,15 @@ def main():
         print(f"  Downsample  : {args.downsample}x")
         print(f"  Write mode  : {mode}")
         print(f"  Compression : {args.compression}  level {args.compression_level}")
-        print(f"  Output      : {output_path}")
+        print(f"  Output dir  : {output_path.parent}  (will be created)")
+        print(f"  Output file : {output_path}")
         print(f"  Est. size   : {estimate_output_size(len(frames), frame_shape, dtype)} (uncompressed)")
         if use_preallocate:
             print(f"  Flush every : {args.flush_every} frames")
+        if not args.keep_sources:
+            print(f"  Delete src  : {len(frames)} source frame(s) will be deleted after write")
+        else:
+            print(f"  Delete src  : --keep-sources set, source frames preserved")
         print("--- nothing written ---\n")
         return
 
@@ -507,6 +524,34 @@ def main():
             compression=args.compression,
             compression_level=args.compression_level,
         )
+
+    # ── Delete source frames (default on; skip with --keep-sources) ─────────
+    if not args.keep_sources:
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            logger.error(
+                "Output file missing or empty after write — "
+                "source frames NOT deleted to avoid data loss."
+            )
+            sys.exit(1)
+        _delete_sources(frames)
+    else:
+        logger.info("Source frames preserved (--keep-sources).")
+
+
+def _delete_sources(frames: list) -> None:
+    """Remove the source frame TIFFs after a successful stack write."""
+    logger.info(f"Deleting {len(frames)} source frame(s)...")
+    failed = []
+    for fpath in frames:
+        try:
+            Path(fpath).unlink()
+        except OSError as exc:
+            logger.warning(f"  Could not delete {fpath}: {exc}")
+            failed.append(fpath)
+    deleted = len(frames) - len(failed)
+    logger.info(f"  Deleted {deleted}/{len(frames)} source frame(s).")
+    if failed:
+        logger.warning(f"  {len(failed)} file(s) could not be deleted (see above).")
 
 
 if __name__ == "__main__":
