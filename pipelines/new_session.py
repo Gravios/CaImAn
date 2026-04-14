@@ -10,7 +10,17 @@ and ``experiment`` paths derived from the destination.
 
 Usage
 -----
-Minimal (infers data_root and experiment from the destination path)::
+Minimal — run from the TL directory containing the .tif::
+
+    cd /data/source/strohA/…/strohA-ia-000000-20140813-TL001_121103-25x-default
+    python ~/software/CaImAn/pipelines/new_session.py
+
+Or run from an already-created session directory::
+
+    cd /data/source/…/TL001_…/<session>/
+    python ~/software/CaImAn/pipelines/new_session.py
+
+Explicit (session and dest still accepted for scripted / batch use)::
 
     python pipelines/new_session.py \\
         stroh-ej-20140714-TL1 \\
@@ -267,10 +277,12 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("session",
-        help="Session identifier, e.g. stroh-ej-20140714-TL1")
-    p.add_argument("dest",
-        help="Absolute path to the session folder (created if missing)")
+    p.add_argument("session", nargs="?", default=None,
+        help="Session identifier (TIF stem). "
+             "Omit to infer from the current working directory.")
+    p.add_argument("dest", nargs="?", default=None,
+        help="Absolute path to the session folder (created if missing). "
+             "Omit to infer from the current working directory.")
 
     # Session / data
     p.add_argument("--data-root", metavar="PATH",
@@ -381,10 +393,64 @@ def _run_motion_correction(
         return None, None
 
 
+def _infer_from_cwd() -> tuple[str, Path]:
+    """Infer (session, dest) from the current working directory.
+
+    Two supported layouts::
+
+        # Run from TL dir — the .tif lives here, session dir is a child
+        <TL_dir>/
+          <session>.tif          ← we find this
+          <session>/             ← dest (created if missing)
+
+        # Run from an already-created session dir
+        <TL_dir>/
+          <session>.tif
+          <session>/             ← cwd IS dest; session = cwd.name
+    """
+    cwd = Path.cwd()
+
+    # Case 1: cwd is the session dir (session dir already exists)
+    # Detect by checking whether a .tif with our name exists in the parent.
+    candidate_tif = cwd.parent / f"{cwd.name}.tif"
+    if candidate_tif.exists():
+        return cwd.name, cwd
+
+    # Case 2: cwd is the TL dir — find exactly one .tif (excluding sub-dirs)
+    tifs = [p for p in cwd.glob("*.tif") if p.is_file()]
+    if len(tifs) == 1:
+        session = tifs[0].stem
+        dest = cwd / session
+        return session, dest
+
+    if len(tifs) == 0:
+        raise SystemExit(
+            "new_session.py: cannot infer session — no .tif found in "
+            f"{cwd}\n"
+            "  Either cd into the TL directory containing the .tif, or supply\n"
+            "  the session and dest arguments explicitly."
+        )
+    # Multiple TIFs — ambiguous
+    names = "\n    ".join(t.name for t in sorted(tifs)[:8])
+    raise SystemExit(
+        f"new_session.py: multiple .tif files found in {cwd}, cannot infer session:\n"
+        f"    {names}\n"
+        "  Supply the session and dest arguments explicitly."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args   = _build_parser().parse_args(argv)
-    session = args.session
-    dest    = Path(args.dest).resolve()
+
+    if args.session is None or args.dest is None:
+        _session, _dest = _infer_from_cwd()
+        session = args.session or _session
+        dest    = Path(args.dest).resolve() if args.dest else _dest.resolve()
+        print(f"  Inferred   : session={session}")
+        print(f"             : dest={dest}")
+    else:
+        session = args.session
+        dest    = Path(args.dest).resolve()
 
     # ── Load YAML defaults (fr, magnification, species, gSig, rf, decay_time) ──
     _yaml_path = Path(args.yaml).resolve() if getattr(args, "yaml", None) else _find_yaml(session, dest)
