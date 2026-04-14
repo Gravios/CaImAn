@@ -150,6 +150,15 @@ def parse_args():
         )
     )
     parser.add_argument(
+        "--flat-output", action="store_true",
+        help=(
+            "Write the output TIF directly to the path given by --output "
+            "instead of placing it inside a subdirectory named after its stem. "
+            "Use when the caller (e.g. stack_sessions.sh) manages directory "
+            "layout itself."
+        )
+    )
+    parser.add_argument(
         "--preallocate", action="store_true",
         help=(
             "Preallocate the full output file before writing via tifffile.memmap. "
@@ -663,10 +672,18 @@ def main():
         logger.error(f"--input is not a directory: {input_dir}")
         sys.exit(1)
 
-    output_path = _resolve_output(Path(args.output))
+    output_path = (
+        Path(args.output) if getattr(args, "flat_output", False)
+        else _resolve_output(Path(args.output))
+    )
 
     # ── Channel detection ────────────────────────────────────────────────────
-    channel_ids = detect_channel_ids(input_dir, args.pattern)
+    # Require ≥ 2 distinct channel IDs to enter multi-channel mode.
+    # When the caller (e.g. stack_sessions.sh) already filters to one channel
+    # via --pattern, detect_channel_ids returns a single-element list and we
+    # correctly fall through to the faster single-channel path.
+    _detected = detect_channel_ids(input_dir, args.pattern)
+    channel_ids = _detected if (_detected is not None and len(_detected) >= 2) else None
 
     if channel_ids is not None:
         # ── Multi-channel mode ───────────────────────────────────────────────
@@ -831,6 +848,71 @@ def _delete_sources(frames: list) -> None:
     logger.info(f"  Deleted {deleted}/{len(frames)} source frame(s).")
     if failed:
         logger.warning(f"  {len(failed)} file(s) could not be deleted (see above).")
+
+
+# ---------------------------------------------------------------------------
+# Programmatic API
+# ---------------------------------------------------------------------------
+
+def stack_frames(
+    input_dir,
+    output_path,
+    pattern: str = "*.tif*",
+    *,
+    start: int | None = None,
+    end: int | None = None,
+    downsample: int = 1,
+    compression: str = "zlib",
+    compression_level: int = 1,
+    preallocate: bool = False,
+    flush_every: int = 200,
+    memory_threshold_gb: float = 15.0,
+) -> None:
+    """Stack frame TIFFs matching *pattern* in *input_dir* into a single
+    BigTIFF at *output_path*.
+
+    Programmatic entry point for use by :mod:`caiman.utils.stack_sessions`
+    and other callers that do not go through the CLI.  Write-mode selection
+    (in-memory / preallocated / streaming) and all logging are identical to
+    the CLI behaviour.
+
+    Parameters
+    ----------
+    input_dir:
+        Directory containing the source frame TIFFs.
+    output_path:
+        Destination BigTIFF path.  The parent directory is created if needed.
+    pattern:
+        Glob pattern relative to *input_dir* (default ``"*.tif*"``).
+    start / end:
+        Frame slice [start:end] applied after sorting (None = no limit).
+    downsample:
+        Spatial downsampling factor (≥ 1).
+    compression:
+        Compression codec: ``"none"`` | ``"zlib"`` | ``"lzw"`` | ``"zstd"``.
+    compression_level:
+        Codec-dependent level (lower = faster).
+    preallocate:
+        Use :func:`tifffile.memmap` preallocation.  Requires
+        ``compression="none"``.
+    flush_every:
+        Preallocated mode: msync interval in frames.
+    memory_threshold_gb:
+        Auto-switch to in-memory mode when estimated stack size is below
+        this threshold (GB).
+    """
+    import types
+    _args = types.SimpleNamespace(
+        downsample         = downsample,
+        in_memory          = False,
+        preallocate        = preallocate,
+        compression        = compression,
+        compression_level  = compression_level,
+        flush_every        = flush_every,
+        memory_threshold   = memory_threshold_gb,
+    )
+    frames = collect_frames(Path(input_dir), pattern, start, end)
+    _write_single_channel(_args, frames, Path(output_path))
 
 
 if __name__ == "__main__":
