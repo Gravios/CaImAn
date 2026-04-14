@@ -29,6 +29,7 @@ Species × magnification priors
 These constrain the gSig search range and set the blob-detection fallback:
 
   mouse 20x: gSig 3–9 px  (10-15 µm soma @ ~0.8 µm/px, FOV ~400 µm)
+  mouse 25x: gSig 3–7 px  (10-15 µm soma @ ~0.78 µm/px; empirical: gSig=4, gSiz=17)
   mouse 40x: gSig 6–14 px (10-15 µm soma @ ~0.4 µm/px, FOV ~200 µm)
   rat   20x: gSig 4–11 px (12-18 µm soma @ ~0.8 µm/px)
   rat   40x: gSig 7–16 px (12-18 µm soma @ ~0.4 µm/px)
@@ -50,7 +51,7 @@ logger = logging.getLogger("caiman")
 # ── Species × magnification priors ────────────────────────────────────────────
 _PRIORS: dict[tuple, dict] = {
     ("mouse", "20x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
-    ("mouse", "25x"): {"gsig_min": 5, "gsig_max": 11, "fallback": 8},
+    ("mouse", "25x"): {"gsig_min": 3, "gsig_max":  7, "fallback": 4},
     ("mouse", "40x"): {"gsig_min": 6, "gsig_max": 14, "fallback": 9},
     ("rat",   "20x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
     ("rat",   "25x"): {"gsig_min": 5, "gsig_max": 13, "fallback": 9},
