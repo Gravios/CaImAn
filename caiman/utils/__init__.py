@@ -20,6 +20,8 @@ cnmf_runner                 CNMFRunner: config-driven CNMF orchestrator
 qc                          QC figure generation (raw, MC, Cn, footprints, evaluation, traces)
 timing                      PipelineTimer context manager, step decorator, log_call, write_report
 oscillation                 Multitaper (DPSS) oscillation analysis — OscillationAnalyzer, load_npz
+ome_meta                    OME-TIFF metadata extraction and Trial.yaml update — extract_pixels, update_yaml
+stack_to_bigtiff            Frame-directory → BigTIFF stacker — stack_frames, detect_channel_ids
 utils                       Miscellaneous helpers (download, SI metadata, …)
 visualization               Component and patch visualisation (bokeh/holoviews)
 """
@@ -67,6 +69,13 @@ from caiman.utils.memory import (
     cupy_flush,
 )
 from caiman.utils.oscillation import OscillationAnalyzer, load_npz
+from caiman.utils.ome_meta import extract_pixels, format_rate_str, update_yaml
+from caiman.utils.stack_to_bigtiff import (
+    stack_frames,
+    detect_channel_ids,
+    collect_channel_frames,
+    write_yaml_sidecar,
+)
 
 __all__ = [
     # params_io
@@ -112,4 +121,13 @@ __all__ = [
     # oscillation
     "OscillationAnalyzer",
     "load_npz",
+    # ome_meta
+    "extract_pixels",
+    "format_rate_str",
+    "update_yaml",
+    # stack_to_bigtiff
+    "stack_frames",
+    "detect_channel_ids",
+    "collect_channel_frames",
+    "write_yaml_sidecar",
 ]

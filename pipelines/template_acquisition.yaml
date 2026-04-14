@@ -1,0 +1,83 @@
+# template_acquisition.yaml
+# ==========================
+# Acquisition metadata template for CaImAn pipeline sessions.
+#
+# Copy this file into the TL directory alongside the raw frame TIFFs and
+# rename it to match the TL directory stem, e.g.:
+#
+#   strohA-ia-000000-20140813-TL001_121103-25x-default.yaml
+#
+# new_session.py reads this file automatically when it finds a YAML with
+# the same stem as the parent TL directory.  All fields may be null if
+# the value is unknown; new_session.py silently skips null values.
+#
+# Multi-channel stacks
+# --------------------
+# Set n_channels > 1 when the acquisition produced per-channel TIF files
+# (e.g. session_C00.tif, session_C01.tif).  new_session.py will generate
+# one _pipeline.json per channel, each stamped with data.channel_id.
+
+experiment:
+  datetime: null            # ISO 8601, e.g. 2024-11-15 14:30:00
+  id: null                  # integer experiment index within the lab
+  class: null               # experiment class / paradigm label
+  condition: null           # treatment / condition label
+
+subject:
+  id: null                  # integer subject ID
+  class: mouse              # animal class, e.g. mouse, rat
+  species: null             # e.g. c57BL/6J, Wistar
+  sex: null                 # M / F / null
+  age: null                 # age in weeks, or descriptive string
+  genotype: null            # e.g. WT, Thy1-GCaMP6f
+  weight: null              # body weight in grams
+
+acquisition_system:
+  settings:
+    sample_rate:
+      value: null           # frame rate in Hz, e.g. 30.0
+      units: Hz
+
+    magnification:
+      value: null           # numeric objective factor, e.g. 25
+      units: factor
+
+    laserPower:
+      value: null           # laser power at sample, e.g. 10.0
+      units: percent
+
+    fa: null                # fill fraction / frame averaging factor (integer)
+
+    depth:
+      value: null           # imaging depth relative to surface, e.g. -150
+      units: um
+
+    frame_size:
+      x: null               # frame width in pixels, e.g. 512
+      y: null               # frame height in pixels, e.g. 512
+
+    pixel_size:
+      x: null               # pixel width in µm, e.g. 0.78
+      y: null               # pixel height in µm, e.g. 0.78
+      units: um
+
+    n_channels: 1           # number of acquisition channels (1 = single-channel)
+    n_planes: 1             # number of z-planes per volume (1 = single-plane)
+    n_frames: null          # total frames acquired per channel per plane
+
+    pixel_type: uint16      # bit-depth / dtype: uint8, uint16, float32
+
+    indicator: null         # calcium indicator, e.g. GCaMP6f, jGCaMP8s
+    brain_area: null        # target brain region, e.g. V1, CA1
+
+    wavelength:
+      excitation: null      # excitation wavelength in nm, e.g. 920
+      emission: null        # emission wavelength in nm, e.g. 520
+
+# Optional: CaImAn parameter hints written by the experimentalist.
+# new_session.py applies these as overrides on top of template_pipeline.json
+# defaults and below explicit CLI flags.
+caiman_recommended:
+  gSig: null        # Gaussian half-width in pixels (int); sets gSig=[N,N], gSiz=[4N+1,4N+1]
+  rf: null          # CNMF patch half-size in pixels (int)
+  decay_time: null  # GCaMP decay time constant in seconds (float)
