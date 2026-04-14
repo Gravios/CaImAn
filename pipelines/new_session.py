@@ -736,6 +736,19 @@ def main(argv: list[str] | None = None) -> int:
     # In multi-channel mode, run estimation on C00 only (primary channel).
     _do_estimate = args.estimate_params or args.run_mc
     if _do_estimate:
+        # Apply env vars from the pipeline JSON before importing caiman so that
+        # CAIMAN_TEMP / CAIMAN_DATA etc. take effect at caiman import time and
+        # CaImAn never falls back to its compiled-in default (/data/proc/...).
+        _env_section = _base_patched.get("env", {})
+        for _ekey, _eval in _env_section.items():
+            if not _ekey.startswith("_comment") and isinstance(_eval, str):
+                os.environ.setdefault(_ekey, _eval)
+        # CAIMAN_TEMP / CAIMAN_DATA are always forced (not setdefault) because
+        # caiman reads them at import; a stale shell value could point anywhere.
+        for _force_key in ("CAIMAN_TEMP", "CAIMAN_DATA", "CAIMAN_SHM"):
+            if _force_key in _env_section:
+                os.environ[_force_key] = _env_section[_force_key]
+
         if _multichannel:
             _primary_cid = channel_ids[0]
             tif_path  = dest / f"{session}_C{_primary_cid}.tif"
