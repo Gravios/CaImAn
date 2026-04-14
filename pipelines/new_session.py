@@ -72,9 +72,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
+
+# Matches per-channel TIF names produced by stack_to_bigtiff multi-channel mode,
+# e.g.  "record-0001_C00.tif"  →  group(1)="record-0001"  group(2)="00"
+_MULTICHAN_TIF_RE = re.compile(r'^(.+)_C(\d{2})\.tiff?$', re.IGNORECASE)
 
 
 
@@ -83,13 +88,25 @@ from pathlib import Path
 def _read_yaml(path) -> dict:
     """Load an acquisition YAML and return a flat dict of useful defaults.
 
-    Reads:
-      acquisition_system.settings.sample_rate.value  → fr
-      acquisition_system.settings.magnification.value → magnification ("25x")
-      subject.species                                  → species ("mouse"/"rat")
-      caiman_recommended.gSig                          → gSig (int, if present)
-      caiman_recommended.rf                            → rf   (int, if present)
-      caiman_recommended.decay_time                    → decay_time (float, if present)
+    Reads from ``acquisition_system.settings``:
+      sample_rate.value   → fr
+      magnification.value → magnification (e.g. "25x")
+      n_channels          → n_channels  (int; drives multi-channel dispatch)
+      n_planes            → n_planes    (int)
+      n_frames            → n_frames_acq (int; informational)
+      frame_size          → frame_size  (dict {x, y})
+      pixel_size          → pixel_size  (dict {x, y, units})
+      pixel_type          → pixel_type  (str, e.g. "uint16")
+      depth.value         → depth_um    (float)
+      indicator           → indicator   (str or None)
+      brain_area          → brain_area  (str or None)
+      wavelength          → wavelength  (dict {excitation, emission})
+
+    Reads from ``subject``:
+      species             → species ("mouse" / "rat")
+
+    Reads from ``caiman_recommended`` (if present):
+      gSig, rf, decay_time
 
     Returns an empty dict if the file cannot be parsed or lacks expected keys.
     """
@@ -100,17 +117,66 @@ def _read_yaml(path) -> dict:
         return {}
     if not isinstance(doc, dict):
         return {}
+
     out: dict = {}
     acq = doc.get("acquisition_system", {}).get("settings", {})
-    sr  = acq.get("sample_rate", {})
+
+    # ── Frame rate ────────────────────────────────────────────────────────────
+    sr = acq.get("sample_rate", {})
     if isinstance(sr.get("value"), (int, float)):
         out["fr"] = float(sr["value"])
+
+    # ── Magnification ─────────────────────────────────────────────────────────
     mag = acq.get("magnification", {})
     if isinstance(mag.get("value"), (int, float)):
         out["magnification"] = f"{int(mag['value'])}x"
+
+    # ── Channel / plane counts ────────────────────────────────────────────────
+    if isinstance(acq.get("n_channels"), int):
+        out["n_channels"] = acq["n_channels"]
+    if isinstance(acq.get("n_planes"), int):
+        out["n_planes"] = acq["n_planes"]
+
+    # ── Frame count (informational) ───────────────────────────────────────────
+    if isinstance(acq.get("n_frames"), int):
+        out["n_frames_acq"] = acq["n_frames"]
+
+    # ── Frame geometry ────────────────────────────────────────────────────────
+    fs = acq.get("frame_size")
+    if isinstance(fs, dict) and "x" in fs and "y" in fs:
+        out["frame_size"] = {"x": fs["x"], "y": fs["y"]}
+
+    ps = acq.get("pixel_size")
+    if isinstance(ps, dict):
+        out["pixel_size"] = dict(ps)
+
+    if isinstance(acq.get("pixel_type"), str):
+        out["pixel_type"] = acq["pixel_type"]
+
+    # ── Imaging depth ─────────────────────────────────────────────────────────
+    depth = acq.get("depth", {})
+    if isinstance(depth.get("value"), (int, float)):
+        out["depth_um"] = float(depth["value"])
+
+    # ── Biological metadata ───────────────────────────────────────────────────
+    indicator = acq.get("indicator")
+    if indicator:
+        out["indicator"] = indicator
+
+    brain_area = acq.get("brain_area")
+    if brain_area:
+        out["brain_area"] = brain_area
+
+    wl = acq.get("wavelength")
+    if isinstance(wl, dict):
+        out["wavelength"] = dict(wl)
+
+    # ── Subject ───────────────────────────────────────────────────────────────
     species_raw = (doc.get("subject", {}) or {}).get("species", "") or ""
     if species_raw:
         out["species"] = "rat" if "rat" in species_raw.lower() else "mouse"
+
+    # ── caiman_recommended overrides (highest priority from YAML) ─────────────
     rec = doc.get("caiman_recommended") or {}
     if isinstance(rec.get("gSig"), int):
         out["gSig"] = rec["gSig"]
@@ -118,6 +184,7 @@ def _read_yaml(path) -> dict:
         out["rf"] = rec["rf"]
     if isinstance(rec.get("decay_time"), (int, float)):
         out["decay_time"] = float(rec["decay_time"])
+
     return out
 
 
@@ -259,15 +326,17 @@ def _patch_json(
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def _check_tif(dest: Path, session: str) -> str | None:
+def _check_tif(dest: Path, session: str, channel_id: str | None = None) -> str | None:
     """Return a warning string if the expected TIF is not found, else None.
 
-    Layout: the TIF lives in dest alongside the pipeline files.
-      <TL_dir>/<session>/
-        <session>.tif            ← here (dest)
-        <session>_pipeline.py
+    For single-channel sessions expects ``<session>.tif``.
+    For multi-channel sessions (``channel_id`` provided) expects
+    ``<session>_C{channel_id}.tif`` (e.g. ``<session>_C00.tif``).
     """
-    tif = dest / f"{session}.tif"
+    if channel_id is not None:
+        tif = dest / f"{session}_C{channel_id}.tif"
+    else:
+        tif = dest / f"{session}.tif"
     if not tif.exists():
         return (f"  ⚠  {tif.name} not found in {dest}\n"
                 f"     Place the TIFF in {dest} before running the pipeline.")
@@ -402,25 +471,28 @@ def _run_motion_correction(
 def _infer_from_cwd() -> tuple[str, Path]:
     """Infer (session, dest) from the current working directory.
 
-    Expected layout — run from the directory that contains the .tif::
+    Expected layouts::
 
-        <TL_dir>/
-          <session>/                ← CWD = dest
-            <session>.tif           ← TIF and pipeline files live together
+        Single-channel:
+          <session>/
+            <session>.tif
             <session>_pipeline.py
-            <session>_pipeline.json
-            caiman/  qc/  logs/
 
-    ``dest`` is always set to ``cwd`` so pipeline files land beside the TIF.
+        Multi-channel (produced by stack_to_bigtiff multi-channel mode):
+          <session>/
+            <session>_C00.tif
+            <session>_C01.tif   ← all share the same base stem
+            <session>_C00_pipeline.json
+            ...
+
+    Returns ``(base_session, cwd)`` in both cases. ``base_session`` is the
+    stem without any ``_CNN`` suffix; multi-channel dispatch is handled later
+    in ``main()`` via ``n_channels`` read from the acquisition YAML.
     """
-    cwd = Path.cwd()
+    cwd  = Path.cwd()
+    tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
 
-    tifs = [p for p in cwd.glob("*.tif") if p.is_file()]
-
-    if len(tifs) == 1:
-        return tifs[0].stem, cwd
-
-    if len(tifs) == 0:
+    if not tifs:
         raise SystemExit(
             "new_session.py: no .tif found in the current directory "
             f"({cwd}).\n"
@@ -428,7 +500,33 @@ def _infer_from_cwd() -> tuple[str, Path]:
             "  or supply session and dest arguments explicitly."
         )
 
-    names = "\n    ".join(t.name for t in sorted(tifs)[:8])
+    # ── Check for multi-channel set: stem_CNN.tif ─────────────────────────
+    multichan: dict[str, list[str]] = {}
+    for t in tifs:
+        m = _MULTICHAN_TIF_RE.match(t.name)
+        if m:
+            multichan.setdefault(m.group(1), []).append(m.group(2))
+
+    if multichan:
+        if len(multichan) == 1:
+            stem     = next(iter(multichan))
+            chan_ids = sorted(multichan[stem])
+            print(f"  Multi-channel TIFs detected: {len(chan_ids)} channel(s) "
+                  f"({', '.join('C'+c for c in chan_ids)})")
+            return stem, cwd
+        else:
+            names = "\n    ".join(sorted(multichan.keys()))
+            raise SystemExit(
+                f"new_session.py: multiple multi-channel TIF sets in {cwd}:\n"
+                f"    {names}\n"
+                "  Supply the session argument explicitly."
+            )
+
+    # ── Single TIF ────────────────────────────────────────────────────────
+    if len(tifs) == 1:
+        return tifs[0].stem, cwd
+
+    names = "\n    ".join(t.name for t in tifs[:8])
     raise SystemExit(
         f"new_session.py: multiple .tif files in {cwd}:\n"
         f"    {names}\n"
@@ -487,6 +585,10 @@ def main(argv: list[str] | None = None) -> int:
     _species = args.species    if args.species    != "mouse"  else _yd.get("species", args.species)
     _magnif  = args.magnification if args.magnification != "20x" else _yd.get("magnification", args.magnification)
 
+    # ── Channel / plane metadata from YAML ────────────────────────────────────
+    _n_channels = _yd.get("n_channels", 1)
+    _n_planes   = _yd.get("n_planes",   1)
+
     overrides: dict = {}
     if _fr      is not None: overrides["data.fr"]             = _fr
     if _decay   is not None: overrides["data.decay_time"]     = _decay
@@ -496,6 +598,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.min_pnr      is not None: overrides["cnmf.min_pnr"]       = args.min_pnr
     if args.method_init  is not None: overrides["cnmf.method_init"]   = args.method_init
     if args.n_processes  is not None: overrides["cluster.n_processes"] = args.n_processes
+
+    # Always write channel/plane counts into JSON so the pipeline script sees them.
+    overrides["data.n_channels"] = _n_channels
+    overrides["data.n_planes"]   = _n_planes
 
     if _gSig is not None:
         g = _gSig
@@ -509,42 +615,99 @@ def main(argv: list[str] | None = None) -> int:
             overrides.setdefault("cnmf.rf",     _rf_auto)
             overrides.setdefault("cnmf.stride", _rf_auto // 2)
 
-    # ── Patch JSON ────────────────────────────────────────────────────────────
-    patched = _patch_json(
+    # ── Determine channel list ────────────────────────────────────────────────
+    # Scan the dest directory for per-channel TIFs to enumerate channels when
+    # the YAML reports n_channels > 1.  Fall back to a synthetic list when TIFs
+    # are not yet present (e.g. during session setup before stacking).
+    if _n_channels > 1:
+        # Try to discover IDs from existing TIFs first.
+        _ch_tifs = sorted(dest.glob(f"{session}_C*.tif")) if dest.exists() else []
+        _discovered = []
+        for _t in _ch_tifs:
+            _m = _MULTICHAN_TIF_RE.match(_t.name)
+            if _m and _m.group(1) == session:
+                _discovered.append(_m.group(2))
+        if _discovered:
+            channel_ids = sorted(set(_discovered))
+        else:
+            # No TIFs yet — synthesise IDs from n_channels (C00, C01, …)
+            channel_ids = [f"{i:02d}" for i in range(_n_channels)]
+    else:
+        channel_ids = []   # empty → single-channel path
+
+    _multichannel = bool(channel_ids)
+
+    # ── Output paths ──────────────────────────────────────────────────────────
+    # Single-channel: one py + one json, same as before.
+    # Multi-channel:  one shared py  + one json per channel (_C00, _C01, …).
+    out_py = dest / f"{session}_pipeline.py"
+    if _multichannel:
+        out_jsons = {
+            cid: dest / f"{session}_C{cid}_pipeline.json"
+            for cid in channel_ids
+        }
+        all_outputs = [out_py] + list(out_jsons.values())
+    else:
+        out_json  = dest / f"{session}_pipeline.json"
+        all_outputs = [out_py, out_json]
+
+    # ── Conflict check ────────────────────────────────────────────────────────
+    existing = [p for p in all_outputs if p.exists()]
+    if existing and not args.force and not args.dry_run:
+        print("The following files already exist:")
+        for p in existing:
+            print(f"  {p}")
+        ans = input("Overwrite? [y/N] ").strip().lower()
+        if ans != "y":
+            print("Aborted.")
+            return 0
+
+    # ── Patch JSON(s) ─────────────────────────────────────────────────────────
+    # Build base patched dict (channel-independent overrides applied here).
+    _base_patched = _patch_json(
         tpl_json, session, dest,
         data_root      = args.data_root,
         overrides      = overrides,
         strip_comments = args.no_comments,
     )
-    json_txt = json.dumps(patched, indent=4)
+    dr  = _base_patched["session"]["data_root"]
+    exp = _base_patched["session"]["experiment"]
 
-    # ── Dry-run summary ───────────────────────────────────────────────────────
-    dr  = patched["session"]["data_root"]
-    exp = patched["session"]["experiment"]
-
+    # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print("Session preparation")
     print("=" * 60)
-    print(f"  Session    : {session}")
-    print(f"  Dest       : {dest}")
-    print(f"  data_root  : {dr}")
-    print(f"  experiment : {exp}")
+    print(f"  Session      : {session}")
+    print(f"  Dest         : {dest}")
+    print(f"  data_root    : {dr}")
+    print(f"  experiment   : {exp}")
+    if _multichannel:
+        print(f"  Channels     : {len(channel_ids)}  ({', '.join('C'+c for c in channel_ids)})")
+    print(f"  n_channels   : {_n_channels}")
+    print(f"  n_planes     : {_n_planes}")
     if args.estimate_params or args.run_mc:
-        print(f"  Species    : {args.species}")
-        print(f"  Magnif.    : {args.magnification}")
+        print(f"  Species      : {_species}")
+        print(f"  Magnif.      : {_magnif}")
     if overrides:
-        print("  Overrides  :")
+        print("  Overrides    :")
         for k, v in overrides.items():
             print(f"    {k} = {v}")
     print()
     print("  Files to write:")
-    print(f"    {out_py}")
-    print(f"    {out_json}")
+    for p in all_outputs:
+        print(f"    {p}")
 
-    tif_warn = _check_tif(dest, session)
-    if tif_warn:
-        print()
-        print(tif_warn)
+    if _multichannel:
+        for cid in channel_ids:
+            tif_warn = _check_tif(dest, session, channel_id=cid)
+            if tif_warn:
+                print()
+                print(tif_warn)
+    else:
+        tif_warn = _check_tif(dest, session)
+        if tif_warn:
+            print()
+            print(tif_warn)
 
     if args.dry_run:
         print()
@@ -554,15 +717,33 @@ def main(argv: list[str] | None = None) -> int:
     # ── Write files ───────────────────────────────────────────────────────────
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(tpl_py, out_py)
-    out_json.write_text(json_txt + "\n")
+
+    if _multichannel:
+        for cid in channel_ids:
+            import copy as _copy
+            _ch_patched = _copy.deepcopy(_base_patched)
+            _ch_patched["data"]["channel_id"] = int(cid)
+            _ch_json_path = out_jsons[cid]
+            _ch_json_path.write_text(json.dumps(_ch_patched, indent=4) + "\n")
+            print(f"  Wrote  {_ch_json_path.name}")
+    else:
+        out_json.write_text(json.dumps(_base_patched, indent=4) + "\n")
 
     print()
     print("Done.")
 
     # ── Optional motion correction + parameter estimation ────────────────
+    # In multi-channel mode, run estimation on C00 only (primary channel).
     _do_estimate = args.estimate_params or args.run_mc
     if _do_estimate:
-        tif_path = dest / f"{session}.tif"
+        if _multichannel:
+            _primary_cid = channel_ids[0]
+            tif_path  = dest / f"{session}_C{_primary_cid}.tif"
+            out_json  = out_jsons[_primary_cid]
+            print(f"\n  Multi-channel: running MC/estimation on primary channel C{_primary_cid}.")
+        else:
+            tif_path = dest / f"{session}.tif"
+
         if not tif_path.exists():
             print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
             print(f"     Place the TIFF and re-run.")
@@ -585,7 +766,6 @@ def main(argv: list[str] | None = None) -> int:
                 _mc_path = (_mc or _mc_temp)
 
                 # ── Run MC if requested and not already done ──────────────
-                # Track whether we created the MC mmap so we can delete it.
                 _mc_created = False
                 _mc_obj     = None
                 if args.run_mc and not _mc_path:
@@ -594,21 +774,15 @@ def main(argv: list[str] | None = None) -> int:
                         tif_path, session, _caiman_temp, _est_logger)
                     if _new_mc:
                         _mc_path   = [_new_mc]
-                        _mc_created = True   # we own it — delete after use
+                        _mc_created = True
                 elif args.run_mc and _mc_path:
                     print(f"\n  MC mmap already exists — skipping motion correction.")
                     print(f"  ({_mc_path[-1]})")
 
                 # ── MC parameter suggestions from shifts ──────────────────
-                # Only when we ran MC ourselves: derive better max_shifts
-                # from the actual shift distribution rather than using the
-                # conservative [6,6] default.
                 if _mc_created and _mc_obj is not None:
                     import numpy as _np_mc
-                    _shifts = _np_mc.array(_mc_obj.shifts_rig)   # (T, 2)
-                    _mag    = _np_mc.hypot(_shifts[:, 0], _shifts[:, 1])
-                    # Suggested max_shifts = 99th-percentile magnitude per
-                    # axis, rounded up to the next even integer, minimum 4.
+                    _shifts = _np_mc.array(_mc_obj.shifts_rig)
                     _p99_r  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 0]), 99))
                     _p99_c  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 1]), 99))
                     _ms_r   = max(4, int(_np_mc.ceil(_p99_r / 2)) * 2)
@@ -619,8 +793,6 @@ def main(argv: list[str] | None = None) -> int:
                         f"→ max_shifts=[{_ms_r}, {_ms_c}]"
                     )
                     del _mc_obj
-                    # Write shift-derived MC params into the JSON now,
-                    # before parameter estimation (which may also update json).
                     from caiman.utils.params_estimator import apply_suggestions as _apply
                     _apply(out_json, {f"motion_correction.{k}": v
                                       for k, v in _mc_overrides.items()})
@@ -645,8 +817,6 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  No MC mmap found for {session}.")
                         print(f"  Re-run with --run-mc to run motion correction first.")
                 finally:
-                    # Delete the MC mmap only if we created it.
-                    # Pre-existing mmaps are always left untouched.
                     if _mc_created and _mc_path and _mc_path[-1]:
                         try:
                             import os as _os_del
@@ -663,10 +833,16 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("Next steps:")
-    print(f"  1. Review and tune:  {out_json.name}")
-    print(f"  2. Place TIFF:       {dest}/{session}.tif")
-    print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
-    print(f"  4. Run:              python {out_py.name}")
+    if _multichannel:
+        for cid in channel_ids:
+            _cj = out_jsons[cid]
+            print(f"  Review  :  {_cj.name}")
+        print(f"  Run     :  python {out_py.name}  (set channel_id in each JSON first)")
+    else:
+        print(f"  1. Review and tune:  {out_json.name}")
+        print(f"  2. Place TIFF:       {dest}/{session}.tif")
+        print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
+        print(f"  4. Run:              python {out_py.name}")
     print()
 
     return 0
