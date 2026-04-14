@@ -260,11 +260,17 @@ def _patch_json(
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def _check_tif(dest: Path, session: str) -> str | None:
-    """Return a warning string if the expected TIF is not found, else None."""
-    tif = dest / f"{session}.tif"
+    """Return a warning string if the expected TIF is not found, else None.
+
+    Layout: the TIF lives in dest.parent (the TL dir), not in dest.
+      TL_dir/
+        <session>.tif   ← here
+        <session>/      ← dest
+    """
+    tif = dest.parent / f"{session}.tif"
     if not tif.exists():
-        return (f"  ⚠  {tif.name} not found in {dest}\n"
-                f"     Place the TIFF there before running the pipeline.")
+        return (f"  ⚠  {tif.name} not found in {dest.parent}\n"
+                f"     Place the TIFF in {dest.parent} before running the pipeline.")
     return None
 
 
@@ -564,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Optional motion correction + parameter estimation ────────────────
     _do_estimate = args.estimate_params or args.run_mc
     if _do_estimate:
-        tif_path = dest / f"{session}.tif"
+        tif_path = dest.parent / f"{session}.tif"  # TIF lives in TL dir, not session dir
         if not tif_path.exists():
             print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
             print(f"     Place the TIFF and re-run.")
@@ -666,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Next steps:")
     print(f"  1. Review and tune:  {out_json.name}")
-    print(f"  2. Place TIFF:       {dest}/{session}.tif")
+    print(f"  2. TIFF location:    {dest.parent}/{session}.tif")
     print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
     print(f"  4. Run:              python {out_py.name}")
     print()
