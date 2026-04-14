@@ -51,16 +51,16 @@
         "p": 1,
         "gnb": 2,
         "merge_thr": 0.85,
-        "rf": 45,
-        "stride": 22,
+        "rf": 20,
+        "stride": 10,
         "K": 15,
         "gSig": [
-            9,
-            9
+            4,
+            4
         ],
         "gSiz": [
-            37,
-            37
+            17,
+            17
         ],
         "ring_size_factor": 0.9,
         "min_corr": 0.6,
@@ -75,7 +75,7 @@
         "nb_patch": 0,
         "del_duplicates": false,
         "normalize_init": false,
-        "maxthr": 0.05,
+        "maxthr": 0.1,
         "extract_cc": true,
         "bas_nonneg": true,
         "rolling_sum": true,
