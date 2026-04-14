@@ -262,15 +262,15 @@ def _patch_json(
 def _check_tif(dest: Path, session: str) -> str | None:
     """Return a warning string if the expected TIF is not found, else None.
 
-    Layout: the TIF lives in dest.parent (the TL dir), not in dest.
-      TL_dir/
-        <session>.tif   ← here
-        <session>/      ← dest
+    Layout: the TIF lives in dest alongside the pipeline files.
+      <TL_dir>/<session>/
+        <session>.tif            ← here (dest)
+        <session>_pipeline.py
     """
-    tif = dest.parent / f"{session}.tif"
+    tif = dest / f"{session}.tif"
     if not tif.exists():
-        return (f"  ⚠  {tif.name} not found in {dest.parent}\n"
-                f"     Place the TIFF in {dest.parent} before running the pipeline.")
+        return (f"  ⚠  {tif.name} not found in {dest}\n"
+                f"     Place the TIFF in {dest} before running the pipeline.")
     return None
 
 
@@ -402,47 +402,39 @@ def _run_motion_correction(
 def _infer_from_cwd() -> tuple[str, Path]:
     """Infer (session, dest) from the current working directory.
 
-    Two supported layouts::
+    Expected layout — run from the directory that contains the .tif::
 
-        # Run from TL dir — the .tif lives here, session dir is a child
         <TL_dir>/
-          <session>.tif          ← we find this
-          <session>/             ← dest (created if missing)
+          <session>/                ← CWD = dest
+            <session>.tif           ← TIF and pipeline files live together
+            <session>_pipeline.py
+            <session>_pipeline.json
+            caiman/  qc/  logs/
 
-        # Run from an already-created session dir
-        <TL_dir>/
-          <session>.tif
-          <session>/             ← cwd IS dest; session = cwd.name
+    ``dest`` is always set to ``cwd`` so pipeline files land beside the TIF.
     """
     cwd = Path.cwd()
 
-    # Case 1: cwd is the session dir (session dir already exists)
-    # Detect by checking whether a .tif with our name exists in the parent.
-    candidate_tif = cwd.parent / f"{cwd.name}.tif"
-    if candidate_tif.exists():
-        return cwd.name, cwd
-
-    # Case 2: cwd is the TL dir — find exactly one .tif (excluding sub-dirs)
     tifs = [p for p in cwd.glob("*.tif") if p.is_file()]
+
     if len(tifs) == 1:
-        session = tifs[0].stem
-        dest = cwd / session
-        return session, dest
+        return tifs[0].stem, cwd
 
     if len(tifs) == 0:
         raise SystemExit(
-            "new_session.py: cannot infer session — no .tif found in "
-            f"{cwd}\n"
-            "  Either cd into the TL directory containing the .tif, or supply\n"
-            "  the session and dest arguments explicitly."
+            "new_session.py: no .tif found in the current directory "
+            f"({cwd}).\n"
+            "  cd into the directory that contains the .tif and re-run,\n"
+            "  or supply session and dest arguments explicitly."
         )
-    # Multiple TIFs — ambiguous
+
     names = "\n    ".join(t.name for t in sorted(tifs)[:8])
     raise SystemExit(
-        f"new_session.py: multiple .tif files found in {cwd}, cannot infer session:\n"
+        f"new_session.py: multiple .tif files in {cwd}:\n"
         f"    {names}\n"
         "  Supply the session and dest arguments explicitly."
     )
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -570,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Optional motion correction + parameter estimation ────────────────
     _do_estimate = args.estimate_params or args.run_mc
     if _do_estimate:
-        tif_path = dest.parent / f"{session}.tif"  # TIF lives in TL dir, not session dir
+        tif_path = dest / f"{session}.tif"
         if not tif_path.exists():
             print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
             print(f"     Place the TIFF and re-run.")
@@ -672,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Next steps:")
     print(f"  1. Review and tune:  {out_json.name}")
-    print(f"  2. TIFF location:    {dest.parent}/{session}.tif")
+    print(f"  2. Place TIFF:       {dest}/{session}.tif")
     print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
     print(f"  4. Run:              python {out_py.name}")
     print()
