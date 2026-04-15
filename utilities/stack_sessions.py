@@ -357,7 +357,7 @@ def _write_yaml(path: Path, doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Frame/session helpers (unchanged from previous version)
+# Frame / session helpers
 # ---------------------------------------------------------------------------
 
 def _tiff_magic(path: Path) -> bool:
@@ -499,55 +499,57 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         # ── Build and write Trial YAML (before stacking) ─────────────────────
-        yaml_path = session_dir / f"{session_name}.yaml"
+        yaml_path   = session_dir / f"{session_name}.yaml"
+        yaml_updated = False
         if yaml_path.exists():
             print(f"    yaml: {yaml_path.name} already exists - updating OME fields only")
             try:
                 update_yaml(yaml_path, px)
+                yaml_updated = True
             except Exception as exc:
                 print(f"    yaml: WARNING update failed: {exc}")
         else:
             if not args.dry_run:
                 doc = build_yaml(session_name, master, px, len(channel_ids))
                 _write_yaml(yaml_path, doc)
-                # Report what was populated
                 s   = doc.get("acquisition_system", {}).get("settings", {})
                 exp = doc.get("experiment", {})
                 sub = doc.get("subject", {})
-                populated = {
-                    k: v for k, v in {
-                        "datetime":    exp.get("datetime"),
-                        "condition":   exp.get("condition"),
-                        "subject_id":  sub.get("id"),
-                        "magnif":      (s.get("magnification") or {}).get("value"),
-                        "fa":          s.get("fa"),
-                        "laser_%":     (s.get("laserPower") or {}).get("value"),
-                        "depth_um":    (s.get("depth") or {}).get("value"),
-                        "fr_Hz":       (s.get("sample_rate") or {}).get("value"),
-                        "frame_size":  s.get("frame_size"),
-                        "n_channels":  s.get("n_channels"),
-                        "n_frames":    s.get("n_frames"),
-                    }.items() if v is not None
-                }
+                populated = {k: v for k, v in {
+                    "datetime":   exp.get("datetime"),
+                    "condition":  exp.get("condition"),
+                    "subject_id": sub.get("id"),
+                    "magnif":     (s.get("magnification") or {}).get("value"),
+                    "fa":         (s.get("fa") or {}).get("value"),
+                    "laser_%":    (s.get("laserPower") or {}).get("value"),
+                    "depth_um":   (s.get("depth") or {}).get("value"),
+                    "fr_Hz":      (s.get("sample_rate") or {}).get("value"),
+                    "frame_size": s.get("frame_size"),
+                    "n_channels": s.get("n_channels"),
+                    "n_frames":   s.get("n_frames"),
+                }.items() if v is not None}
                 fields_str = "  ".join(f"{k}={v}" for k, v in populated.items())
                 print(f"    yaml: wrote {yaml_path.name}  [{fields_str}]")
+                yaml_updated = True
             else:
-                # Dry-run: show what would be parsed
                 dn = _parse_session_name(session_name)
                 fn = _parse_frame_name(master.name)
                 print(f"    yaml: would write {yaml_path.name}")
-                print(f"           dirname → {dn}")
-                print(f"           frame   → {fn}")
+                print(f"           dirname -> {dn}")
+                print(f"           frame   -> {fn}")
 
         for ch in channel_ids:
-            output = session_dir / f"{session_name}-C{ch}-fc{fc_str}.tif"
+            stem       = f"{session_name}-C{ch}-fc{fc_str}"
+            ch_dir     = session_dir / stem
+            output     = ch_dir / f"{stem}.tif"
 
+            # Skip if the channel subdir already contains a stacked TIF
             if output.exists():
                 print(f"    C{ch}: already exists, skipping")
                 continue
 
             frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
-            print(f"    C{ch}: {len(frames)} frames -> {output.name}")
+            print(f"    C{ch}: {len(frames)} frames -> {stem}/")
 
             if args.dry_run:
                 continue
@@ -557,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
             cur_width = len(sample_t.group(2)) if sample_t else 4
             needed    = max(6, len(str(max(frame_count - 1, 0))))
             if cur_width < needed:
-                print(f"    C{ch}: padding time indices → {needed} digits...")
+                print(f"    C{ch}: padding time indices -> {needed} digits...")
                 n = _pad_time_indices(session_dir, ch, needed)
                 print(f"    C{ch}: padded {n} filename(s)")
                 frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
@@ -570,7 +572,8 @@ def main(argv: list[str] | None = None) -> int:
                     if new_master.exists():
                         master = new_master
 
-            # ── Stack ────────────────────────────────────────────────────────
+            # ── Create channel subdir and stack ──────────────────────────────
+            ch_dir.mkdir(exist_ok=True)
             stack_frames(
                 input_dir   = session_dir,
                 output_path = output,

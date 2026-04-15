@@ -11,41 +11,33 @@ CNMF parameters, and executes the pipeline.
 
 Quick start
 -----------
-  # From the TIF directory (session and dest inferred automatically):
-  cd /data/source/.../strohA-ia-000000-20151016/strohA-ia-000000-20151016-TL001_143915-25x-spont
+  # From the channel subdir (session and dest inferred automatically):
+  cd /data/source/.../TL001_143915-25x-spont/TL001_143915-25x-spont-C00-fc011170
   new-session -y
   new-session --run-mc --estimate-params -y
   new-session --run-mc --estimate-params --run -y
 
-  # Explicit session and dest:
-  new-session strohA-ia-000000-20151016-TL001_143915-25x-spont-C00-fc011170 \
-              /data/source/.../strohA-ia-000000-20151016-TL001_143915-25x-spont \
-              --run-mc --estimate-params -y
+  # Explicit:
+  new-session <session-stem> <dest-path> --run-mc --estimate-params -y
 
 Positional arguments
 --------------------
-  session               Session identifier (TIF stem).
-                        Omit to infer from CWD.
-  dest                  Absolute path to the session folder.
-                        Omit to infer from CWD.
+  session               Session identifier (TIF stem). Inferred from CWD if omitted.
+  dest                  Path to the channel subdir. Inferred from CWD if omitted.
 
 Session / data flags
 ---------------------
   --data-root PATH      Override inferred data_root in the JSON.
-  --yaml PATH           Acquisition YAML to read defaults from.
-                        Auto-detected from dest parent if omitted.
+  --yaml PATH           Acquisition YAML. Auto-detected from dest parent if omitted.
                         Created from template if not found.
   --fr HZ               Acquisition frame rate [Hz].
-  --decay-time S        GCaMP decay time constant [s].
-                        (GCaMP6f ~0.4, GCaMP6s ~1.0)
+  --decay-time S        GCaMP decay time constant [s]. (GCaMP6f ~0.4, GCaMP6s ~1.0)
 
 CNMF parameter flags
 ---------------------
-  --gSig PX             Gaussian half-width [px].
-                        Sets gSig=[N,N] and gSiz=[4N+1,4N+1].
+  --gSig PX             Gaussian half-width [px]. Sets gSig=[N,N] and gSiz=[4N+1,4N+1].
                         Also auto-derives rf and stride when --rf is omitted.
-  --rf PX               Patch half-size [px].
-                        Ring constraint: ring_size_factor x gSiz must be < rf.
+  --rf PX               Patch half-size [px]. Ring constraint: ring_size_factor x gSiz < rf.
   --K N                 Max components per patch.
   --min-corr F          Minimum local correlation for seed pixel.
   --min-pnr F           Minimum peak-to-noise ratio for seed pixel.
@@ -54,26 +46,17 @@ CNMF parameter flags
 
 Processing flags
 -----------------
-  --run-mc              Run GPU rigid motion correction before parameter
-                        estimation if no MC mmap exists yet.
-                        Implies --estimate-params.
-  --estimate-params     Estimate CNMF parameters from the MC'd movie and
-                        update the JSON with the suggestions.
-  --n-frames N          Frames to subsample for parameter estimation.
-                        Default: 500.
-  --species mouse|rat   Animal species — constrains gSig search range.
-                        Default: mouse.
-  --magnification 20x|40x
-                        Objective magnification — combined with species to
-                        bound gSig. Default: 20x.
-  --run                 Run the pipeline script after setup (and MC /
-                        estimation if those flags are also set).
+  --run-mc              Run GPU rigid motion correction. Implies --estimate-params.
+  --estimate-params     Estimate CNMF parameters from the MC'd movie.
+  --n-frames N          Frames to subsample for param estimation. Default: 500.
+  --species mouse|rat   Animal species. Default: mouse.
+  --magnification 20x|40x  Objective magnification. Default: 20x.
+  --run                 Run the pipeline script after setup.
 
 Behaviour flags
 ---------------
-  --dry-run             Print what would be done without writing any files.
-  -y / --force          Overwrite existing pipeline files without prompting.
-                        Useful in batch scripts.
+  --dry-run             Preview only -- no files written.
+  -y / --force          Overwrite existing files without prompting.
   --no-comments         Strip _comment keys from the output JSON.
   -h / --help           Show this help message.
 
@@ -81,36 +64,36 @@ Output files
 ------------
   <dest>/<session>_pipeline.py    Ready-to-run pipeline script.
   <dest>/<session>_pipeline.json  JSON config with all parameters.
-  <dest>/<session>.yaml           Acquisition YAML (created from template
-                                  if not already present).
+  <dest.parent>/<TL_dir>.yaml     Acquisition YAML (created from template if absent).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
 
-# Matches per-channel TIF names produced by stack_to_bigtiff multi-channel mode,
-# e.g.  "record-0001_C00.tif"  →  group(1)="record-0001"  group(2)="00"
-_MULTICHAN_TIF_RE = re.compile(r'^(.+)_C(\d{2})\.tiff?$', re.IGNORECASE)
+logger = logging.getLogger(__name__)
+
+# ── Template locations ────────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PIPELINES  = _SCRIPT_DIR / "pipelines"
+_TPL_PY     = _PIPELINES / "template_pipeline.py"
+_TPL_JSON   = _PIPELINES / "template_pipeline.json"
+_TPL_YAML   = _PIPELINES / "template_acquisition.yaml"
 
 
+# ── YAML helpers ──────────────────────────────────────────────────────────────
 
-# ── YAML reader ───────────────────────────────────────────────────────────────
+def _read_yaml(path: Path) -> dict:
+    """Load acquisition YAML -> flat dict of pipeline defaults.
 
-def _read_yaml(path) -> dict:
-    """Load an acquisition YAML and return a flat dict of useful defaults.
-
-    Handles both {value, units} nodes and plain scalars for all fields.
-    Reads pixel_dtype (new) with fallback to pixel_type (old).
-    Reads regions.vis_ctx.indicator and coordinates.
-
-    Returns an empty dict if the file cannot be parsed.
+    Handles both {value, units} nodes and plain scalars.
+    Returns {} if the file cannot be parsed.
     """
     try:
         import yaml as _yaml
@@ -124,9 +107,7 @@ def _read_yaml(path) -> dict:
     acq = doc.get("acquisition_system", {}).get("settings", {})
 
     def _val(node):
-        if isinstance(node, dict):
-            return node.get("value")
-        return node
+        return node.get("value") if isinstance(node, dict) else node
 
     fr = _val(acq.get("sample_rate"))
     if isinstance(fr, (int, float)):
@@ -136,17 +117,15 @@ def _read_yaml(path) -> dict:
     if isinstance(mag, (int, float)):
         out["magnification"] = f"{int(mag)}x"
 
-    if isinstance(acq.get("n_channels"), int):
-        out["n_channels"] = acq["n_channels"]
-    if isinstance(acq.get("n_planes"), int):
-        out["n_planes"] = acq["n_planes"]
+    for key in ("n_channels", "n_planes"):
+        if isinstance(acq.get(key), int):
+            out[key] = acq[key]
     if isinstance(acq.get("n_frames"), int):
         out["n_frames_acq"] = acq["n_frames"]
 
     fs = acq.get("frame_size")
     if isinstance(fs, dict) and "x" in fs and "y" in fs:
         out["frame_size"] = {"x": fs["x"], "y": fs["y"]}
-
     ps = acq.get("pixel_size")
     if isinstance(ps, dict):
         out["pixel_size"] = dict(ps)
@@ -157,27 +136,20 @@ def _read_yaml(path) -> dict:
     elif isinstance(acq.get("pixel_type"), str):
         out["pixel_dtype"] = acq["pixel_type"]
 
-    depth = _val(acq.get("depth"))
-    if isinstance(depth, (int, float)):
-        out["depth_um"] = float(depth)
-
-    fa = _val(acq.get("fa"))
-    if fa is not None:
-        out["fa"] = fa
-
-    lp = _val(acq.get("laserPower"))
-    if isinstance(lp, (int, float)):
-        out["laser_power"] = float(lp)
-
-    gain = _val(acq.get("gain"))
-    if isinstance(gain, (int, float)):
-        out["gain"] = float(gain)
+    if isinstance(_val(acq.get("depth")), (int, float)):
+        out["depth_um"] = float(_val(acq["depth"]))
+    if _val(acq.get("fa")) is not None:
+        out["fa"] = _val(acq["fa"])
+    if isinstance(_val(acq.get("laserPower")), (int, float)):
+        out["laser_power"] = float(_val(acq["laserPower"]))
+    if isinstance(_val(acq.get("gain")), (int, float)):
+        out["gain"] = float(_val(acq["gain"]))
 
     vis_ctx = (doc.get("regions") or {}).get("vis_ctx") or {}
     if vis_ctx.get("indicator"):
         out["indicator"] = vis_ctx["indicator"]
 
-    species_raw = (doc.get("subject", {}) or {}).get("species", "") or ""
+    species_raw = (doc.get("subject") or {}).get("species") or ""
     if species_raw:
         out["species"] = "rat" if "rat" in species_raw.lower() else "mouse"
 
@@ -192,21 +164,16 @@ def _read_yaml(path) -> dict:
     return out
 
 
-def _find_yaml(session: str, dest) -> "Path | None":
-    """Locate the acquisition YAML for a session.
+def _find_yaml(session: str, dest: Path) -> Path | None:
+    """Locate the acquisition YAML.
 
-    Layout (current)::
-
-        <TL_dir>/               ← dest
-          <TL_dir>.yaml         ← YAML lives here alongside the TIF
-          <session>.tif
-          <session>_pipeline.py
-
-    Returns ``dest / (dest.name + ".yaml")`` if it exists, then falls back
-    to ``dest / (session + ".yaml")``.
+    Layout::
+        <TL_dir>/              <- dest.parent
+          <TL_dir>.yaml        <- canonical location
+          <TL_dir>-C00-fc<N>/ <- dest
     """
     for candidate in [
-        dest / (dest.name + ".yaml"),
+        dest.parent / (dest.parent.name + ".yaml"),
         dest / (session + ".yaml"),
     ]:
         if candidate.exists() and ".bak" not in candidate.suffixes:
@@ -214,16 +181,9 @@ def _find_yaml(session: str, dest) -> "Path | None":
     return None
 
 
-# ── Locate templates ──────────────────────────────────────────────────────────
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_PIPELINES  = _SCRIPT_DIR / "pipelines"
-_TPL_PY     = _PIPELINES / "template_pipeline.py"
-_TPL_JSON   = _PIPELINES / "template_pipeline.json"
-
+# ── Template helpers ──────────────────────────────────────────────────────────
 
 def _find_templates() -> tuple[Path, Path]:
-    """Return (template.py, template.json), raising if not found."""
     missing = [p for p in (_TPL_PY, _TPL_JSON) if not p.exists()]
     if missing:
         raise FileNotFoundError(
@@ -236,38 +196,24 @@ def _find_templates() -> tuple[Path, Path]:
 # ── JSON patching ─────────────────────────────────────────────────────────────
 
 def _infer_paths(dest: Path, data_root: str | None) -> tuple[str, str]:
-    """Infer data_root and experiment from *dest*.
-
-    Walks upward from *dest* to find the longest prefix that matches
-    *data_root* (default ``/data/src/``).  The remainder is the experiment
-    path.
-
-    Returns ``(data_root, experiment)`` as strings with trailing slashes.
-    """
     if data_root is None:
-        # Heuristic: try common roots in order
         for candidate in ["/data/src", "/data", "/mnt/data/src"]:
             if str(dest).startswith(candidate):
                 data_root = candidate
                 break
         else:
-            # Fall back to parent of dest
             data_root = str(dest.parent.parent)
-
     data_root = data_root.rstrip("/")
     dest_str  = str(dest).rstrip("/")
-
-    if dest_str.startswith(data_root):
-        experiment = dest_str[len(data_root):].lstrip("/") + "/"
-    else:
-        # dest is outside data_root — use absolute path as experiment
-        experiment = dest_str.lstrip("/") + "/"
-
-    return data_root + "/", experiment
+    experiment = (
+        dest_str[len(data_root):].lstrip("/")
+        if dest_str.startswith(data_root)
+        else dest_str.lstrip("/")
+    )
+    return data_root + "/", experiment + "/"
 
 
 def _strip_comments(raw: dict) -> dict:
-    """Recursively remove ``_comment`` keys from a dict (in-place copy)."""
     if isinstance(raw, dict):
         return {k: _strip_comments(v) for k, v in raw.items()
                 if not k.startswith("_comment")}
@@ -284,72 +230,159 @@ def _patch_json(
     overrides: dict,
     strip_comments: bool,
 ) -> dict:
-    """Load the template JSON and apply all patches.
-
-    Parameters
-    ----------
-    template_path
-        Path to ``template_pipeline.json``.
-    session
-        Session identifier.
-    dest
-        Session destination folder.
-    data_root
-        Explicit data root override, or ``None`` to infer.
-    overrides
-        Dict of ``{section.key: value}`` overrides from CLI flags.
-    strip_comments
-        If ``True``, remove ``_comment`` keys from the output.
-
-    Returns
-    -------
-    dict
-        Patched JSON as a plain dict, ready for ``json.dump``.
-    """
     raw = json.loads(template_path.read_text())
-
     dr, exp = _infer_paths(dest, data_root)
     raw["session"]["data_root"]  = dr
     raw["session"]["experiment"] = exp
-
-    # Remove placeholder _comment from session (not useful after patching)
     raw["session"].pop("_comment", None)
-
-    # Apply CLI overrides: section.key → value
     for dotkey, value in overrides.items():
         parts = dotkey.split(".", 1)
         if len(parts) == 2:
             section, key = parts
-            if section in raw and isinstance(raw[section], dict):
-                raw[section][key] = value
-            else:
-                raw[section] = {key: value}
+            raw.setdefault(section, {})[key] = value
         else:
             raw[dotkey] = value
-
-    if strip_comments:
-        raw = _strip_comments(raw)
-
-    return raw
+    return _strip_comments(raw) if strip_comments else raw
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
-def _check_tif(dest: Path, session: str, channel_id: str | None = None) -> str | None:
-    """Return a warning string if the expected TIF is not found, else None.
-
-    Pipeline files and TIFs all live in the same directory (dest).
-    For single-channel: <session>.tif
-    For multi-channel:  <session>_C{channel_id}.tif
-    """
-    if channel_id is not None:
-        tif = dest / f"{session}_C{channel_id}.tif"
-    else:
-        tif = dest / f"{session}.tif"
+def _check_tif(dest: Path, session: str) -> str | None:
+    tif = dest / f"{session}.tif"
     if not tif.exists():
         return (f"  ⚠  {tif.name} not found in {dest}\n"
-                f"     Place the TIFF in {dest} before running the pipeline.")
+                f"     Place the TIFF before running the pipeline.")
     return None
+
+
+# ── Inference ────────────────────────────────────────────────────────────────
+
+def _infer_from_cwd() -> tuple[str, Path]:
+    """Infer (session, dest) from CWD (the channel subdir)."""
+    cwd  = Path.cwd()
+    tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
+    if not tifs:
+        raise SystemExit(
+            f"new_session.py: no .tif found in {cwd}.\n"
+            "  cd into the channel subdir, or supply session and dest explicitly."
+        )
+    if len(tifs) == 1:
+        return tifs[0].stem, cwd
+    names = "\n    ".join(t.name for t in tifs[:8])
+    raise SystemExit(
+        f"new_session.py: multiple .tif files in {cwd}:\n    {names}\n"
+        "  Supply session and dest arguments explicitly."
+    )
+
+
+# ── MC / param estimation ─────────────────────────────────────────────────────
+
+def _apply_pipeline_env(env_section: dict) -> None:
+    """Apply env vars from the pipeline JSON before caiman import."""
+    for key, val in env_section.items():
+        if not key.startswith("_comment") and isinstance(val, str):
+            os.environ.setdefault(key, val)
+    # Always force CaImAn path vars so stale shell values don't misdirect
+    for key in ("CAIMAN_TEMP", "CAIMAN_DATA", "CAIMAN_SHM"):
+        if key in env_section:
+            os.environ[key] = env_section[key]
+
+
+def _run_motion_correction(tif_path: Path, caiman_temp: str, log) -> tuple:
+    """GPU rigid MC. Returns (mmap_path, mc_object) or (None, None) on failure."""
+    try:
+        from caiman.motion_correction import MotionCorrect as _MC
+        import numpy as _np
+        log.info(f"MC: rigid GPU correction on {tif_path}")
+        mc = _MC(
+            [str(tif_path)],
+            dview=None, max_shifts=[6, 6], strides=[64, 64], overlaps=[32, 32],
+            max_deviation_rigid=3, shifts_opencv=True, nonneg_movie=True,
+            border_nan="copy", pw_rigid=False, use_gpu=True,
+        )
+        mc.motion_correct(save_movie=True)
+        fname = mc.mmap_file[0]
+        shifts = _np.array(mc.shifts_rig)
+        mag    = _np.hypot(shifts[:, 0], shifts[:, 1])
+        log.info(f"MC done: {fname}  (median {_np.median(mag):.2f} px, max {mag.max():.2f} px)")
+        return fname, mc
+    except Exception as exc:
+        log.warning(f"MC failed: {exc}")
+        return None, None
+
+
+def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> None:
+    """Run motion correction and/or param estimation; updates out_json in place."""
+    import glob as _glob
+    import logging as _logging
+
+    log = _logging.getLogger("caiman")
+    log.setLevel(_logging.INFO)
+    if not log.handlers:
+        _h = _logging.StreamHandler()
+        _h.setFormatter(_logging.Formatter("%(message)s"))
+        log.addHandler(_h)
+
+    tif_path    = dest / f"{session}.tif"
+    caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
+
+    if not tif_path.exists():
+        print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
+        return
+
+    mc_path = (
+        sorted(_glob.glob(str(dest / f"*{session}*rig*order_F*.mmap")))
+        or sorted(_glob.glob(os.path.join(caiman_temp, f"*{session}*rig*order_F*.mmap")))
+    )
+
+    mc_created = False
+    mc_obj     = None
+
+    if args.run_mc and not mc_path:
+        print(f"\nRunning motion correction on {tif_path.name}...")
+        new_mc, mc_obj = _run_motion_correction(tif_path, caiman_temp, log)
+        if new_mc:
+            mc_path    = [new_mc]
+            mc_created = True
+    elif args.run_mc and mc_path:
+        print(f"\n  MC mmap already exists -- skipping.\n  ({mc_path[-1]})")
+
+    if mc_created and mc_obj is not None:
+        import numpy as _np
+        shifts = _np.array(mc_obj.shifts_rig)
+        p99_r  = float(_np.percentile(_np.abs(shifts[:, 0]), 99))
+        p99_c  = float(_np.percentile(_np.abs(shifts[:, 1]), 99))
+        ms_r   = max(4, int(_np.ceil(p99_r / 2)) * 2)
+        ms_c   = max(4, int(_np.ceil(p99_c / 2)) * 2)
+        log.info(f"MC shift p99: row={p99_r:.2f} col={p99_c:.2f} -> max_shifts=[{ms_r},{ms_c}]")
+        del mc_obj
+        from caiman.utils.params_estimator import apply_suggestions
+        apply_suggestions(out_json, {"motion_correction.max_shifts": [ms_r, ms_c]})
+        print(f"  MC parameter update: max_shifts=[{ms_r}, {ms_c}]")
+
+    try:
+        if mc_path and mc_path[-1]:
+            print("\nEstimating parameters...")
+            from caiman.utils.params_estimator import estimate_params, apply_suggestions
+            suggestions = estimate_params(
+                mc_path[-1],
+                species       = args.species,
+                magnification = args.magnification,
+                n_frames      = args.n_frames,
+                out_path      = dest / f"{session}_qc_00_param_estimate.png",
+                logger        = log,
+            )
+            apply_suggestions(out_json, suggestions)
+            print("\n  JSON updated with estimated parameters.")
+        elif not args.run_mc:
+            print("  No MC mmap found. Re-run with --run-mc first.")
+    finally:
+        if mc_created and mc_path and mc_path[-1]:
+            try:
+                os.unlink(mc_path[-1])
+                print(f"  Deleted temporary MC mmap: {Path(mc_path[-1]).name}")
+            except OSError as exc:
+                log.warning(f"Could not delete MC mmap: {exc}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -359,537 +392,191 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="new_session.py",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='CNMF ring constraint: ring_size_factor x gSiz must be < rf\n  Safe rule: rf = 5 x gSig,  stride = rf // 2,  gSiz = 4 x gSig + 1\n\nExamples:\n  new-session -y\n  new-session --run-mc --estimate-params -y\n  new-session --run-mc --estimate-params --run -y\n  new-session --gSig 6 --rf 32 --K 15 -y\n  new-session session dest --fr 30.6 --decay-time 0.4 --gSig 7 -y',
+        epilog=(
+            "CNMF ring constraint: ring_size_factor x gSiz must be < rf\n"
+            "  Safe rule: rf = 5 x gSig,  stride = rf // 2,  gSiz = 4 x gSig + 1\n\n"
+            "Examples:\n"
+            "  new-session -y\n"
+            "  new-session --run-mc --estimate-params -y\n"
+            "  new-session --run-mc --estimate-params --run -y\n"
+            "  new-session --gSig 6 --rf 32 --K 15 -y"
+        ),
     )
-
     p.add_argument("session", nargs="?", default=None,
-        help="Session identifier (TIF stem). "
-             "Omit to infer from the current working directory.")
+                   help="Session stem. Inferred from CWD if omitted.")
     p.add_argument("dest", nargs="?", default=None,
-        help="Absolute path to the session folder (created if missing). "
-             "Omit to infer from the current working directory.")
-
-    # Session / data
-    p.add_argument("--data-root", metavar="PATH",
-        help="Override inferred data_root in the JSON (default: auto)")
-    p.add_argument("--yaml", metavar="PATH",
-        help="Acquisition YAML to read defaults from. "
-             "Auto-detected from dest parent if omitted.")
-    p.add_argument("--fr", type=float, metavar="HZ",
-        help="Acquisition frame rate [Hz]")
-    p.add_argument("--decay-time", type=float, metavar="S",
-        help="GCaMP decay time constant [s]")
-
-    # CNMF
-    p.add_argument("--gSig", type=int, metavar="PX",
-        help="Gaussian half-width [px]; sets gSig=[N,N] and gSiz=[4N+1,4N+1]")
-    p.add_argument("--rf", type=int, metavar="PX",
-        help="Patch half-size [px]")
-    p.add_argument("--K", type=int, metavar="N",
-        help="Max components per patch")
-    p.add_argument("--min-corr", type=float, metavar="F",
-        help="Minimum local correlation for seed pixel")
-    p.add_argument("--min-pnr", type=float, metavar="F",
-        help="Minimum peak-to-noise ratio for seed pixel")
-    p.add_argument("--method-init", choices=["corr_pnr", "greedy_roi"],
-        help="Initialisation method")
-    p.add_argument("--n-processes", type=int, metavar="N",
-        help="CNMF worker count (default: null = all CPUs)")
-
-    # Behaviour
-    p.add_argument("--dry-run", action="store_true",
-        help="Print what would be done without writing any files")
-    p.add_argument("-y", "--force", action="store_true",
-        help="Overwrite existing pipeline files without prompting (useful in batch scripts)")
-    p.add_argument("--no-comments", action="store_true",
-        help="Strip _comment keys from the output JSON")
-
-    p.add_argument("--run-mc", action="store_true",
-        help="Run GPU motion correction before parameter estimation if no MC mmap "
-             "exists yet. Uses conservative defaults for 512×512 stacks. "
-             "Implies --estimate-params.")
-
-    p.add_argument("--estimate-params", action="store_true",
-        help="Run parameter estimation from the TIF after creating the session "
-             "files and update the JSON with the suggestions (requires caiman)")
-    p.add_argument("--n-frames", type=int, default=500, metavar="N",
-        help="Frames to subsample for parameter estimation (default 500)")
-    p.add_argument("--species", choices=["mouse", "rat"], default="mouse",
-        help="Animal species — constrains gSig search range (default: mouse)")
-    p.add_argument("--magnification", choices=["20x", "40x"], default="20x",
-        help="Objective magnification — combined with species to bound gSig (default: 20x)")
-
-    p.add_argument("--run", action="store_true",
-        help="Run the CaImAn pipeline script after session setup (and MC/estimation "
-             "if those flags are also set). Equivalent to: python <session>_pipeline.py")
-
+                   help="Channel subdir path. Inferred from CWD if omitted.")
+    p.add_argument("--data-root",       metavar="PATH")
+    p.add_argument("--yaml",            metavar="PATH")
+    p.add_argument("--fr",              type=float, metavar="HZ")
+    p.add_argument("--decay-time",      type=float, metavar="S")
+    p.add_argument("--gSig",            type=int,   metavar="PX")
+    p.add_argument("--rf",              type=int,   metavar="PX")
+    p.add_argument("--K",               type=int,   metavar="N")
+    p.add_argument("--min-corr",        type=float, metavar="F")
+    p.add_argument("--min-pnr",         type=float, metavar="F")
+    p.add_argument("--method-init",     choices=["corr_pnr", "greedy_roi"])
+    p.add_argument("--n-processes",     type=int,   metavar="N")
+    p.add_argument("--run-mc",          action="store_true")
+    p.add_argument("--estimate-params", action="store_true")
+    p.add_argument("--n-frames",        type=int, default=500, metavar="N")
+    p.add_argument("--species",         choices=["mouse", "rat"], default="mouse")
+    p.add_argument("--magnification",   choices=["20x", "40x"],   default="20x")
+    p.add_argument("--run",             action="store_true")
+    p.add_argument("--dry-run",         action="store_true")
+    p.add_argument("-y", "--force",     action="store_true")
+    p.add_argument("--no-comments",     action="store_true")
     return p
 
 
-
-def _run_motion_correction(
-    tif_path: Path,
-    session:  str,
-    caiman_temp: str,
-    logger,
-) -> tuple:
-    """Run GPU rigid motion correction with conservative 512×512 defaults.
-
-    Writes the F-order mmap to ``caiman_temp`` and returns
-    ``(fname_mc, mc_object)`` so that the caller can inspect shifts
-    for better MC parameter suggestions, then delete the mmap.
-    Returns ``(None, None)`` on failure.
-
-    Default parameters are tuned for 512×512 galvo 2P stacks:
-    - ``max_shifts = [6, 6]`` — ±6 px per axis, catches typical brain motion
-    - ``strides / overlaps`` — standard piecewise-rigid tile size (unused for
-      rigid MC, included for forward-compatibility)
-    - ``border_nan = "copy"`` — no black borders after shift
-    - ``pw_rigid = False`` — rigid-only; faster and sufficient for most cases
-    """
-    try:
-        from caiman.motion_correction import MotionCorrect as _MC
-        import numpy as _np
-
-        logger.info(f"MC: rigid GPU correction on {tif_path}")
-        mc = _MC(
-            [str(tif_path)],
-            dview               = None,
-            max_shifts          = [6, 6],
-            strides             = [64, 64],
-            overlaps            = [32, 32],
-            max_deviation_rigid = 3,
-            shifts_opencv       = True,
-            nonneg_movie        = True,
-            border_nan          = "copy",
-            pw_rigid            = False,
-            use_gpu             = True,
-        )
-        mc.motion_correct(save_movie=True)
-        fname_mc = mc.mmap_file[0]
-
-        shifts = _np.array(mc.shifts_rig)
-        mag    = _np.hypot(shifts[:, 0], shifts[:, 1])
-        logger.info(
-            f"MC done: {fname_mc}  "
-            f"(median shift {_np.median(mag):.2f} px, "
-            f"max {mag.max():.2f} px)"
-        )
-        return fname_mc, mc
-
-    except Exception as exc:
-        logger.warning(f"MC failed: {exc}")
-        return None, None
-
-
-def _infer_from_cwd() -> tuple[str, Path]:
-    """Infer (session, dest) from the current working directory.
-
-    Expected layouts — run from the TL directory that contains the TIF::
-
-        <TL_dir>/                     ← CWD = dest
-          <session>.tif               ← pipeline files land beside the TIF
-          <session>_pipeline.py
-          <session>_pipeline.json
-          <session>.yaml
-
-        Multi-channel::
-          <TL_dir>/
-            <session>_C00.tif
-            <session>_C01.tif
-            <session>_C00_pipeline.json
-
-    Returns ``(base_session, cwd)``.
-    """
-    cwd  = Path.cwd()
-    tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
-
-    if not tifs:
-        raise SystemExit(
-            "new_session.py: no .tif found in the current directory "
-            f"({cwd}).\n"
-            "  cd into the directory that contains the .tif and re-run,\n"
-            "  or supply session and dest arguments explicitly."
-        )
-
-    # ── Check for multi-channel set: stem_CNN.tif ─────────────────────────
-    multichan: dict[str, list[str]] = {}
-    for t in tifs:
-        m = _MULTICHAN_TIF_RE.match(t.name)
-        if m:
-            multichan.setdefault(m.group(1), []).append(m.group(2))
-
-    if multichan:
-        if len(multichan) == 1:
-            stem     = next(iter(multichan))
-            chan_ids = sorted(multichan[stem])
-            print(f"  Multi-channel TIFs detected: {len(chan_ids)} channel(s) "
-                  f"({', '.join('C'+c for c in chan_ids)})")
-            return stem, cwd
-        else:
-            names = "\n    ".join(sorted(multichan.keys()))
-            raise SystemExit(
-                f"new_session.py: multiple multi-channel TIF sets in {cwd}:\n"
-                f"    {names}\n"
-                "  Supply the session argument explicitly."
-            )
-
-    # ── Single TIF ────────────────────────────────────────────────────────
-    if len(tifs) == 1:
-        return tifs[0].stem, cwd
-
-    names = "\n    ".join(t.name for t in tifs[:8])
-    raise SystemExit(
-        f"new_session.py: multiple .tif files in {cwd}:\n"
-        f"    {names}\n"
-        "  Supply the session and dest arguments explicitly."
-    )
-
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
-    args   = _build_parser().parse_args(argv)
+    args = _build_parser().parse_args(argv)
 
+    # ── Resolve session + dest ─────────────────────────────────────────────
     if args.session is None or args.dest is None:
         _session, _dest = _infer_from_cwd()
         session = args.session or _session
-        dest    = Path(args.dest).resolve() if args.dest else _dest.resolve()
+        dest    = Path(args.dest).resolve() if args.dest else _dest
         print(f"  Inferred   : session={session}")
         print(f"             : dest={dest}")
     else:
         session = args.session
         dest    = Path(args.dest).resolve()
 
-    # ── Load YAML defaults — create from template if not found ───────────────
-    _yaml_path = Path(args.yaml).resolve() if getattr(args, "yaml", None) else _find_yaml(session, dest)
-
-    if _yaml_path is None or not _yaml_path.exists():
-        # No YAML found — create one from template_acquisition.yaml in the
-        # session directory (dest) so the experimentalist can fill it in.
-        _tpl_acq = _PIPELINES / "template_acquisition.yaml"
-        if _tpl_acq.exists() and not args.dry_run:
-            _yaml_path = dest / f"{session}.yaml"
-            import shutil as _sh
+    # ── YAML: find or create from template ────────────────────────────────
+    yaml_path = Path(args.yaml).resolve() if args.yaml else _find_yaml(session, dest)
+    if yaml_path is None or not yaml_path.exists():
+        if _TPL_YAML.exists() and not args.dry_run:
+            yaml_path = dest.parent / f"{dest.parent.name}.yaml"
             dest.mkdir(parents=True, exist_ok=True)
-            _sh.copy2(_tpl_acq, _yaml_path)
-            print(f"  YAML       : created {_yaml_path.name} from template")
+            shutil.copy2(_TPL_YAML, yaml_path)
+            print(f"  YAML       : created {yaml_path.name} from template")
         elif args.dry_run:
-            print(f"  YAML       : would create {dest / (session + '.yaml')} from template")
+            print(f"  YAML       : would create {dest.parent / (dest.parent.name + '.yaml')}")
 
-    _yd: dict = _read_yaml(_yaml_path) if _yaml_path and _yaml_path.exists() else {}
-    if _yd:
-        print("  YAML       :", _yaml_path.name)
-        for _k, _v in _yd.items(): print(f"    {_k} = {_v}")
+    yd: dict = _read_yaml(yaml_path) if yaml_path and yaml_path.exists() else {}
+    if yd:
+        print(f"  YAML       : {yaml_path.name}")
+        for k, v in yd.items():
+            print(f"    {k} = {v}")
 
-    # ── Locate templates ──────────────────────────────────────────────────────
+    # ── Locate templates ───────────────────────────────────────────────────
     try:
         tpl_py, tpl_json = _find_templates()
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # ── Output paths ──────────────────────────────────────────────────────────
+    # ── Build overrides (YAML defaults < CLI flags) ────────────────────────
+    fr      = args.fr         if args.fr         is not None else yd.get("fr")
+    decay   = args.decay_time if args.decay_time is not None else yd.get("decay_time")
+    rf      = args.rf         if args.rf         is not None else yd.get("rf")
+    gSig    = args.gSig       if args.gSig       is not None else yd.get("gSig")
+    species = args.species    if args.species    != "mouse"  else yd.get("species", args.species)
+    magnif  = args.magnification if args.magnification != "20x" else yd.get("magnification", args.magnification)
+
+    overrides: dict = {}
+    if fr    is not None: overrides["data.fr"]           = fr
+    if decay is not None: overrides["data.decay_time"]   = decay
+    if rf    is not None: overrides["cnmf.rf"]           = rf
+    if args.K            is not None: overrides["cnmf.K"]           = args.K
+    if args.min_corr     is not None: overrides["cnmf.min_corr"]    = args.min_corr
+    if args.min_pnr      is not None: overrides["cnmf.min_pnr"]     = args.min_pnr
+    if args.method_init  is not None: overrides["cnmf.method_init"] = args.method_init
+    if args.n_processes  is not None: overrides["cluster.n_processes"] = args.n_processes
+    overrides["data.n_channels"] = yd.get("n_channels", 1)
+    overrides["data.n_planes"]   = yd.get("n_planes",   1)
+
+    if gSig is not None:
+        overrides["cnmf.gSig"] = [gSig, gSig]
+        overrides["cnmf.gSiz"] = [gSig * 4 + 1, gSig * 4 + 1]
+        if rf is None and args.rf is None:
+            rf_auto = 5 * gSig
+            overrides.setdefault("cnmf.rf",     rf_auto)
+            overrides.setdefault("cnmf.stride", rf_auto // 2)
+
+    # ── Output paths ───────────────────────────────────────────────────────
     out_py   = dest / f"{session}_pipeline.py"
     out_json = dest / f"{session}_pipeline.json"
 
-    # ── Conflict check ────────────────────────────────────────────────────────
+    # ── Conflict check ─────────────────────────────────────────────────────
     existing = [p for p in (out_py, out_json) if p.exists()]
     if existing and not args.force and not args.dry_run:
         print("The following files already exist:")
         for p in existing:
             print(f"  {p}")
-        ans = input("Overwrite? [y/N] ").strip().lower()
-        if ans != "y":
+        if input("Overwrite? [y/N] ").strip().lower() != "y":
             print("Aborted.")
             return 0
 
-    # ── Build overrides (YAML defaults < CLI flags) ───────────────────────────
-    _fr      = args.fr         if args.fr         is not None else _yd.get("fr")
-    _decay   = args.decay_time if args.decay_time is not None else _yd.get("decay_time")
-    _rf      = args.rf         if args.rf         is not None else _yd.get("rf")
-    _gSig    = args.gSig       if args.gSig       is not None else _yd.get("gSig")
-    _species = args.species    if args.species    != "mouse"  else _yd.get("species", args.species)
-    _magnif  = args.magnification if args.magnification != "20x" else _yd.get("magnification", args.magnification)
+    # ── Patch JSON ─────────────────────────────────────────────────────────
+    patched = _patch_json(tpl_json, session, dest,
+                          data_root=args.data_root,
+                          overrides=overrides,
+                          strip_comments=args.no_comments)
+    dr  = patched["session"]["data_root"]
+    exp = patched["session"]["experiment"]
 
-    # ── Channel / plane metadata from YAML ────────────────────────────────────
-    _n_channels = _yd.get("n_channels", 1)
-    _n_planes   = _yd.get("n_planes",   1)
-
-    overrides: dict = {}
-    if _fr      is not None: overrides["data.fr"]             = _fr
-    if _decay   is not None: overrides["data.decay_time"]     = _decay
-    if _rf      is not None: overrides["cnmf.rf"]             = _rf
-    if args.K            is not None: overrides["cnmf.K"]             = args.K
-    if args.min_corr     is not None: overrides["cnmf.min_corr"]      = args.min_corr
-    if args.min_pnr      is not None: overrides["cnmf.min_pnr"]       = args.min_pnr
-    if args.method_init  is not None: overrides["cnmf.method_init"]   = args.method_init
-    if args.n_processes  is not None: overrides["cluster.n_processes"] = args.n_processes
-
-    # Always write channel/plane counts into JSON so the pipeline script sees them.
-    overrides["data.n_channels"] = _n_channels
-    overrides["data.n_planes"]   = _n_planes
-
-    if _gSig is not None:
-        g = _gSig
-        overrides["cnmf.gSig"] = [g, g]
-        overrides["cnmf.gSiz"] = [g * 4 + 1, g * 4 + 1]
-        # Auto-derive rf and stride from gSig when not explicitly supplied:
-        #   rf = 5 × gSig  (guarantees ring fits: 0.9 × gSiz < rf for all gSig≥2)
-        #   stride = rf // 2
-        if _rf is None and args.rf is None:
-            _rf_auto = 5 * g
-            overrides.setdefault("cnmf.rf",     _rf_auto)
-            overrides.setdefault("cnmf.stride", _rf_auto // 2)
-
-    # ── Determine channel list ────────────────────────────────────────────────
-    # Scan the dest directory for per-channel TIFs to enumerate channels when
-    # the YAML reports n_channels > 1.  Fall back to a synthetic list when TIFs
-    # are not yet present (e.g. during session setup before stacking).
-    if _n_channels > 1:
-        # Try to discover IDs from existing TIFs first.
-        _ch_tifs = sorted(dest.glob(f"{session}_C*.tif")) if dest.exists() else []
-        _discovered = []
-        for _t in _ch_tifs:
-            _m = _MULTICHAN_TIF_RE.match(_t.name)
-            if _m and _m.group(1) == session:
-                _discovered.append(_m.group(2))
-        if _discovered:
-            channel_ids = sorted(set(_discovered))
-        else:
-            # No TIFs yet — synthesise IDs from n_channels (C00, C01, …)
-            channel_ids = [f"{i:02d}" for i in range(_n_channels)]
-    else:
-        channel_ids = []   # empty → single-channel path
-
-    _multichannel = bool(channel_ids)
-
-    # ── Output paths ──────────────────────────────────────────────────────────
-    # Single-channel: one py + one json, same as before.
-    # Multi-channel:  one shared py  + one json per channel (_C00, _C01, …).
-    out_py = dest / f"{session}_pipeline.py"
-    if _multichannel:
-        out_jsons = {
-            cid: dest / f"{session}_C{cid}_pipeline.json"
-            for cid in channel_ids
-        }
-        all_outputs = [out_py] + list(out_jsons.values())
-    else:
-        out_json  = dest / f"{session}_pipeline.json"
-        all_outputs = [out_py, out_json]
-
-    # ── Conflict check ────────────────────────────────────────────────────────
-    existing = [p for p in all_outputs if p.exists()]
-    if existing and not args.force and not args.dry_run:
-        print("The following files already exist:")
-        for p in existing:
-            print(f"  {p}")
-        ans = input("Overwrite? [y/N] ").strip().lower()
-        if ans != "y":
-            print("Aborted.")
-            return 0
-
-    # ── Patch JSON(s) ─────────────────────────────────────────────────────────
-    # Build base patched dict (channel-independent overrides applied here).
-    _base_patched = _patch_json(
-        tpl_json, session, dest,
-        data_root      = args.data_root,
-        overrides      = overrides,
-        strip_comments = args.no_comments,
-    )
-    dr  = _base_patched["session"]["data_root"]
-    exp = _base_patched["session"]["experiment"]
-
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # ── Summary ────────────────────────────────────────────────────────────
     print()
     print("Session preparation")
     print("=" * 60)
-    print(f"  Session      : {session}")
-    print(f"  Dest         : {dest}")
-    print(f"  data_root    : {dr}")
-    print(f"  experiment   : {exp}")
-    if _multichannel:
-        print(f"  Channels     : {len(channel_ids)}  ({', '.join('C'+c for c in channel_ids)})")
-    print(f"  n_channels   : {_n_channels}")
-    print(f"  n_planes     : {_n_planes}")
+    print(f"  Session    : {session}")
+    print(f"  Dest       : {dest}")
+    print(f"  data_root  : {dr}")
+    print(f"  experiment : {exp}")
     if args.estimate_params or args.run_mc:
-        print(f"  Species      : {_species}")
-        print(f"  Magnif.      : {_magnif}")
+        print(f"  Species    : {species}    Magnif: {magnif}")
     if overrides:
-        print("  Overrides    :")
+        print("  Overrides  :")
         for k, v in overrides.items():
             print(f"    {k} = {v}")
     print()
     print("  Files to write:")
-    for p in all_outputs:
-        print(f"    {p}")
+    print(f"    {out_py}")
+    print(f"    {out_json}")
 
-    if _multichannel:
-        for cid in channel_ids:
-            tif_warn = _check_tif(dest, session, channel_id=cid)
-            if tif_warn:
-                print()
-                print(tif_warn)
-    else:
-        tif_warn = _check_tif(dest, session)
-        if tif_warn:
-            print()
-            print(tif_warn)
+    warn = _check_tif(dest, session)
+    if warn:
+        print(f"\n{warn}")
 
     if args.dry_run:
-        print()
-        print("Dry run — no files written.")
+        print("\nDry run -- no files written.")
         return 0
 
-    # ── Write files ───────────────────────────────────────────────────────────
+    # ── Write ──────────────────────────────────────────────────────────────
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy2(tpl_py, out_py)
+    out_json.write_text(json.dumps(patched, indent=4) + "\n")
+    print("\nDone.")
 
-    if _multichannel:
-        for cid in channel_ids:
-            import copy as _copy
-            _ch_patched = _copy.deepcopy(_base_patched)
-            _ch_patched["data"]["channel_id"] = int(cid)
-            _ch_json_path = out_jsons[cid]
-            _ch_json_path.write_text(json.dumps(_ch_patched, indent=4) + "\n")
-            print(f"  Wrote  {_ch_json_path.name}")
-    else:
-        out_json.write_text(json.dumps(_base_patched, indent=4) + "\n")
+    # ── MC / param estimation ──────────────────────────────────────────────
+    if args.estimate_params or args.run_mc:
+        _apply_pipeline_env(patched.get("env", {}))
+        try:
+            _run_mc_and_estimate(args, session, dest, out_json)
+        except Exception as exc:
+            import traceback
+            print(f"  Failed: {exc}")
+            traceback.print_exc()
 
-    print()
-    print("Done.")
-
-    # ── Optional motion correction + parameter estimation ────────────────
-    # In multi-channel mode, run estimation on C00 only (primary channel).
-    _do_estimate = args.estimate_params or args.run_mc
-    if _do_estimate:
-        # Apply env vars from the pipeline JSON before importing caiman so that
-        # CAIMAN_TEMP / CAIMAN_DATA etc. take effect at caiman import time and
-        # CaImAn never falls back to its compiled-in default (/data/proc/...).
-        _env_section = _base_patched.get("env", {})
-        for _ekey, _eval in _env_section.items():
-            if not _ekey.startswith("_comment") and isinstance(_eval, str):
-                os.environ.setdefault(_ekey, _eval)
-        # CAIMAN_TEMP / CAIMAN_DATA are always forced (not setdefault) because
-        # caiman reads them at import; a stale shell value could point anywhere.
-        for _force_key in ("CAIMAN_TEMP", "CAIMAN_DATA", "CAIMAN_SHM"):
-            if _force_key in _env_section:
-                os.environ[_force_key] = _env_section[_force_key]
-
-        if _multichannel:
-            _primary_cid = channel_ids[0]
-            tif_path  = dest / f"{session}_C{_primary_cid}.tif"
-            out_json  = out_jsons[_primary_cid]
-            print(f"\n  Multi-channel: running MC/estimation on primary channel C{_primary_cid}.")
-        else:
-            tif_path = dest / f"{session}.tif"
-
-        if not tif_path.exists():
-            print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
-            print(f"     Place the TIFF and re-run.")
-        else:
-            try:
-                import logging as _logging
-                _est_logger = _logging.getLogger("caiman")
-                _est_logger.setLevel(_logging.INFO)
-                if not _est_logger.handlers:
-                    _h = _logging.StreamHandler()
-                    _h.setFormatter(_logging.Formatter("%(message)s"))
-                    _est_logger.addHandler(_h)
-
-                import glob as _glob
-                _caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
-                _mc = sorted(_glob.glob(str(
-                    dest / f"*{session}*rig*order_F*.mmap")))
-                _mc_temp = sorted(_glob.glob(
-                    os.path.join(_caiman_temp, f"*{session}*rig*order_F*.mmap")))
-                _mc_path = (_mc or _mc_temp)
-
-                # ── Run MC if requested and not already done ──────────────
-                _mc_created = False
-                _mc_obj     = None
-                if args.run_mc and not _mc_path:
-                    print(f"\nRunning motion correction on {tif_path.name}...")
-                    _new_mc, _mc_obj = _run_motion_correction(
-                        tif_path, session, _caiman_temp, _est_logger)
-                    if _new_mc:
-                        _mc_path   = [_new_mc]
-                        _mc_created = True
-                elif args.run_mc and _mc_path:
-                    print(f"\n  MC mmap already exists — skipping motion correction.")
-                    print(f"  ({_mc_path[-1]})")
-
-                # ── MC parameter suggestions from shifts ──────────────────
-                if _mc_created and _mc_obj is not None:
-                    import numpy as _np_mc
-                    _shifts = _np_mc.array(_mc_obj.shifts_rig)
-                    _p99_r  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 0]), 99))
-                    _p99_c  = float(_np_mc.percentile(_np_mc.abs(_shifts[:, 1]), 99))
-                    _ms_r   = max(4, int(_np_mc.ceil(_p99_r / 2)) * 2)
-                    _ms_c   = max(4, int(_np_mc.ceil(_p99_c / 2)) * 2)
-                    _mc_overrides = {"max_shifts": [_ms_r, _ms_c]}
-                    _est_logger.info(
-                        f"MC shift analysis: p99 row={_p99_r:.2f} col={_p99_c:.2f} px "
-                        f"→ max_shifts=[{_ms_r}, {_ms_c}]"
-                    )
-                    del _mc_obj
-                    from caiman.utils.params_estimator import apply_suggestions as _apply
-                    _apply(out_json, {f"motion_correction.{k}": v
-                                      for k, v in _mc_overrides.items()})
-                    print(f"  MC parameter update: max_shifts={[_ms_r, _ms_c]}")
-
-                # ── Parameter estimation ──────────────────────────────────
-                try:
-                    if _mc_path and _mc_path[-1]:
-                        print(f"\nEstimating parameters...")
-                        from caiman.utils.params_estimator import estimate_params, apply_suggestions
-                        _suggestions = estimate_params(
-                            _mc_path[-1],
-                            species       = _species,
-                            magnification = _magnif,
-                            n_frames      = args.n_frames,
-                            out_path      = out_json.parent / f"{session}_qc_00_param_estimate.png",
-                            logger        = _est_logger,
-                        )
-                        apply_suggestions(out_json, _suggestions)
-                        print(f"\n  JSON updated with estimated parameters.")
-                    elif not args.run_mc:
-                        print(f"  No MC mmap found for {session}.")
-                        print(f"  Re-run with --run-mc to run motion correction first.")
-                finally:
-                    if _mc_created and _mc_path and _mc_path[-1]:
-                        try:
-                            import os as _os_del
-                            _os_del.unlink(_mc_path[-1])
-                            _est_logger.info(f"Deleted temporary MC mmap: {_mc_path[-1]}")
-                            print(f"  Deleted temporary MC mmap: {Path(_mc_path[-1]).name}")
-                        except OSError as _del_exc:
-                            _est_logger.warning(f"Could not delete MC mmap: {_del_exc}")
-
-            except Exception as _exc:
-                import traceback as _tb
-                print(f"  Failed: {_exc}")
-                _tb.print_exc()
-
+    # ── Next steps ─────────────────────────────────────────────────────────
     print()
     print("Next steps:")
-    if _multichannel:
-        for cid in channel_ids:
-            _cj = out_jsons[cid]
-            print(f"  Review  :  {_cj.name}")
-        print(f"  Run     :  python {out_py.name}  (set channel_id in each JSON first)")
-    else:
-        print(f"  1. Review and tune:  {out_json.name}")
-        print(f"  2. Place TIFF:       {dest}/{session}.tif")
-        print(f"  3. Estimate params:  python utilities/new_session.py {session} {dest} --run-mc --estimate-params -y")
-        print(f"  4. Run:              python {out_py.name}")
+    print(f"  1. Review : {out_json.name}")
+    print(f"  2. TIF    : {dest / (session + '.tif')}")
+    print(f"  3. Params : new-session {session} {dest} --run-mc --estimate-params -y")
+    print(f"  4. Run    : python {out_py.name}")
     print()
 
-    # ── Optional pipeline run ─────────────────────────────────────────────────
-    if getattr(args, "run", False):
-        import subprocess as _sp
+    # ── Optional pipeline run ──────────────────────────────────────────────
+    if args.run:
+        import subprocess
         print(f"Running pipeline: {out_py}")
         print("=" * 60)
-        result = _sp.run([sys.executable, str(out_py)], cwd=str(dest))
+        result = subprocess.run([sys.executable, str(out_py)], cwd=str(dest))
         if result.returncode != 0:
             print(f"\n  Pipeline exited with code {result.returncode}")
             return result.returncode
