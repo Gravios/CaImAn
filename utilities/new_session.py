@@ -195,18 +195,22 @@ def _read_yaml(path) -> dict:
 def _find_yaml(session: str, dest) -> "Path | None":
     """Locate the acquisition YAML for a session.
 
-    Layout::
+    Layout (current)::
 
-        <date>/<TL_dir>/              ← dest.parent
-          <TL_dir>.yaml              ← YAML (stem = TL dir name)
-          <TL_dir>-C00-fc*.tif       ← source TIF
-          <TL_dir>-C00-fc*/          ← dest (session dir)
+        <TL_dir>/               ← dest
+          <TL_dir>.yaml         ← YAML lives here alongside the TIF
+          <session>.tif
+          <session>_pipeline.py
 
-    Returns ``dest.parent / (dest.parent.name + ".yaml")`` if it exists.
+    Returns ``dest / (dest.name + ".yaml")`` if it exists, then falls back
+    to ``dest / (session + ".yaml")``.
     """
-    candidate = dest.parent / (dest.parent.name + ".yaml")
-    if candidate.exists() and ".bak" not in candidate.suffixes:
-        return candidate
+    for candidate in [
+        dest / (dest.name + ".yaml"),
+        dest / (session + ".yaml"),
+    ]:
+        if candidate.exists() and ".bak" not in candidate.suffixes:
+            return candidate
     return None
 
 
@@ -334,9 +338,9 @@ def _patch_json(
 def _check_tif(dest: Path, session: str, channel_id: str | None = None) -> str | None:
     """Return a warning string if the expected TIF is not found, else None.
 
-    For single-channel sessions expects ``<session>.tif``.
-    For multi-channel sessions (``channel_id`` provided) expects
-    ``<session>_C{channel_id}.tif`` (e.g. ``<session>_C00.tif``).
+    Pipeline files and TIFs all live in the same directory (dest).
+    For single-channel: <session>.tif
+    For multi-channel:  <session>_C{channel_id}.tif
     """
     if channel_id is not None:
         tif = dest / f"{session}_C{channel_id}.tif"
@@ -481,23 +485,21 @@ def _run_motion_correction(
 def _infer_from_cwd() -> tuple[str, Path]:
     """Infer (session, dest) from the current working directory.
 
-    Expected layouts::
+    Expected layouts — run from the TL directory that contains the TIF::
 
-        Single-channel:
-          <session>/
-            <session>.tif
-            <session>_pipeline.py
+        <TL_dir>/                     ← CWD = dest
+          <session>.tif               ← pipeline files land beside the TIF
+          <session>_pipeline.py
+          <session>_pipeline.json
+          <session>.yaml
 
-        Multi-channel (produced by stack_to_bigtiff multi-channel mode):
-          <session>/
+        Multi-channel::
+          <TL_dir>/
             <session>_C00.tif
-            <session>_C01.tif   ← all share the same base stem
+            <session>_C01.tif
             <session>_C00_pipeline.json
-            ...
 
-    Returns ``(base_session, cwd)`` in both cases. ``base_session`` is the
-    stem without any ``_CNN`` suffix; multi-channel dispatch is handled later
-    in ``main()`` via ``n_channels`` read from the acquisition YAML.
+    Returns ``(base_session, cwd)``.
     """
     cwd  = Path.cwd()
     tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
