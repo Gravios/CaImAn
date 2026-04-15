@@ -410,6 +410,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--magnification", choices=["20x", "40x"], default="20x",
         help="Objective magnification — combined with species to bound gSig (default: 20x)")
 
+    p.add_argument("--run", action="store_true",
+        help="Run the CaImAn pipeline script after session setup (and MC/estimation "
+             "if those flags are also set). Equivalent to: python <session>_pipeline.py")
+
     return p
 
 
@@ -858,6 +862,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  3. Estimate params:  python utilities/new_session.py {session} {dest} --run-mc --estimate-params -y")
         print(f"  4. Run:              python {out_py.name}")
     print()
+
+    # ── Optional pipeline run ─────────────────────────────────────────────────
+    if getattr(args, "run", False):
+        import subprocess as _sp
+        print(f"Running pipeline: {out_py}")
+        print("=" * 60)
+        result = _sp.run([sys.executable, str(out_py)], cwd=str(dest))
+        if result.returncode != 0:
+            print(f"\n  Pipeline exited with code {result.returncode}")
+            return result.returncode
 
     return 0
 
