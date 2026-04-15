@@ -105,7 +105,7 @@ def load_to_shm(
     if log is None:
         log = logger
 
-    shm_path = os.path.join(shm_dir, f"{session}_cnmf_shm.mmap")
+    shm_path = os.path.join(shm_dir, os.path.basename(fname_cnmf))
 
     if not os.path.isdir(shm_dir):
         raise RuntimeError(
