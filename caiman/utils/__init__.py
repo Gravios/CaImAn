@@ -76,6 +76,11 @@ from caiman.utils.stack_to_bigtiff import (
     collect_channel_frames,
     write_yaml_sidecar,
 )
+from caiman.utils.shm_movie import (
+    check_shm_capacity,
+    load_to_shm,
+    release_shm,
+)
 
 __all__ = [
     # params_io
@@ -125,9 +130,8 @@ __all__ = [
     "extract_pixels",
     "format_rate_str",
     "update_yaml",
-    # stack_to_bigtiff
-    "stack_frames",
-    "detect_channel_ids",
-    "collect_channel_frames",
-    "write_yaml_sidecar",
+    # shm_movie
+    "check_shm_capacity",
+    "load_to_shm",
+    "release_shm",
 ]

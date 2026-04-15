@@ -100,6 +100,7 @@ if __name__ == "__main__":
     from caiman.utils.cnmf_runner    import CNMFRunner
     from caiman.utils.qc             import QCRunner
     from caiman.utils.oscillation    import OscillationAnalyzer
+    from caiman.utils.shm_movie      import load_to_shm, release_shm, check_shm_capacity
 
     import dill as _dill
     import multiprocessing.reduction as _mpr
@@ -266,6 +267,36 @@ if __name__ == "__main__":
     del images, Yr
     gc.collect()
     malloc_trim(logger)
+
+    # ── 4b. Load movie into shared memory ─────────────────────────────────────
+    # Always attempt to copy the C-order mmap into /dev/shm so patch workers
+    # read from RAM instead of NVMe.  Falls back to disk transparently if SHM
+    # lacks sufficient free space (logs a warning).
+    import psutil as _psutil
+    _shm_dir   = os.environ.get("CAIMAN_SHM", "/dev/shm")
+    _shm_path  = None
+    _avail, _fits = check_shm_capacity(os.path.getsize(fname_cnmf), _shm_dir)
+    if _fits:
+        @timer.step("SHM: copy movie to shared memory")
+        def _load_shm():
+            global _shm_path, fname_cnmf
+            _shm_path  = load_to_shm(fname_cnmf, session, _shm_dir, logger)
+            fname_cnmf = _shm_path
+        _load_shm()
+    else:
+        logger.warning(
+            f"SHM: need {os.path.getsize(fname_cnmf)/1024**3:.1f} GB, "
+            f"only {_avail/1024**3:.1f} GB free in {_shm_dir} — "
+            f"using disk-backed mmap."
+        )
+
+    # Use all physical cores when movie is in SHM; JSON cluster.n_processes otherwise
+    _cluster_n = (
+        (_psutil.cpu_count(logical=False) or os.cpu_count())
+        if _shm_path else
+        (getattr(_P, "cluster", None) and _P.cluster.n_processes or None)
+    )
+
     Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)
     images = np.reshape(Yr.T, [T] + list(dims), order="F")
     images.filename = Yr.filename
@@ -279,7 +310,7 @@ if __name__ == "__main__":
     logger.info("Starting CNMF cluster")
     _, dview, n_processes = cm.cluster.setup_cluster(
         backend="multiprocessing",
-        n_processes=getattr(_P, "cluster", None) and _P.cluster.n_processes or None,
+        n_processes=_cluster_n,
         single_thread=False,
     )
 
@@ -301,6 +332,8 @@ if __name__ == "__main__":
     finally:
         logger.info("Stopping cluster")
         cm.stop_server(dview=dview)
+        if _shm_path:
+            release_shm(_shm_path, logger)
 
     # ── 6. Report ─────────────────────────────────────────────────────────────
     # Component counts for the report
