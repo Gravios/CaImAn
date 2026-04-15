@@ -362,14 +362,22 @@ def _corr_threshold_upper_tail(
     cn:       np.ndarray,
     *,
     tail_pct: float = 92.0,
+    floor:    float = 0.3,
     logger:   logging.Logger = logger,
 ) -> float:
-    """p92 of all Cn pixels as the min_corr threshold."""
+    """p92 of all Cn pixels as the min_corr threshold, with an absolute floor.
+
+    The percentile-based estimate can return near-zero values for dim or
+    sparse recordings where the entire Cn distribution is low.  ``floor``
+    (default 0.3) prevents pathologically low seeds that would accept most
+    background pixels as signal.
+    """
     all_cn    = cn.ravel()
     threshold = float(np.percentile(all_cn, tail_pct))
     lo        = float(np.percentile(all_cn, 80))
     hi        = float(np.percentile(all_cn, 98))
     threshold = float(np.clip(threshold, lo, hi))
+    threshold = max(threshold, floor)
 
     n_seeds    = int((cn >= threshold).sum())
     frac_seeds = n_seeds / cn.size
@@ -386,10 +394,16 @@ def _pnr_threshold_from_signal_pixels(
     min_corr: float,
     *,
     signal_pnr_pct: float = 10.0,
-    pnr_floor:      float = 3.0,
+    pnr_floor:      float = 5.0,
     logger:   logging.Logger = logger,
 ) -> float:
-    """p10 of PNR at signal pixels (Cn ≥ min_corr), floor 3.0."""
+    """p10 of PNR at signal pixels (Cn >= min_corr), floor 5.0.
+
+    The floor was previously 3.0 which is below the noise level for typical
+    2P GCaMP recordings and produced near-trivial thresholds on short or
+    quiet movies.  5.0 is a more conservative minimum consistent with
+    validated pipeline parameters.
+    """
     signal_mask = cn >= min_corr
     n_signal    = int(signal_mask.sum())
 
@@ -399,17 +413,17 @@ def _pnr_threshold_from_signal_pixels(
         signal_pnr = signal_pnr[signal_pnr < pnr_99]
         threshold  = float(np.percentile(signal_pnr, signal_pnr_pct))
         logger.info(
-            f"  min_pnr: {n_signal} signal pixels (Cn≥{min_corr:.2f})  "
+            f"  min_pnr: {n_signal} signal pixels (Cn>={min_corr:.2f})  "
             f"p10={threshold:.1f}  median={np.median(signal_pnr):.1f}"
         )
     else:
         threshold = float(np.percentile(pnr[pnr > 1].ravel(), 85))
         logger.warning(
-            f"  min_pnr: only {n_signal} signal pixels — fallback p85={threshold:.1f}"
+            f"  min_pnr: only {n_signal} signal pixels -- fallback p85={threshold:.1f}"
         )
 
     threshold = max(pnr_floor, threshold)
-    logger.info(f"  min_pnr → {threshold:.1f}")
+    logger.info(f"  min_pnr -> {threshold:.1f}")
     return threshold
 
 
