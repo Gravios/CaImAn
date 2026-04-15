@@ -88,27 +88,11 @@ _MULTICHAN_TIF_RE = re.compile(r'^(.+)_C(\d{2})\.tiff?$', re.IGNORECASE)
 def _read_yaml(path) -> dict:
     """Load an acquisition YAML and return a flat dict of useful defaults.
 
-    Reads from ``acquisition_system.settings``:
-      sample_rate.value   → fr
-      magnification.value → magnification (e.g. "25x")
-      n_channels          → n_channels  (int; drives multi-channel dispatch)
-      n_planes            → n_planes    (int)
-      n_frames            → n_frames_acq (int; informational)
-      frame_size          → frame_size  (dict {x, y})
-      pixel_size          → pixel_size  (dict {x, y, units})
-      pixel_type          → pixel_type  (str, e.g. "uint16")
-      depth.value         → depth_um    (float)
-      indicator           → indicator   (str or None)
-      brain_area          → brain_area  (str or None)
-      wavelength          → wavelength  (dict {excitation, emission})
+    Handles both {value, units} nodes and plain scalars for all fields.
+    Reads pixel_dtype (new) with fallback to pixel_type (old).
+    Reads regions.vis_ctx.indicator and coordinates.
 
-    Reads from ``subject``:
-      species             → species ("mouse" / "rat")
-
-    Reads from ``caiman_recommended`` (if present):
-      gSig, rf, decay_time
-
-    Returns an empty dict if the file cannot be parsed or lacks expected keys.
+    Returns an empty dict if the file cannot be parsed.
     """
     try:
         import yaml as _yaml
@@ -121,27 +105,26 @@ def _read_yaml(path) -> dict:
     out: dict = {}
     acq = doc.get("acquisition_system", {}).get("settings", {})
 
-    # ── Frame rate ────────────────────────────────────────────────────────────
-    sr = acq.get("sample_rate", {})
-    if isinstance(sr.get("value"), (int, float)):
-        out["fr"] = float(sr["value"])
+    def _val(node):
+        if isinstance(node, dict):
+            return node.get("value")
+        return node
 
-    # ── Magnification ─────────────────────────────────────────────────────────
-    mag = acq.get("magnification", {})
-    if isinstance(mag.get("value"), (int, float)):
-        out["magnification"] = f"{int(mag['value'])}x"
+    fr = _val(acq.get("sample_rate"))
+    if isinstance(fr, (int, float)):
+        out["fr"] = float(fr)
 
-    # ── Channel / plane counts ────────────────────────────────────────────────
+    mag = _val(acq.get("magnification"))
+    if isinstance(mag, (int, float)):
+        out["magnification"] = f"{int(mag)}x"
+
     if isinstance(acq.get("n_channels"), int):
         out["n_channels"] = acq["n_channels"]
     if isinstance(acq.get("n_planes"), int):
         out["n_planes"] = acq["n_planes"]
-
-    # ── Frame count (informational) ───────────────────────────────────────────
     if isinstance(acq.get("n_frames"), int):
         out["n_frames_acq"] = acq["n_frames"]
 
-    # ── Frame geometry ────────────────────────────────────────────────────────
     fs = acq.get("frame_size")
     if isinstance(fs, dict) and "x" in fs and "y" in fs:
         out["frame_size"] = {"x": fs["x"], "y": fs["y"]}
@@ -150,33 +133,36 @@ def _read_yaml(path) -> dict:
     if isinstance(ps, dict):
         out["pixel_size"] = dict(ps)
 
-    if isinstance(acq.get("pixel_type"), str):
-        out["pixel_type"] = acq["pixel_type"]
+    # pixel_dtype (new schema) with fallback to pixel_type (old)
+    if isinstance(acq.get("pixel_dtype"), str):
+        out["pixel_dtype"] = acq["pixel_dtype"]
+    elif isinstance(acq.get("pixel_type"), str):
+        out["pixel_dtype"] = acq["pixel_type"]
 
-    # ── Imaging depth ─────────────────────────────────────────────────────────
-    depth = acq.get("depth", {})
-    if isinstance(depth.get("value"), (int, float)):
-        out["depth_um"] = float(depth["value"])
+    depth = _val(acq.get("depth"))
+    if isinstance(depth, (int, float)):
+        out["depth_um"] = float(depth)
 
-    # ── Biological metadata ───────────────────────────────────────────────────
-    indicator = acq.get("indicator")
-    if indicator:
-        out["indicator"] = indicator
+    fa = _val(acq.get("fa"))
+    if fa is not None:
+        out["fa"] = fa
 
-    brain_area = acq.get("brain_area")
-    if brain_area:
-        out["brain_area"] = brain_area
+    lp = _val(acq.get("laserPower"))
+    if isinstance(lp, (int, float)):
+        out["laser_power"] = float(lp)
 
-    wl = acq.get("wavelength")
-    if isinstance(wl, dict):
-        out["wavelength"] = dict(wl)
+    gain = _val(acq.get("gain"))
+    if isinstance(gain, (int, float)):
+        out["gain"] = float(gain)
 
-    # ── Subject ───────────────────────────────────────────────────────────────
+    vis_ctx = (doc.get("regions") or {}).get("vis_ctx") or {}
+    if vis_ctx.get("indicator"):
+        out["indicator"] = vis_ctx["indicator"]
+
     species_raw = (doc.get("subject", {}) or {}).get("species", "") or ""
     if species_raw:
         out["species"] = "rat" if "rat" in species_raw.lower() else "mouse"
 
-    # ── caiman_recommended overrides (highest priority from YAML) ─────────────
     rec = doc.get("caiman_recommended") or {}
     if isinstance(rec.get("gSig"), int):
         out["gSig"] = rec["gSig"]
@@ -553,8 +539,22 @@ def main(argv: list[str] | None = None) -> int:
         session = args.session
         dest    = Path(args.dest).resolve()
 
-    # ── Load YAML defaults (fr, magnification, species, gSig, rf, decay_time) ──
+    # ── Load YAML defaults — create from template if not found ───────────────
     _yaml_path = Path(args.yaml).resolve() if getattr(args, "yaml", None) else _find_yaml(session, dest)
+
+    if _yaml_path is None or not _yaml_path.exists():
+        # No YAML found — create one from template_acquisition.yaml in the
+        # session directory (dest) so the experimentalist can fill it in.
+        _tpl_acq = _PIPELINES / "template_acquisition.yaml"
+        if _tpl_acq.exists() and not args.dry_run:
+            _yaml_path = dest / f"{session}.yaml"
+            import shutil as _sh
+            dest.mkdir(parents=True, exist_ok=True)
+            _sh.copy2(_tpl_acq, _yaml_path)
+            print(f"  YAML       : created {_yaml_path.name} from template")
+        elif args.dry_run:
+            print(f"  YAML       : would create {dest / (session + '.yaml')} from template")
+
     _yd: dict = _read_yaml(_yaml_path) if _yaml_path and _yaml_path.exists() else {}
     if _yd:
         print("  YAML       :", _yaml_path.name)
