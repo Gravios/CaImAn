@@ -136,10 +136,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Skipping — pipeline JSON already exists: {existing[0].name}\n")
                 continue
 
-        # Build argv for new_session:
-        #   new_session takes an optional positional `dest` and infers session
-        #   from the TIF in that directory.
-        ns_argv = [str(session_dir)] + passthrough
+        # Pass both positional args: session (stem) and dest (full path).
+        # new_session expects: new_session [session] [dest] [flags...]
+        # If only one positional is given it lands in `session`, not `dest`,
+        # causing _infer_from_cwd() to scan the caller's CWD instead.
+        ns_argv = [session_name, str(session_dir)] + passthrough
 
         try:
             rc = _new_session_main(ns_argv)
