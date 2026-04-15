@@ -39,6 +39,7 @@ Forwarded to new-session (examples)
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -105,41 +106,55 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: --parent is not a directory: {parent}", file=sys.stderr)
         return 1
 
-    session_dirs = sorted(
+    # Collect all channel subdirs across all matching TL dirs.
+    # Layout:
+    #   <parent>/
+    #     <TL_dir>/                     <- matches --prefix
+    #       <TL_dir>-C00-fc<N>/         <- channel subdir (dest for new_session)
+    #         <TL_dir>-C00-fc<N>.tif
+    ch_pattern = re.compile(r'.+-C\d{2}-fc\d+$')
+
+    tl_dirs = sorted(
         d for d in parent.iterdir()
         if d.is_dir() and (args.prefix is None or d.name.startswith(args.prefix))
     )
 
-    if not session_dirs:
-        print(f"No session directories found in {parent}"
+    # Build list of (session_stem, channel_dir) pairs
+    sessions: list[tuple[str, Path]] = []
+    for tl_dir in tl_dirs:
+        ch_dirs = sorted(
+            d for d in tl_dir.iterdir()
+            if d.is_dir() and ch_pattern.match(d.name)
+        )
+        for ch_dir in ch_dirs:
+            sessions.append((ch_dir.name, ch_dir))
+
+    if not sessions:
+        print(f"No channel subdirectories found under {parent}"
               + (f" matching prefix '{args.prefix}'" if args.prefix else ""))
         return 0
 
     print(f"Batch session setup")
     print(f"  Parent  : {parent}")
-    print(f"  Sessions: {len(session_dirs)}")
+    print(f"  Sessions: {len(sessions)}")
     if passthrough:
         print(f"  Flags   : {' '.join(passthrough)}")
     print()
 
     failed = []
 
-    for i, session_dir in enumerate(session_dirs, 1):
-        session_name = session_dir.name
-        print(f"[{i}/{len(session_dirs)}] {session_name}")
+    for i, (session_name, session_dir) in enumerate(sessions, 1):
+        print(f"[{i}/{len(sessions)}] {session_name}")
         print("-" * 70)
 
-        # --skip-done: check for any existing _pipeline.json
+        # --skip-done: check for any existing _pipeline.json in the channel subdir
         if args.skip_done:
             existing = list(session_dir.glob("*_pipeline.json"))
             if existing:
                 print(f"  Skipping — pipeline JSON already exists: {existing[0].name}\n")
                 continue
 
-        # Pass both positional args: session (stem) and dest (full path).
-        # new_session expects: new_session [session] [dest] [flags...]
-        # If only one positional is given it lands in `session`, not `dest`,
-        # causing _infer_from_cwd() to scan the caller's CWD instead.
+        # Pass session stem + dest path as positional args to new_session
         ns_argv = [session_name, str(session_dir)] + passthrough
 
         try:
@@ -163,8 +178,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Summary
     print("=" * 70)
-    succeeded = len(session_dirs) - len(failed)
-    print(f"Done: {succeeded}/{len(session_dirs)} sessions succeeded.")
+    succeeded = len(sessions) - len(failed)
+    print(f"Done: {succeeded}/{len(sessions)} sessions succeeded.")
     if failed:
         print(f"Failed ({len(failed)}):")
         for name in failed:
