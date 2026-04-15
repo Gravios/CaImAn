@@ -73,6 +73,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -488,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.n_processes  is not None: overrides["cluster.n_processes"] = args.n_processes
     overrides["data.n_channels"] = yd.get("n_channels", 1)
     overrides["data.n_planes"]   = yd.get("n_planes",   1)
+
+    # Extract channel_id from session stem (e.g. "...-C01-fc015000" -> 1)
+    _ch_match = re.search(r'-C(\d{2})-fc\d+', session)
+    overrides["data.channel_id"] = int(_ch_match.group(1)) if _ch_match else 0
 
     if gSig is not None:
         overrides["cnmf.gSig"] = [gSig, gSig]
