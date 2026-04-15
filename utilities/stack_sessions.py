@@ -232,34 +232,55 @@ def build_yaml(
 ) -> dict:
     """Build an acquisition YAML dict from template + parsed metadata.
 
+    The template is always loaded verbatim first so every field is present
+    with a null value.  Parsed values are then filled in on top in priority
+    order: dirname < frame filename < OME header.
+
     Priority (highest last, i.e. higher overwrites lower):
-      template defaults → dirname parse → frame filename parse → OME header
+      template skeleton -> dirname parse -> frame filename parse -> OME header
     """
-    # ── Load template ─────────────────────────────────────────────────────
+    # ── 1. Load template verbatim (all fields present, all null) ─────────
     template_path = _find_template()
     if template_path and _HAVE_YAML:
         doc = _yaml.safe_load(template_path.read_text()) or {}
-        # Strip comment strings from template (they're for humans, not data)
-        def _strip(d):
-            if isinstance(d, dict):
-                return {k: _strip(v) for k, v in d.items()}
-            if isinstance(d, list):
-                return [_strip(v) for v in d]
-            return d
-        doc = _strip(doc)
     else:
-        # Bare skeleton if template not found or yaml unavailable
+        # Minimal fallback matching the template schema
         doc = {
             "experiment": {"datetime": None, "id": None, "class": None, "condition": None},
-            "subject": {"id": None, "class": "mouse", "species": None, "sex": None,
-                        "age": None, "genotype": None, "weight": None},
-            "acquisition_system": {"settings": {}},
-            "caiman_recommended": {"gSig": None, "rf": None, "decay_time": None},
+            "subject": {
+                "id": None, "class": None, "species": None, "sex": None,
+                "age": None, "genotype": None,
+                "weight": {"value": None, "units": None},
+                "heart_rate": {"value": None, "units": None},
+                "body_temperature": {"value": None, "units": None},
+            },
+            "regions": {
+                "type": None,
+                "vis_ctx": {
+                    "indicator": None,
+                    "coordinates": {
+                        "ap": {"value": None, "units": "mm"},
+                        "ml": {"value": None, "units": "mm"},
+                    },
+                },
+            },
+            "acquisition_system": {"settings": {
+                "sample_rate":  {"value": None, "units": "Hz"},
+                "magnification": {"value": None, "units": "factor"},
+                "gain":         {"value": None, "units": None},
+                "laserPower":   {"value": None, "units": "percent"},
+                "fa":           {"value": None, "units": None},
+                "depth":        {"value": None, "units": "um"},
+                "frame_size":   {"x": None, "y": None, "units": "pixels"},
+                "pixel_size":   {"x": None, "y": None, "units": "um"},
+                "n_channels": None, "n_planes": None,
+                "n_frames": None, "pixel_dtype": None,
+            }},
         }
 
     s = doc.setdefault("acquisition_system", {}).setdefault("settings", {})
 
-    # ── 1. Dirname ────────────────────────────────────────────────────────
+    # ── 2. Dirname ────────────────────────────────────────────────────────
     dn = _parse_session_name(session_name)
     if dn.get("experiment_datetime"):
         doc["experiment"]["datetime"] = dn["experiment_datetime"].strftime(
@@ -272,39 +293,30 @@ def build_yaml(
     if dn.get("subject_id") is not None:
         doc["subject"]["id"] = dn["subject_id"]
     if dn.get("magnification"):
-        s.setdefault("magnification", {})["value"] = dn["magnification"]
-        s["magnification"]["units"] = "factor"
+        s["magnification"]["value"] = dn["magnification"]
 
-    # ── 2. Frame filename ─────────────────────────────────────────────────
+    # ── 3. Frame filename ─────────────────────────────────────────────────
     fn = _parse_frame_name(master_frame.name)
     if fn.get("fa") is not None:
-        s["fa"] = fn["fa"]
+        s["fa"]["value"] = fn["fa"]
     if fn.get("laser_power") is not None:
-        s.setdefault("laserPower", {})["value"] = fn["laser_power"]
-        s["laserPower"]["units"] = "percent"
+        s["laserPower"]["value"] = fn["laser_power"]
     if fn.get("depth_um") is not None:
-        s.setdefault("depth", {})["value"] = fn["depth_um"]
-        s["depth"]["units"] = "um"
+        s["depth"]["value"] = fn["depth_um"]
     if fn.get("magnification") and not dn.get("magnification"):
-        s.setdefault("magnification", {})["value"] = fn["magnification"]
-        s["magnification"]["units"] = "factor"
+        s["magnification"]["value"] = fn["magnification"]
 
-    # ── 3. OME header (highest priority) ─────────────────────────────────
+    # ── 4. OME header (highest priority) ─────────────────────────────────
     if px.get("sample_rate_hz"):
-        s["sample_rate"] = {
-            "value": round(px["sample_rate_hz"], 4),
-            "units": "Hz",
-        }
+        s["sample_rate"]["value"] = round(px["sample_rate_hz"], 4)
     if px.get("size_x") and px.get("size_y"):
-        s["frame_size"] = {"x": px["size_x"], "y": px["size_y"]}
+        s["frame_size"]["x"] = px["size_x"]
+        s["frame_size"]["y"] = px["size_y"]
     if px.get("physical_size_x") and px.get("physical_size_y"):
-        s["pixel_size"] = {
-            "x": round(px["physical_size_x"], 6),
-            "y": round(px["physical_size_y"], 6),
-            "units": "um",
-        }
+        s["pixel_size"]["x"] = round(px["physical_size_x"], 6)
+        s["pixel_size"]["y"] = round(px["physical_size_y"], 6)
     if px.get("pixel_type"):
-        s["pixel_type"] = px["pixel_type"]
+        s["pixel_dtype"] = px["pixel_type"]
     if px.get("size_t"):
         s["n_frames"] = px["size_t"]
     if px.get("size_z"):
