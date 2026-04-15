@@ -2,69 +2,87 @@
 """
 utilities/new_session.py
 ========================
-Prepare a new pipeline session from the template files.
+Prepare a new CaImAn pipeline session from the template files.
 
-Creates ``<dest>/<session>_pipeline.py`` and ``<dest>/<session>_pipeline.json``
-by copying the templates and patching the JSON with the correct ``data_root``
-and ``experiment`` paths derived from the destination.
+Creates <dest>/<session>_pipeline.py and <dest>/<session>_pipeline.json
+by copying the templates and patching the JSON with the correct paths and
+any parameter overrides.  Optionally runs GPU motion correction, estimates
+CNMF parameters, and executes the pipeline.
 
-Usage
------
-Minimal — run from the TL directory containing the .tif::
+Quick start
+-----------
+  # From the TIF directory (session and dest inferred automatically):
+  cd /data/source/.../strohA-ia-000000-20151016/strohA-ia-000000-20151016-TL001_143915-25x-spont
+  new-session -y
+  new-session --run-mc --estimate-params -y
+  new-session --run-mc --estimate-params --run -y
 
-    cd /data/source/strohA/…/strohA-ia-000000-20140813-TL001_121103-25x-default
-    python ~/software/CaImAn/utilities/new_session.py
-
-Or run from an already-created session directory::
-
-    cd /data/source/…/TL001_…/<session>/
-    python ~/software/CaImAn/utilities/new_session.py
-
-Explicit (session and dest still accepted for scripted / batch use)::
-
-    python utilities/new_session.py \\
-        stroh-ej-20140714-TL1 \\
-        /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/
-
-Override individual JSON parameters::
-
-    python utilities/new_session.py \\
-        stroh-ej-20140714-TL1 \\
-        /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/ \\
-        --data-root /data/src/ \\
-        --fr 15 \\
-        --decay-time 0.4 \\
-        --gSig 7 \\
-        --rf 28 \\
-        --method-init greedy_roi
-
-Dry run (print what would be done without writing anything)::
-
-    python utilities/new_session.py \\
-        stroh-ej-20140714-TL1 \\
-        /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/ \\
-        --dry-run
+  # Explicit session and dest:
+  new-session strohA-ia-000000-20151016-TL001_143915-25x-spont-C00-fc011170 \
+              /data/source/.../strohA-ia-000000-20151016-TL001_143915-25x-spont \
+              --run-mc --estimate-params -y
 
 Positional arguments
 --------------------
-session
-    Session identifier, e.g. ``stroh-ej-20140714-TL1``.  This becomes the
-    stem of both output files and is used to locate the expected ``.tif``
-    input.
-dest
-    Absolute path to the session folder.  The folder is created if it does
-    not exist.  ``data_root`` and ``experiment`` are inferred as the longest
-    prefix that matches ``/data/src/`` (or the value of ``--data-root``) and
-    the remainder respectively.
+  session               Session identifier (TIF stem).
+                        Omit to infer from CWD.
+  dest                  Absolute path to the session folder.
+                        Omit to infer from CWD.
+
+Session / data flags
+---------------------
+  --data-root PATH      Override inferred data_root in the JSON.
+  --yaml PATH           Acquisition YAML to read defaults from.
+                        Auto-detected from dest parent if omitted.
+                        Created from template if not found.
+  --fr HZ               Acquisition frame rate [Hz].
+  --decay-time S        GCaMP decay time constant [s].
+                        (GCaMP6f ~0.4, GCaMP6s ~1.0)
+
+CNMF parameter flags
+---------------------
+  --gSig PX             Gaussian half-width [px].
+                        Sets gSig=[N,N] and gSiz=[4N+1,4N+1].
+                        Also auto-derives rf and stride when --rf is omitted.
+  --rf PX               Patch half-size [px].
+                        Ring constraint: ring_size_factor x gSiz must be < rf.
+  --K N                 Max components per patch.
+  --min-corr F          Minimum local correlation for seed pixel.
+  --min-pnr F           Minimum peak-to-noise ratio for seed pixel.
+  --method-init         Initialisation method: corr_pnr (default) or greedy_roi.
+  --n-processes N       CNMF worker count. Default: all CPUs.
+
+Processing flags
+-----------------
+  --run-mc              Run GPU rigid motion correction before parameter
+                        estimation if no MC mmap exists yet.
+                        Implies --estimate-params.
+  --estimate-params     Estimate CNMF parameters from the MC'd movie and
+                        update the JSON with the suggestions.
+  --n-frames N          Frames to subsample for parameter estimation.
+                        Default: 500.
+  --species mouse|rat   Animal species — constrains gSig search range.
+                        Default: mouse.
+  --magnification 20x|40x
+                        Objective magnification — combined with species to
+                        bound gSig. Default: 20x.
+  --run                 Run the pipeline script after setup (and MC /
+                        estimation if those flags are also set).
+
+Behaviour flags
+---------------
+  --dry-run             Print what would be done without writing any files.
+  -y / --force          Overwrite existing pipeline files without prompting.
+                        Useful in batch scripts.
+  --no-comments         Strip _comment keys from the output JSON.
+  -h / --help           Show this help message.
 
 Output files
 ------------
-``<dest>/<session>_pipeline.py``
-    Ready-to-run pipeline script (unchanged copy of the template).
-
-``<dest>/<session>_pipeline.json``
-    JSON config with ``session.data_root`` and ``session.experiment`` patched.
-    Any additional ``--key value`` overrides are applied on top.
+  <dest>/<session>_pipeline.py    Ready-to-run pipeline script.
+  <dest>/<session>_pipeline.json  JSON config with all parameters.
+  <dest>/<session>.yaml           Acquisition YAML (created from template
+                                  if not already present).
 """
 
 from __future__ import annotations
@@ -337,6 +355,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="new_session.py",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='CNMF ring constraint: ring_size_factor x gSiz must be < rf\n  Safe rule: rf = 5 x gSig,  stride = rf // 2,  gSiz = 4 x gSig + 1\n\nExamples:\n  new-session -y\n  new-session --run-mc --estimate-params -y\n  new-session --run-mc --estimate-params --run -y\n  new-session --gSig 6 --rf 32 --K 15 -y\n  new-session session dest --fr 30.6 --decay-time 0.4 --gSig 7 -y',
     )
 
     p.add_argument("session", nargs="?", default=None,

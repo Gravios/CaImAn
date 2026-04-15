@@ -2,35 +2,38 @@
 """
 utilities/batch_sessions.py
 ============================
-Run new-session for every session subdirectory under a parent directory,
-passing through all new-session flags unchanged.
+Run new-session for every session subdirectory under a parent directory.
+All unrecognised flags are forwarded verbatim to new-session.
 
-Usage
------
-Run from the date directory (--parent defaults to CWD)::
+Quick start
+-----------
+  cd /data/source/strohA/.../strohA-ia-000000-20151016
+  batch-sessions --prefix strohA-ia --run-mc --estimate-params -y
+  batch-sessions --prefix strohA-ia --run -y
+  batch-sessions --prefix strohA-ia --run-mc --estimate-params --run -y
 
-    cd /data/source/strohA/strohA-ia/strohA-ia-000000/strohA-ia-000000-20151016
-    batch-sessions --prefix strohA-ia --run-mc --estimate-params -y
+Flags (batch-sessions)
+----------------------
+  --parent DIR          Parent directory containing session subdirs.
+                        Default: current working directory.
+  --prefix PREFIX       Only process subdirs whose name starts with PREFIX.
+                        Default: all subdirectories.
+  --skip-done           Skip sessions that already have a _pipeline.json.
+  --stop-on-error       Abort on first failure. Default: log and continue.
 
-Explicit parent with pipeline execution::
-
-    batch-sessions \\
-        --parent /data/source/strohA/.../strohA-ia-000000-20151016 \\
-        --prefix strohA-ia \\
-        --run-mc --estimate-params --run -y
-
-Any flag not listed below is forwarded verbatim to new-session.
-
-Batch-only options
-------------------
---parent      Parent directory containing session subdirectories
-              (default: current working directory)
---prefix      Only process subdirectories whose name starts with this prefix
-              (default: all subdirectories)
---skip-done   Skip sessions that already have a _pipeline.json
---stop-on-error
-              Abort the batch on the first session that fails
-              (default: log the error and continue)
+Forwarded to new-session (examples)
+-------------------------------------
+  -y / --force          Overwrite existing pipeline files without prompting.
+  --run-mc              Run GPU motion correction before param estimation.
+  --estimate-params     Estimate CNMF parameters from the MC'd movie.
+  --run                 Run the CaImAn pipeline after setup.
+  --gSig PX             Gaussian half-width in pixels.
+  --rf PX               Patch half-size in pixels.
+  --fr HZ               Acquisition frame rate.
+  --decay-time S        GCaMP decay time constant in seconds.
+  --species mouse|rat   Animal species (constrains gSig search range).
+  --dry-run             Preview only — no files written.
+  (see: new-session --help for the full list)
 """
 
 from __future__ import annotations
@@ -64,6 +67,15 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         # allow_abbrev=False prevents --prefix matching --preallocate etc.
         allow_abbrev=False,
+        epilog=(
+            "Batch-only flags:\n"
+            "  --parent DIR          Parent directory (default: CWD)\n"
+            "  --prefix PREFIX       Only process subdirs starting with PREFIX\n"
+            "  --skip-done           Skip sessions that already have a _pipeline.json\n"
+            "  --stop-on-error       Abort on first failure (default: continue)\n\n"
+            "All other flags are forwarded verbatim to new-session.\n"
+            "Run: new-session --help   for the full list of forwarded flags."
+        ),
     )
     p.add_argument(
         "--parent", default=None, metavar="DIR",

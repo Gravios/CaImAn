@@ -2,39 +2,42 @@
 """
 utilities/stack_sessions.py
 ============================
-Stack OME-TIFF frame series for all session directories under a parent
-directory.  Replaces ``stack_sessions.sh``.
+Stack OME-TIFF frame series into per-channel BigTIFF stacks for every
+session directory under a parent directory.
 
-Imports :mod:`caiman.utils.ome_meta` and :mod:`caiman.utils.stack_to_bigtiff`
-directly - no ``--script-dir`` needed, no OS ARG_MAX constraint.
+For each session this script:
+  1. Finds the master OME-TIFF and reads frame count / sample rate from
+     its OME-XML header.
+  2. Discovers channels from *_CNN_t0*.ome.tif sentinel files.
+  3. Zero-pads time indices to 6 digits so alphabetic sort equals
+     temporal order (fixes Olympus FluoView mixed-width indices).
+  4. Stacks each channel into a single preallocated BigTIFF.
+  5. Creates or updates the session Trial YAML, populating every field
+     it can infer from the directory name, frame filename, and OME header.
 
-For each session a Trial YAML is created (or updated) at
-``<session_dir>/<session_name>.yaml`` by:
+Quick start
+-----------
+  cd /data/source/strohA/.../strohA-ia-000000-20150709
+  stack-sessions --prefix strohA-ia            # dry run
+  stack-sessions --prefix strohA-ia            # live run (sources kept)
+  stack-sessions --prefix strohA-ia --delete-sources   # delete frames after stack
 
-  1. Copying ``pipelines/template_acquisition.yaml`` as the skeleton
-  2. Parsing fields from the session directory name
-  3. Parsing additional fields from the frame filename (laser power, depth, fa)
-  4. Filling in OME-header fields (frame rate, frame size, pixel size, etc.)
-
-Usage
+Flags
 -----
-Run from the parent date directory (``--parent`` defaults to CWD)::
+  --prefix PREFIX       Session directory prefix to match (required).
+                        e.g. strohA-ia
+  --parent DIR          Parent directory containing session subdirs.
+                        Default: current working directory.
+  --delete-sources      Delete source frame TIFFs after each successful
+                        stack write. Off by default.
+  --dry-run             Preview what would be done — no files written.
+  -h / --help           Show this help message.
 
-    cd /data/source/strohA/.../strohA-ia-000000-20150709
-    python ~/software/CaImAn/utilities/stack_sessions.py --prefix strohA-ia
-
-Explicit parent::
-
-    python ~/software/CaImAn/utilities/stack_sessions.py \\
-        --prefix strohA-ia \\
-        --parent /data/source/strohA/.../strohA-ia-000000-20150709
-
-Options
--------
---prefix          Session directory prefix, e.g. ``strohA-ia`` (required)
---parent          Parent directory containing session subdirs (default: CWD)
---delete-sources  Delete source frame TIFFs after each successful stack write
---dry-run         Preview without writing any files
+Output layout (per session)
+---------------------------
+  <session>-C00-fc<N>.tif          BigTIFF stack, channel 00
+  <session>-C01-fc<N>.tif          BigTIFF stack, channel 01  (if present)
+  <session>.yaml                   Trial YAML (created or updated)
 """
 
 from __future__ import annotations
@@ -416,6 +419,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Output per session:\n  <session>-C00-fc<N>.tif    BigTIFF stack for channel 00\n  <session>.yaml             Trial YAML (created/updated)\n\nExamples:\n  stack-sessions --prefix strohA-ia\n  stack-sessions --prefix strohA-ia --delete-sources\n  stack-sessions --prefix strohA-ia --dry-run',
     )
     p.add_argument(
         "--prefix", required=True, metavar="PREFIX",
