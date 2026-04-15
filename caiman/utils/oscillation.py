@@ -409,11 +409,24 @@ class OscillationAnalyzer:
         self._neural_label = "signal"   # overwritten below if traces found
 
         # ── Background ───────────────────────────────────────────────────
+        # estimates.f is the raw temporal coefficient of the global low-rank
+        # background spatial components (b), shape (gnb, T).  Unlike neural
+        # traces it is never baselined — it carries strong DC offset and slow
+        # photobleaching drift that swamp the multitaper spectral estimate.
+        # Subtract a per-component running median (window = 10 s) before
+        # averaging so only oscillatory structure remains.
         if hasattr(estimates, "f") and estimates.f is not None:
-            fm      = np.atleast_2d(estimates.f)
-            self.bg = fm.mean(axis=0).astype(np.float64)
+            fm = np.atleast_2d(np.array(estimates.f, dtype=np.float64))
+            win = max(3, int(fs * 10) | 1)          # 10-s window, odd
+            try:
+                from scipy.ndimage import uniform_filter1d as _uf1
+                baseline = _uf1(fm, size=win, axis=1, mode="nearest")
+                fm = fm - baseline
+            except Exception:
+                fm = fm - fm.mean(axis=1, keepdims=True)   # DC removal fallback
+            self.bg = fm.mean(axis=0)
             log.info(f"Background: {fm.shape[0]} component(s), "
-                     f"{fm.shape[1]} frames")
+                     f"{fm.shape[1]} frames  (detrended, window={win} samples)")
         else:
             self.bg = None
             log.warning("estimates.f not found — background analysis disabled")
