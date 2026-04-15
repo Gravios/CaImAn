@@ -312,8 +312,10 @@ def _run_motion_correction(tif_path: Path, caiman_temp: str, log) -> tuple:
         return None, None
 
 
-def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> None:
-    """Run motion correction and/or param estimation; updates out_json in place."""
+def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> bool:
+    """Run motion correction and/or param estimation; updates out_json in place.
+    Returns True if estimation ran (or was skipped intentionally), False if TIF missing.
+    """
     import glob as _glob
     import logging as _logging
 
@@ -329,7 +331,7 @@ def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> None
 
     if not tif_path.exists():
         print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
-        return
+        return False
 
     mc_path = (
         sorted(_glob.glob(str(dest / f"*{session}*rig*order_F*.mmap")))
@@ -384,6 +386,7 @@ def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> None
                 print(f"  Deleted temporary MC mmap: {Path(mc_path[-1]).name}")
             except OSError as exc:
                 log.warning(f"Could not delete MC mmap: {exc}")
+    return True
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -558,14 +561,16 @@ def main(argv: list[str] | None = None) -> int:
     print("\nDone.")
 
     # ── MC / param estimation ──────────────────────────────────────────────
+    tif_ok = (dest / f"{session}.tif").exists()
     if args.estimate_params or args.run_mc:
         _apply_pipeline_env(patched.get("env", {}))
         try:
-            _run_mc_and_estimate(args, session, dest, out_json)
+            tif_ok = _run_mc_and_estimate(args, session, dest, out_json)
         except Exception as exc:
             import traceback
             print(f"  Failed: {exc}")
             traceback.print_exc()
+            tif_ok = False
 
     # ── Next steps ─────────────────────────────────────────────────────────
     print()
@@ -578,13 +583,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Optional pipeline run ──────────────────────────────────────────────
     if args.run:
-        import subprocess
-        print(f"Running pipeline: {out_py}")
-        print("=" * 60)
-        result = subprocess.run([sys.executable, str(out_py)], cwd=str(dest))
-        if result.returncode != 0:
-            print(f"\n  Pipeline exited with code {result.returncode}")
-            return result.returncode
+        if not tif_ok:
+            print("  Skipping --run: TIF not found.")
+        else:
+            import subprocess
+            print(f"Running pipeline: {out_py}")
+            print("=" * 60)
+            result = subprocess.run([sys.executable, str(out_py)], cwd=str(dest))
+            if result.returncode != 0:
+                print(f"\n  Pipeline exited with code {result.returncode}")
+                return result.returncode
 
     return 0
 
