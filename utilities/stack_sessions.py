@@ -215,7 +215,7 @@ def _parse_frame_name(name: str) -> dict:
 def _find_template() -> Path | None:
     """Locate template_acquisition.yaml relative to this script."""
     candidates = [
-        Path(__file__).resolve().parent.parent / "pipelines" / "template_acquisition.yaml",
+        Path(__file__).resolve().parent / "pipelines" / "template_acquisition.yaml",
         Path(__file__).resolve().parent / "template_acquisition.yaml",
     ]
     for c in candidates:

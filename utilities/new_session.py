@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pipelines/new_session.py
+utilities/new_session.py
 ========================
 Prepare a new pipeline session from the template files.
 
@@ -13,22 +13,22 @@ Usage
 Minimal — run from the TL directory containing the .tif::
 
     cd /data/source/strohA/…/strohA-ia-000000-20140813-TL001_121103-25x-default
-    python ~/software/CaImAn/pipelines/new_session.py
+    python ~/software/CaImAn/utilities/new_session.py
 
 Or run from an already-created session directory::
 
     cd /data/source/…/TL001_…/<session>/
-    python ~/software/CaImAn/pipelines/new_session.py
+    python ~/software/CaImAn/utilities/new_session.py
 
 Explicit (session and dest still accepted for scripted / batch use)::
 
-    python pipelines/new_session.py \\
+    python utilities/new_session.py \\
         stroh-ej-20140714-TL1 \\
         /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/
 
 Override individual JSON parameters::
 
-    python pipelines/new_session.py \\
+    python utilities/new_session.py \\
         stroh-ej-20140714-TL1 \\
         /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/ \\
         --data-root /data/src/ \\
@@ -40,7 +40,7 @@ Override individual JSON parameters::
 
 Dry run (print what would be done without writing anything)::
 
-    python pipelines/new_session.py \\
+    python utilities/new_session.py \\
         stroh-ej-20140714-TL1 \\
         /data/src/stroh-ej/RawDataSel_AD_Project/G1_B6J/14072014/ \\
         --dry-run
@@ -209,8 +209,9 @@ def _find_yaml(session: str, dest) -> "Path | None":
 # ── Locate templates ──────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_TPL_PY     = _SCRIPT_DIR / "template_pipeline.py"
-_TPL_JSON   = _SCRIPT_DIR / "template_pipeline.json"
+_PIPELINES  = _SCRIPT_DIR / "pipelines"
+_TPL_PY     = _PIPELINES / "template_pipeline.py"
+_TPL_JSON   = _PIPELINES / "template_pipeline.json"
 
 
 def _find_templates() -> tuple[Path, Path]:
@@ -219,7 +220,7 @@ def _find_templates() -> tuple[Path, Path]:
     if missing:
         raise FileNotFoundError(
             f"Template files not found: {[str(p) for p in missing]}\n"
-            f"Expected in: {_SCRIPT_DIR}"
+            f"Expected in: {_PIPELINES}"
         )
     return _TPL_PY, _TPL_JSON
 
@@ -854,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"  1. Review and tune:  {out_json.name}")
         print(f"  2. Place TIFF:       {dest}/{session}.tif")
-        print(f"  3. Estimate params:  python pipelines/new_session.py {session} {dest} --run-mc --estimate-params -y")
+        print(f"  3. Estimate params:  python utilities/new_session.py {session} {dest} --run-mc --estimate-params -y")
         print(f"  4. Run:              python {out_py.name}")
     print()
 
