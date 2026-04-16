@@ -108,9 +108,7 @@ if __name__ == "__main__":
 
     # ── Session identity ──────────────────────────────────────────────────────
     _P     = load_pipeline_params(_CONFIG_PATH)
-    datsrc = Path(_P.session.data_root)
-    expsrc = Path(_P.session.experiment)
-    outdir = datsrc / expsrc
+    outdir = _SCRIPT_PATH.parent
 
     # ── Infrastructure ────────────────────────────────────────────────────────
     logger         = setup_logging(outdir / f"{session}.log")
@@ -290,11 +288,14 @@ if __name__ == "__main__":
             f"using disk-backed mmap."
         )
 
-    # Use all physical cores when movie is in SHM; JSON cluster.n_processes otherwise
+    # Use explicit cluster.n_processes when set; fall back to all logical cores
+    # (logical=True — hyperthreads help on NNLS workloads) when in SHM mode,
+    # or the JSON value when falling back to disk.
+    _json_n = getattr(_P, "cluster", None) and _P.cluster.n_processes or None
     _cluster_n = (
-        (_psutil.cpu_count(logical=False) or os.cpu_count())
+        _json_n or (_psutil.cpu_count(logical=True) or os.cpu_count())
         if _shm_path else
-        (getattr(_P, "cluster", None) and _P.cluster.n_processes or None)
+        _json_n
     )
 
     Yr, dims, T = cm.mmapping.load_memmap(fname_cnmf)

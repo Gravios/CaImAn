@@ -27,7 +27,6 @@ Positional arguments
 
 Session / data flags
 ---------------------
-  --data-root PATH      Override inferred data_root in the JSON.
   --yaml PATH           Acquisition YAML. Auto-detected from dest parent if omitted.
                         Created from template if not found.
   --fr HZ               Acquisition frame rate [Hz].
@@ -196,24 +195,6 @@ def _find_templates() -> tuple[Path, Path]:
 
 # ── JSON patching ─────────────────────────────────────────────────────────────
 
-def _infer_paths(dest: Path, data_root: str | None) -> tuple[str, str]:
-    if data_root is None:
-        for candidate in ["/data/src", "/data", "/mnt/data/src"]:
-            if str(dest).startswith(candidate):
-                data_root = candidate
-                break
-        else:
-            data_root = str(dest.parent.parent)
-    data_root = data_root.rstrip("/")
-    dest_str  = str(dest).rstrip("/")
-    experiment = (
-        dest_str[len(data_root):].lstrip("/")
-        if dest_str.startswith(data_root)
-        else dest_str.lstrip("/")
-    )
-    return data_root + "/", experiment + "/"
-
-
 def _strip_comments(raw: dict) -> dict:
     if isinstance(raw, dict):
         return {k: _strip_comments(v) for k, v in raw.items()
@@ -227,15 +208,12 @@ def _patch_json(
     template_path: Path,
     session: str,
     dest: Path,
-    data_root: str | None,
     overrides: dict,
     strip_comments: bool,
 ) -> dict:
     raw = json.loads(template_path.read_text())
-    dr, exp = _infer_paths(dest, data_root)
-    raw["session"]["data_root"]  = dr
-    raw["session"]["experiment"] = exp
-    raw["session"].pop("_comment", None)
+    raw.pop("session", None)   # session section removed — outdir derived from script location
+
     for dotkey, value in overrides.items():
         parts = dotkey.split(".", 1)
         if len(parts) == 2:
@@ -243,6 +221,7 @@ def _patch_json(
             raw.setdefault(section, {})[key] = value
         else:
             raw[dotkey] = value
+
     return _strip_comments(raw) if strip_comments else raw
 
 
@@ -410,7 +389,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Session stem. Inferred from CWD if omitted.")
     p.add_argument("dest", nargs="?", default=None,
                    help="Channel subdir path. Inferred from CWD if omitted.")
-    p.add_argument("--data-root",       metavar="PATH")
     p.add_argument("--template-json",   metavar="PATH",
                    help="Path to a custom template_pipeline.json. "
                         "Defaults to utilities/pipelines/template_pipeline.json.")
@@ -531,11 +509,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Patch JSON ─────────────────────────────────────────────────────────
     patched = _patch_json(tpl_json, session, dest,
-                          data_root=args.data_root,
                           overrides=overrides,
                           strip_comments=args.no_comments)
-    dr  = patched["session"]["data_root"]
-    exp = patched["session"]["experiment"]
 
     # ── Summary ────────────────────────────────────────────────────────────
     print()
@@ -543,8 +518,6 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
     print(f"  Session    : {session}")
     print(f"  Dest       : {dest}")
-    print(f"  data_root  : {dr}")
-    print(f"  experiment : {exp}")
     if args.estimate_params or args.run_mc:
         print(f"  Species    : {species}    Magnif: {magnif}")
     if overrides:

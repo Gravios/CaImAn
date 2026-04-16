@@ -16,11 +16,6 @@
         "KERAS_BACKEND": "numpy",
         "CAIMAN_TILE_N": "4"
     },
-    "session": {
-        "_comment": "session_id is intentionally absent \u2014 it is the script filename stem minus _pipeline. Only structural paths live here.",
-        "data_root": "/data/src/",
-        "experiment": "<lab>/<experiment>/<date>/"
-    },
     "data": {
         "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f\u22480.4, GCaMP6s\u22481.0). add_baseline: constant added to all pixels during F\u2192C conversion to keep values >0 for stable dF/F. n_channels / n_planes: propagated from acquisition YAML by new_session.py. channel_id: 0-based index of the channel this pipeline analyses (set per-channel when n_channels > 1).",
         "fr": 30,
@@ -94,9 +89,9 @@
     },
     "cluster": {
         "_comment": "n_processes: null=auto (all CPUs). Reduce ram_budget_frac if workers OOM. Lower worker_overhead_frac if actual worker RAM < estimated. worker_overhead_frac: multiplier on analytical RAM estimate per worker (default 1.6). Lower to allow more workers when empirical RSS < estimate. ram_budget_frac: fraction of total RAM available for workers after reserving movie+parent.",
-        "n_processes": null,
-        "ram_budget_frac": 0.9,
-        "worker_overhead_frac": 1.2,
+        "n_processes": 128,
+        "ram_budget_frac": 0.95,
+        "worker_overhead_frac": 1.1,
         "blas_threads_per_worker": 1
     },
     "gpu": {
