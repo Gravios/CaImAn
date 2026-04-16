@@ -27,6 +27,7 @@ Forwarded to new-session (examples)
   --run-mc              Run GPU motion correction before param estimation.
   --estimate-params     Estimate CNMF parameters from the MC'd movie.
   --run                 Run the CaImAn pipeline after setup.
+  --template-json PATH  Use a custom template_pipeline.json.
   --gSig PX             Gaussian half-width in pixels.
   --rf PX               Patch half-size in pixels.
   --fr HZ               Acquisition frame rate.

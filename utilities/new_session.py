@@ -411,6 +411,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("dest", nargs="?", default=None,
                    help="Channel subdir path. Inferred from CWD if omitted.")
     p.add_argument("--data-root",       metavar="PATH")
+    p.add_argument("--template-json",   metavar="PATH",
+                   help="Path to a custom template_pipeline.json. "
+                        "Defaults to utilities/pipelines/template_pipeline.json.")
     p.add_argument("--yaml",            metavar="PATH")
     p.add_argument("--fr",              type=float, metavar="HZ")
     p.add_argument("--decay-time",      type=float, metavar="S")
@@ -467,11 +470,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {k} = {v}")
 
     # ── Locate templates ───────────────────────────────────────────────────
+    tpl_json_override = Path(args.template_json).resolve() if args.template_json else None
+    if tpl_json_override and not tpl_json_override.exists():
+        print(f"ERROR: --template-json not found: {tpl_json_override}", file=sys.stderr)
+        return 1
     try:
         tpl_py, tpl_json = _find_templates()
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    if tpl_json_override:
+        tpl_json = tpl_json_override
+        print(f"  Template JSON : {tpl_json}")
 
     # ── Build overrides (YAML defaults < CLI flags) ────────────────────────
     fr      = args.fr         if args.fr         is not None else yd.get("fr")
