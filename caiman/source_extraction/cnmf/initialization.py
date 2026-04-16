@@ -1729,7 +1729,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
                 del _ftm
             # Apply tsub to match data_filtered shape (total_frames, d1p, d2p).
             # total_frames = T//tsub; _fd_T = T (full). Downsample by slicing.
-            _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
+            _ftsub = max(1, _filt_raw.shape[0] // data_filtered.shape[0])
             # Apply temporal AND spatial subsampling.
             # filt_full is at full resolution; data_filtered may be spatially
             # downsampled. Derive the spatial factor from array shapes directly
@@ -1749,7 +1749,7 @@ def init_neurons_corr_pnr(data, max_number=None, gSiz=15, gSig=None,
             # the nominal gSiz×gSiz extent when the patch abuts the movie edge.
             _d1p, _d2p = data_filtered.shape[1], data_filtered.shape[2]
             _filt_raw = _filt_raw[:, :_d1p, :_d2p]
-            _ftsub = _fd_T // total_frames if total_frames < _fd_T else 1
+            _ftsub = max(1, _filt_raw.shape[0] // data_filtered.shape[0])
             _fssub = max(1, _filt_raw.shape[1] // data_filtered.shape[1])
             data_filtered[:] = _filt_raw[::_ftsub, ::_fssub, ::_fssub]
             del _filt_raw
