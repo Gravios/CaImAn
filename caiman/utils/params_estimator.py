@@ -50,9 +50,11 @@ logger = logging.getLogger("caiman")
 
 # ── Species × magnification priors ────────────────────────────────────────────
 _PRIORS: dict[tuple, dict] = {
+    ("mouse", "16x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
     ("mouse", "20x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
     ("mouse", "25x"): {"gsig_min": 3, "gsig_max":  7, "fallback": 4},
     ("mouse", "40x"): {"gsig_min": 6, "gsig_max": 14, "fallback": 9},
+    ("rat",   "16x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
     ("rat",   "20x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
     ("rat",   "25x"): {"gsig_min": 5, "gsig_max": 13, "fallback": 9},
     ("rat",   "40x"): {"gsig_min": 7, "gsig_max": 16, "fallback": 10},
