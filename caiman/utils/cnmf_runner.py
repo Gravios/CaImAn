@@ -250,10 +250,10 @@ class CNMFRunner:
         tuple[int, int]
             ``(n_accepted, n_rejected)`` component counts.
         """
-        cnm2.estimates.evaluate_components(images, cnm2.params, dview=None)
+        cnm2.estimates.evaluate_components(images, cnm2.params, dview=self._dview)
         if cnm2.estimates.idx_components is None:
             logger.warning("idx_components is None — re-running evaluate_components")
-            cnm2.estimates.evaluate_components(images, cnm2.params, dview=None)
+            cnm2.estimates.evaluate_components(images, cnm2.params, dview=self._dview)
 
         idx_acc = cnm2.estimates.idx_components
         idx_rej = cnm2.estimates.idx_components_bad
