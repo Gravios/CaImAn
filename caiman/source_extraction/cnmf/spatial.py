@@ -202,6 +202,7 @@ def update_spatial_components(Y, C=None, f=None, A_in=None, sn=None, dims=None,
                 Y, _Cf, f, ind2_, sn, nr, d, T, rank_f,
                 method_ls=method_ls, cct=cct,
                 n_pixels_per_process=n_pixels_per_process,
+                dview=dview,
             )
         except Exception as _gpu_exc:
             logger.warning(
