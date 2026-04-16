@@ -301,11 +301,23 @@ if __name__ == "__main__":
     images = np.reshape(Yr.T, [T] + list(dims), order="F")
     images.filename = Yr.filename
 
+    if _shm_path:
+        # Collapse all patches into a single tile so workers receive the full
+        # patch list at once with no inter-tile waiting.
+        # tile_n × stride must cover max(d1, d2); 1 slot = no prefetch needed.
+        import math as _math
+        _stride = int(_P.cnmf.stride)
+        _tile_n = _math.ceil(max(dims) / _stride)
+        os.environ["CAIMAN_TILE_N"]     = str(_tile_n)
+        os.environ["CAIMAN_TILE_SLOTS"] = "1"
+        logger.info(
+            f"SHM: tile_n={_tile_n}, stride={_stride} — "
+            f"all patches in one {dims[0]}×{dims[1]} tile, 1 slot"
+        )
+
     # Register CuPy atexit cleanup to prevent CUDA_ERROR_ILLEGAL_ADDRESS
     # at process exit when torch (CUDA 13) and cupy-cuda12x coexist.
     cupy_register_cleanup()
-
-    # ── 5. CNMF ───────────────────────────────────────────────────────────────
     clean_stale_shm(CAIMAN_SHM, CAIMAN_TEMP, logger)
     logger.info("Starting CNMF cluster")
     _, dview, n_processes = cm.cluster.setup_cluster(

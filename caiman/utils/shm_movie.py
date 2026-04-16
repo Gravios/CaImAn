@@ -143,10 +143,6 @@ def load_to_shm(
         _fast_copy(fname_cnmf, shm_path, log)
         log.info(f"SHM: copy complete  {shm_path}")
 
-    # Disable tile buffer — irrelevant when movie is in RAM
-    os.environ["CAIMAN_TILE_SLOTS"] = "0"
-    log.info("SHM: CAIMAN_TILE_SLOTS set to 0 (tile buffer disabled)")
-
     return shm_path
 
 
