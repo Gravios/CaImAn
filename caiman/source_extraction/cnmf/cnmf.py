@@ -333,7 +333,7 @@ class CNMF(object):
             cnm._forder_movie_path = self._forder_movie_path
         try:
             cnm.fit(images)
-        finally:
+        except Exception:
             if getattr(cnm, 'dview', None) is not None and \
                     'multiprocessing' in str(type(cnm.dview)):
                 try:
@@ -342,6 +342,7 @@ class CNMF(object):
                     cnm.dview = None
                 except Exception:
                     pass
+            raise
         return cnm
 
     def fit(self, images, indices=(slice(None), slice(None))) -> None:
