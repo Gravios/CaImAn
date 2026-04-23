@@ -55,7 +55,8 @@ echo "Scanning for .etrk.png frames in: $ABS_DIR"
 
 find "$ABS_DIR" -maxdepth 1 -name "*.etrk.png" -printf "%f\n" \
     | sort -t'-' -k7 -n \
-    | awk -v dir="$ABS_DIR" '{ print "file " dir "/" $0 }' \
+    | awk -v dir="$ABS_DIR" -v fps="$FPS" \
+        '{ print "file " dir "/" $0 "\nduration " 1/fps }' \
     > "$TMPLIST"
 
 NFRAMES=$(wc -l < "$TMPLIST")
