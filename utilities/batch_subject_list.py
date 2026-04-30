@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{i}/{len(subjects)}] {subject.name}")
         print("#" * 70)
 
-        bsubj_argv = [str(subject)] + passthrough
+        bsubj_argv = ["--subject", str(subject)] + passthrough
         try:
             rc = _bsubj_main(bsubj_argv)
         except SystemExit as exc:
