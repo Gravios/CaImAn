@@ -107,12 +107,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Error: --parent is not a directory: {parent}", file=sys.stderr)
         return 1
 
-    # Collect all channel subdirs across all matching TL dirs.
-    # Layout:
+    # Collect all session candidates across all matching TL dirs.
+    # Layouts:
     #   <parent>/
     #     <TL_dir>/                     <- matches --prefix
-    #       <TL_dir>-C00-fc<N>/         <- channel subdir (dest for new_session)
-    #         <TL_dir>-C00-fc<N>.tif
+    #       <TL_dir>-C00-fc<N>/         <- channel subdir (TIF or MSR post-branch)
+    #         <TL_dir>-C00-fc<N>.tif    or .msr
+    #       <TL_dir>.msr                <- organize_msr.py output, pre-MSR-branch
     ch_pattern = re.compile(r'.+-C\d{2}-fc\d+$')
 
     tl_dirs = sorted(
@@ -120,15 +121,29 @@ def main(argv: list[str] | None = None) -> int:
         if d.is_dir() and (args.prefix is None or d.name.startswith(args.prefix))
     )
 
-    # Build list of (session_stem, channel_dir) pairs
+    # Build list of (session_stem, dest_dir) pairs.
+    #
+    # Two layouts are recognised per TL_dir:
+    #   A. Channel subdir(s) already exist (TIF case, or MSR after first
+    #      new_session run): each <TL_dir>-C<NN>-fc<NNNNNN>/ becomes a
+    #      session whose dest is the channel subdir itself.
+    #   B. organize_msr.py output, pre-MSR-branch: <TL_dir>/<TL_dir>.msr
+    #      sits at the TL_dir level and no channel subdir exists yet. The
+    #      TL_dir itself is passed as dest; new_session's MSR branch will
+    #      build the channel subdir on first call.
     sessions: list[tuple[str, Path]] = []
     for tl_dir in tl_dirs:
         ch_dirs = sorted(
             d for d in tl_dir.iterdir()
             if d.is_dir() and ch_pattern.match(d.name)
         )
-        for ch_dir in ch_dirs:
-            sessions.append((ch_dir.name, ch_dir))
+        if ch_dirs:
+            for ch_dir in ch_dirs:
+                sessions.append((ch_dir.name, ch_dir))
+        else:
+            msr_at_tl = tl_dir / f"{tl_dir.name}.msr"
+            if msr_at_tl.exists():
+                sessions.append((tl_dir.name, tl_dir))
 
     if not sessions:
         print(f"No channel subdirectories found under {parent}"
