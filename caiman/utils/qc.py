@@ -214,11 +214,8 @@ def qc_raw_sample(
     str or None
         Absolute path of the saved PNG, or ``None`` on failure.
     """
-    import tifffile
-    with tifffile.TiffFile(str(fname)) as tf:
-        T   = len(tf.pages)
-        idx = np.linspace(0, T - 1, n_frames, dtype=int)
-        frames = np.stack([tf.pages[i].asarray() for i in idx])
+    from caiman.utils.stack_io import stack_evenly_sampled
+    frames, idx = stack_evenly_sampled(fname, n_frames)
 
     nc  = 3
     nr  = int(np.ceil(n_frames / nc))
@@ -265,7 +262,7 @@ def qc_motion_correction(mc, out_path: Union[str, Path]) -> Optional[str]:
         Absolute path of the saved PNG, or ``None`` on failure.
     """
     import caiman as cm
-    import tifffile
+    from caiman.utils.stack_io import stack_size, stack_sample
 
     shifts_rig = np.array(mc.shifts_rig)           # (T, 2) — [row, col]
     T  = len(shifts_rig)
@@ -273,12 +270,9 @@ def qc_motion_correction(mc, out_path: Union[str, Path]) -> Optional[str]:
     mag = np.hypot(shifts_rig[:, 0], shifts_rig[:, 1])
 
     # Mean raw — subsampled for speed (≤300 frames)
-    with tifffile.TiffFile(mc.fname[0]) as tf:
-        n_raw = len(tf.pages)
-        step  = max(1, n_raw // 300)
-        raw_frames = np.stack(
-            [tf.pages[i].asarray() for i in range(0, n_raw, step)]
-        ).astype(np.float32)
+    _, n_raw   = stack_size(mc.fname[0])
+    step       = max(1, n_raw // 300)
+    raw_frames = stack_sample(mc.fname[0], range(0, n_raw, step))
     mean_raw = raw_frames.mean(axis=0)
     del raw_frames
 
@@ -757,16 +751,11 @@ def qc_xcorr_correction(
     str or None
         Absolute path of the saved PNG, or ``None`` on failure.
     """
-    import tifffile
+    from caiman.utils.stack_io import stack_evenly_sampled
 
     def _mean_proj(path, n):
-        with tifffile.TiffFile(str(path)) as tf:
-            T   = len(tf.pages)
-            idx = np.linspace(0, T - 1, min(n, T), dtype=int)
-            return np.mean(
-                [tf.pages[i].asarray().astype(np.float32) for i in idx],
-                axis=0,
-            )
+        frames, _ = stack_evenly_sampled(path, n)
+        return frames.mean(axis=0)
 
     mean_raw  = _mean_proj(src_tif,       n_frames)
     mean_corr = _mean_proj(corrected_tif, n_frames)
