@@ -229,28 +229,42 @@ def _patch_json(
 
 def _check_tif(dest: Path, session: str) -> str | None:
     tif = dest / f"{session}.tif"
-    if not tif.exists():
-        return (f"  ⚠  {tif.name} not found in {dest}\n"
-                f"     Place the TIFF before running the pipeline.")
+    msr = dest / f"{session}.msr"
+    if not tif.exists() and not msr.exists():
+        return (f"  ⚠  {session}.tif / {session}.msr not found in {dest}\n"
+                f"     Place the input file before running the pipeline.")
     return None
 
 
 # ── Inference ────────────────────────────────────────────────────────────────
 
 def _infer_from_cwd() -> tuple[str, Path]:
-    """Infer (session, dest) from CWD (the channel subdir)."""
+    """Infer (session, dest) from CWD.
+
+    Three layouts are recognised:
+      1. Channel subdir containing <stem>.tif        → session = stem,            dest = cwd
+      2. Channel subdir containing <stem>.msr        → session = stem,            dest = cwd
+      3. TL_dir containing <TL_dir>.msr (organize_msr.py output, pre-channel
+         subdir)                                     → session = TL_dir.name,     dest = cwd
+
+    For case 3 the MSR branch in main() will create the channel subdir and
+    rebind dest/session before any pipeline files are written.
+    """
     cwd  = Path.cwd()
     tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
-    if not tifs:
+    msrs = sorted(p for p in cwd.glob("*.msr") if p.is_file())
+    candidates = tifs + msrs
+    if not candidates:
         raise SystemExit(
-            f"new_session.py: no .tif found in {cwd}.\n"
-            "  cd into the channel subdir, or supply session and dest explicitly."
+            f"new_session.py: no .tif or .msr found in {cwd}.\n"
+            "  cd into the channel subdir (or the TL_dir for an MSR session),\n"
+            "  or supply session and dest explicitly."
         )
-    if len(tifs) == 1:
-        return tifs[0].stem, cwd
-    names = "\n    ".join(t.name for t in tifs[:8])
+    if len(candidates) == 1:
+        return candidates[0].stem, cwd
+    names = "\n    ".join(p.name for p in candidates[:8])
     raise SystemExit(
-        f"new_session.py: multiple .tif files in {cwd}:\n    {names}\n"
+        f"new_session.py: multiple input files in {cwd}:\n    {names}\n"
         "  Supply session and dest arguments explicitly."
     )
 
@@ -407,6 +421,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-frames",        type=int, default=500, metavar="N")
     p.add_argument("--species",         choices=["mouse", "rat"], default="mouse")
     p.add_argument("--magnification",   choices=["20x", "40x"],   default="20x")
+    p.add_argument("--channels",        metavar="LIST", default=None,
+                   help="Comma-separated channel indices for MSR input "
+                        "(default: all channels in MSR metadata). Ignored "
+                        "for TIF input.")
     p.add_argument("--run",             action="store_true")
     p.add_argument("--dry-run",         action="store_true")
     p.add_argument("-y", "--force",     action="store_true")
@@ -429,6 +447,30 @@ def main(argv: list[str] | None = None) -> int:
     else:
         session = args.session
         dest    = Path(args.dest).resolve()
+
+    # ── MSR branch: organize_msr.py output (<TL_dir>/<TL_dir>.msr) ────────
+    # Detects the pre-channel-subdir layout produced by organize_msr.py and
+    # builds the canonical -C<NN>-fc<NNNNNN> channel subdir(s) before the
+    # rest of the flow proceeds. After this block, dest is the (primary)
+    # channel subdir and session is its stem -- matching the TIF case.
+    msr_at_tl = dest / f"{session}.msr"
+    if msr_at_tl.exists():
+        try:
+            from _msr_session import setup_msr_session
+        except ImportError as exc:
+            print(f"ERROR: MSR input detected but _msr_session not importable: {exc}",
+                  file=sys.stderr)
+            return 1
+        chans = ([int(c) for c in args.channels.split(",")]
+                 if args.channels else None)
+        try:
+            dest = setup_msr_session(msr_at_tl, channels=chans, dry_run=args.dry_run)
+        except Exception as exc:
+            print(f"ERROR: setup_msr_session failed: {exc}", file=sys.stderr)
+            return 1
+        session = dest.name
+        print(f"  MSR branch : dest    -> {dest}")
+        print(f"             : session -> {session}")
 
     # ── YAML: find or create from template ────────────────────────────────
     yaml_path = Path(args.yaml).resolve() if args.yaml else _find_yaml(session, dest)
