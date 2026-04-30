@@ -325,12 +325,17 @@ def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> bool
         _h.setFormatter(_logging.Formatter("%(message)s"))
         log.addHandler(_h)
 
-    tif_path    = dest / f"{session}.tif"
-    caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
-
-    if not tif_path.exists():
-        print(f"\n  ⚠  Cannot proceed: {tif_path.name} not found.")
+    tif_path = dest / f"{session}.tif"
+    msr_path = dest / f"{session}.msr"
+    if tif_path.exists():
+        input_path = tif_path
+    elif msr_path.exists():
+        input_path = msr_path
+    else:
+        print(f"\n  ⚠  Cannot proceed: {tif_path.name} / {msr_path.name} not found.")
         return False
+    tif_path = input_path  # keep variable name; downstream cm.load() dispatches by ext
+    caiman_temp = os.environ.get("CAIMAN_TEMP", "/data/caiman/temp")
 
     mc_path = (
         sorted(_glob.glob(str(dest / f"*{session}*rig*order_F*.mmap")))
@@ -459,8 +464,14 @@ def main(argv: list[str] | None = None) -> int:
     # builds the canonical -C<NN>-fc<NNNNNN> channel subdir(s) before the
     # rest of the flow proceeds. After this block, dest is the (primary)
     # channel subdir and session is its stem -- matching the TIF case.
-    msr_at_tl = dest / f"{session}.msr"
-    if msr_at_tl.exists():
+    #
+    # Guard: if dest is ALREADY a channel subdir (its name matches the
+    # -C<NN>-fc<NNNNNN> suffix), the .msr inside is the target of a previous
+    # successful run, not a TL-level pre-branch input. Skip, otherwise we'd
+    # create a doubly-nested -C00-fc<N>-C00-fc<N> subdir.
+    _CH_SUFFIX = re.compile(r".+-C\d{2}-fc\d+$")
+    msr_at_tl  = dest / f"{session}.msr"
+    if msr_at_tl.exists() and not _CH_SUFFIX.match(dest.name):
         try:
             from _msr_session import setup_msr_session
         except ImportError as exc:
@@ -592,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\nDone.")
 
     # ── MC / param estimation ──────────────────────────────────────────────
-    tif_ok = (dest / f"{session}.tif").exists()
+    tif_ok = (dest / f"{session}.tif").exists() or (dest / f"{session}.msr").exists()
     if args.estimate_params or args.run_mc:
         _apply_pipeline_env(patched.get("env", {}))
         try:
@@ -607,7 +618,11 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("Next steps:")
     print(f"  1. Review : {out_json.name}")
-    print(f"  2. TIF    : {dest / (session + '.tif')}")
+    _input_for_msg = (
+        (dest / f"{session}.msr") if (dest / f"{session}.msr").exists()
+        else (dest / f"{session}.tif")
+    )
+    print(f"  2. Input  : {_input_for_msg}")
     print(f"  3. Params : new-session {session} {dest} --run-mc --estimate-params -y")
     print(f"  4. Run    : python {out_py.name}")
     print()
@@ -615,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── Optional pipeline run ──────────────────────────────────────────────
     if args.run:
         if not tif_ok:
-            print("  Skipping --run: TIF not found.")
+            print("  Skipping --run: input file (.tif or .msr) not found.")
         else:
             import subprocess
             print(f"Running pipeline: {out_py}")
