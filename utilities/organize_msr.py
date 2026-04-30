@@ -41,15 +41,16 @@ from pathlib import Path
 
 # --- adjust this import to wherever your reader lives -----------------------
 sys.path.insert(0, str(Path(__file__).parent))
-from imspectorreader import ImspectorReader  # noqa: E402
+from imspectorreader import IMSpectorReader  # noqa: E402
 # ---------------------------------------------------------------------------
 
 SUBJECT_RX = re.compile(r"^(\d+)\.msr$", re.IGNORECASE)
 COND_RX    = re.compile(r"^[cdr]\d+$", re.IGNORECASE)
 
 # Candidate metadata keys — refine with --inspect once on a real file.
-DATE_KEYS = ("AcquisitionDate", "acquisition_date", "DateTime", "datetime",
-             "date", "Date", "CreatedOn", "created", "StartTime")
+DATE_KEYS = ("Creation Date", "AcquisitionDate", "acquisition_date",
+             "DateTime", "datetime", "date", "Date",
+             "CreatedOn", "created", "StartTime")
 TIME_KEYS = ("AcquisitionTime", "acquisition_time", "Time", "StartTime")
 MAG_KEYS  = ("Magnification", "ObjectiveMagnification", "Zoom",
              "objective_mag", "objective_magnification")
@@ -73,12 +74,12 @@ class Entry:
 
 
 def load_metadata(path: Path) -> dict:
-    r = ImspectorReader(str(path))
+    r = IMSpectorReader(str(path))
     for attr in ("metadata", "meta", "info", "header"):
         m = getattr(r, attr, None)
         if isinstance(m, dict):
             return m
-    raise RuntimeError(f"No metadata dict on ImspectorReader for {path.name}")
+    raise RuntimeError(f"No metadata dict on IMSpectorReader for {path.name}")
 
 
 def parse_dt(meta: dict) -> tuple[str, str]:

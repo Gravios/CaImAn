@@ -22,34 +22,42 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from imspectorreader import ImspectorReader  # noqa: E402
+from imspectorreader import IMSpectorReader  # noqa: E402
 
-DATE_KEYS = ("AcquisitionDate", "acquisition_date", "DateTime", "datetime",
-             "date", "Date", "CreatedOn", "created", "StartTime", "Time")
+DATE_KEYS = ("Creation Date", "AcquisitionDate", "acquisition_date",
+             "DateTime", "datetime", "date", "Date",
+             "CreatedOn", "created", "StartTime", "Time")
 FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
            "%Y%m%dT%H%M%S",     "%Y%m%d_%H%M%S",
            "%Y-%m-%d %H:%M",
            "%Y-%m-%d",          "%Y%m%d",
-           "%d.%m.%Y %H:%M:%S", "%d.%m.%Y")
+           "%d.%m.%Y %H:%M:%S", "%d.%m.%Y",
+           "%a %b %d %H:%M:%S %Y",   # ctime-like, common in scope headers
+           "%Y-%m-%dT%H:%M:%S%z")
 DATE_FIELD = re.compile(r"^\d{6}$|^\d{8}$")
 
 
 def parse_yyyymmdd(p: Path) -> str:
-    r = ImspectorReader(str(p))
-    m = next((getattr(r, a) for a in ("metadata", "meta", "info", "header")
-              if isinstance(getattr(r, a, None), dict)), None)
-    if m is None:
-        raise RuntimeError(f"no metadata dict on {p.name}")
-    for k in DATE_KEYS:
-        if k not in m:
-            continue
-        raw = str(m[k]).strip().split(".")[0]
+    r = IMSpectorReader(str(p))
+    # Try direct attribute first (some forks store .date), then metadata dict
+    candidates: list[str] = []
+    for attr in ("date", "acquisition_date"):
+        v = getattr(r, attr, None)
+        if v:
+            candidates.append(str(v))
+    md = getattr(r, "metadata", None)
+    if isinstance(md, dict):
+        for k in DATE_KEYS:
+            if k in md:
+                candidates.append(str(md[k]))
+    for raw in candidates:
+        raw = raw.strip().split(".")[0]
         for f in FORMATS:
             try:
                 return datetime.strptime(raw, f).strftime("%Y%m%d")
             except ValueError:
                 continue
-    raise ValueError(f"no parseable date in {p.name}")
+    raise ValueError(f"no parseable date (tried {len(candidates)} fields)")
 
 
 def fix_date_field(name: str, idx: int, yyyymmdd: str) -> str:
@@ -67,10 +75,29 @@ def main() -> int:
     ap.add_argument("root", type=Path)
     ap.add_argument("--apply", action="store_true",
                     help="Actually rename (default: dry-run)")
+    ap.add_argument("--inspect", action="store_true",
+                    help="Dump metadata + date attrs from first .msr and exit")
     ap.add_argument("--date-field-index", type=int, default=3,
                     help="Hyphen-separated index of the date field (default: 3, "
                          "matching <lab>-<exp>-<subj>-<date>-...)")
     args = ap.parse_args()
+
+    if args.inspect:
+        first = next(iter(sorted(args.root.rglob("*.msr"))), None)
+        if first is None:
+            print("# no .msr files found", file=sys.stderr)
+            return 1
+        print(f"# {first}")
+        r = IMSpectorReader(str(first))
+        for attr in ("date", "acquisition_date", "filename"):
+            if hasattr(r, attr):
+                print(f"r.{attr} = {getattr(r, attr)!r}")
+        md = getattr(r, "metadata", None)
+        if isinstance(md, dict):
+            print("# metadata dict:")
+            for k, v in md.items():
+                print(f"  {k!r}: {v!r}")
+        return 0
 
     plan: dict[Path, Path] = {}
     failed: list[Path] = []
