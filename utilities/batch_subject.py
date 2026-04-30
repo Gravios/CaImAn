@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{i}/{len(date_dirs)}] {date_dir.name}")
         print("=" * 70)
 
-        bs_argv = [str(date_dir)] + passthrough
+        bs_argv = ["--parent", str(date_dir)] + passthrough
         try:
             rc = _bs_main(bs_argv)
         except SystemExit as exc:
