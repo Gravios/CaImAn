@@ -80,6 +80,10 @@ def ensure_multipage_tiff(src_path: str) -> str:
     If it is a single-strip TIFF (all frames in one page), a new
     ``<stem>_mp.tif`` BigTIFF is written next to it and its path returned.
 
+    Inputs that are not TIFF (e.g. Imspector ``.msr``) are returned
+    unchanged — frame access happens later through ``cm.load_iter`` which
+    knows how to dispatch on extension.
+
     The source is memory-mapped (no full-file RAM copy).  Frames are
     batched into ~256 MB chunks before being passed to tifffile so that
     each write is a large sequential I/O rather than thousands of small
@@ -88,6 +92,11 @@ def ensure_multipage_tiff(src_path: str) -> str:
     Re-conversion is skipped if the destination is newer than the source.
     """
     import tifffile
+
+    # Non-TIFF inputs are frame-addressable through cm.load_iter; nothing
+    # to convert here.
+    if os.path.splitext(src_path)[1].lower() in (".msr",):
+        return src_path
 
     dst_path = os.path.splitext(src_path)[0] + "_mp.tif"
 

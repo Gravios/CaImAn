@@ -1299,6 +1299,36 @@ def load(file_name: Union[str, list[str]],
         elif extension == '.sima':
             raise Exception("movies.py:load(): FATAL: sima support was removed in 1.9.8")
 
+        elif extension == '.msr':
+            # Imspector .msr — frame-addressable via IMSpectorReader. The reader
+            # returns uint16; the bottom return cast handles outtype.
+            from caiman.utils.imspectorreader import IMSpectorReader
+            reader = IMSpectorReader(file_name)
+            if subindices is None:
+                input_arr = reader.read_whole()
+            else:
+                # CaImAn passes subindices as a slice/range/iterable for the time
+                # axis, or a list of per-axis indexers (T, H, W).
+                if isinstance(subindices, list):
+                    t_idx, spatial = subindices[0], subindices[1:]
+                else:
+                    t_idx, spatial = subindices, []
+                if isinstance(t_idx, slice):
+                    t_range = range(*t_idx.indices(reader.slices_count))
+                elif isinstance(t_idx, range):
+                    t_range = t_idx
+                elif hasattr(t_idx, '__iter__'):
+                    t_range = [int(i) for i in t_idx]
+                else:
+                    t_range = [int(t_idx)]
+                input_arr = np.stack([reader.read_slice(i) for i in t_range])
+                for axis, sl in enumerate(spatial, start=1):
+                    if isinstance(sl, slice):
+                        input_arr = input_arr[(slice(None),) * axis + (sl,)]
+                    else:
+                        input_arr = np.take(input_arr, sl, axis=axis)
+            input_arr = np.squeeze(input_arr)
+
         else:
             raise Exception('Unknown file type')
     else:
@@ -1701,6 +1731,19 @@ def load_iter(file_name: Union[str, list[str]], subindices=None, var_name_hdf5: 
                     for ind in subindices:
                         yield Y[ind].astype(outtype)
                 # zarr doesn't have a close(), but falling out of scope causes both h5py and zarr to clean up
+            elif extension == '.msr':
+                from caiman.utils.imspectorreader import IMSpectorReader
+                reader = IMSpectorReader(file_name)
+                if subindices is None:
+                    indices = range(reader.slices_count)
+                elif isinstance(subindices, slice):
+                    indices = range(*subindices.indices(reader.slices_count))
+                elif isinstance(subindices, range):
+                    indices = subindices
+                else:
+                    indices = subindices
+                for i in indices:
+                    yield reader.read_slice(int(i)).astype(outtype)
             else:  # fall back to memory inefficient version
                 for y in load(file_name, var_name_hdf5=var_name_hdf5,
                             subindices=subindices, outtype=outtype, is3D=is3D):
@@ -1809,6 +1852,11 @@ def get_file_size(file_name, var_name_hdf5:str='mov') -> tuple[tuple, Union[int,
                 shape = caiman.utils.sbx_utils.sbx_shape(file_name[:-4])
                 T = shape[-1]
                 dims = (shape[2], shape[1])                
+            elif extension == '.msr':
+                from caiman.utils.imspectorreader import IMSpectorReader
+                reader = IMSpectorReader(file_name)
+                T    = reader.slices_count
+                dims = (reader.size_y, reader.size_x)
             else:
                 raise Exception('Unknown file type')
             dims = tuple(dims)
