@@ -121,10 +121,21 @@ if __name__ == "__main__":
     timer = PipelineTimer(logger)
     qc    = QCRunner(_P, session, outdir)
 
-    # ── 1. TIFF check ─────────────────────────────────────────────────────────
-    fnames = str(outdir / f"{session}.tif")
+    # ── 1. Input-file check ──────────────────────────────────────────────────
+    # Prefer .tif when present, fall back to .msr (Imspector). cm.load_iter
+    # dispatches on extension, so downstream code works for either input.
+    _tif_in = outdir / f"{session}.tif"
+    _msr_in = outdir / f"{session}.msr"
+    if _tif_in.exists():
+        fnames = str(_tif_in)
+    elif _msr_in.exists():
+        fnames = str(_msr_in)
+    else:
+        raise FileNotFoundError(
+            f"Neither {_tif_in.name} nor {_msr_in.name} found in {outdir}"
+        )
 
-    @timer.step("TIFF format check")
+    @timer.step("Input format check")
     def check_tiff():
         global fnames
         fnames = ensure_multipage_tiff(fnames)
