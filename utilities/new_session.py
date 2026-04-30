@@ -86,6 +86,12 @@ _TPL_PY     = _PIPELINES / "template_pipeline.py"
 _TPL_JSON   = _PIPELINES / "template_pipeline.json"
 _TPL_YAML   = _PIPELINES / "template_acquisition.yaml"
 
+# When invoked as the `new-session` console-script entry point, sys.path
+# does not include _SCRIPT_DIR, so sibling modules (_msr_session,
+# imspectorreader) are not importable. Make them findable.
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 
 # ── YAML helpers ──────────────────────────────────────────────────────────────
 

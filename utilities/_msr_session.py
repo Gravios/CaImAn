@@ -31,8 +31,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# imspectorreader must be importable from the caller's environment
-# (same setup as organize_msr.py)
+# imspectorreader.py lives next to this file. When called from the
+# new-session console-script entry point, _SCRIPT_DIR isn't on sys.path,
+# so the sibling import would fail. Make it findable.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 
 # Metadata-key candidates — extend with --inspect output once verified.
