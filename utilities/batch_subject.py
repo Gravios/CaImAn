@@ -12,9 +12,7 @@ Quick start
 
 Flags (batch-subject)
 ---------------------
-  subject (positional)  Subject directory containing date subdirs.
-                        Default: current working directory.
-  --subject DIR         Same as positional; explicit form. Overrides positional.
+  --subject DIR         Subject directory (default: CWD).
   --stop-on-error       Abort on first failed date. Default: log and continue.
 
 Forwarded to batch-sessions (examples)
@@ -62,12 +60,8 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         ),
     )
     p.add_argument(
-        "subject_pos", nargs="?", default=None, metavar="subject",
-        help="Subject directory (default: CWD). Same as --subject.",
-    )
-    p.add_argument(
         "--subject", default=None, metavar="DIR",
-        help="Subject directory (default: CWD). Overrides positional.",
+        help="Subject directory (default: CWD).",
     )
     p.add_argument(
         "--stop-on-error", action="store_true",
@@ -79,8 +73,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 def main(argv: list[str] | None = None) -> int:
     args, passthrough = parse_args(argv)
 
-    subj_arg = args.subject if args.subject is not None else args.subject_pos
-    subject  = Path(subj_arg).resolve() if subj_arg else Path.cwd()
+    subject = Path(args.subject).resolve() if args.subject else Path.cwd()
     if not subject.is_dir():
         print(f"Error: subject is not a directory: {subject}", file=sys.stderr)
         return 1
@@ -106,7 +99,6 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 70)
 
         bs_argv = ["--parent", str(date_dir)] + passthrough
-        print("BS_ARGV:", bs_argv, flush=True)
         try:
             rc = _bs_main(bs_argv)
         except SystemExit as exc:
