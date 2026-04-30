@@ -43,24 +43,32 @@ CHANNEL_KEYS = ("NumberOfChannels", "NChannels", "Channels", "channels",
                 "ChannelCount", "n_channels")
 
 
-def _load_meta(path: Path) -> dict:
-    from imspectorreader import ImspectorReader
-    r = ImspectorReader(str(path))
-    for attr in ("metadata", "meta", "info", "header"):
-        m = getattr(r, attr, None)
-        if isinstance(m, dict):
-            return m
-    raise RuntimeError(f"No metadata dict on ImspectorReader for {path.name}")
+def _open_reader(path: Path):
+    """Return (reader, metadata_dict). metadata_dict may be empty."""
+    from imspectorreader import IMSpectorReader
+    r = IMSpectorReader(str(path))
+    md = next((getattr(r, a) for a in ("metadata", "meta", "info", "header")
+               if isinstance(getattr(r, a, None), dict)), {})
+    return r, md
 
 
-def _parse_frame_count(meta: dict) -> int:
+def _parse_frame_count(reader, meta: dict) -> int:
+    # Primary: direct attribute populated by IMSpectorReader._parse_file()
+    for attr in ("slices_count", "size_z", "size_t"):
+        v = getattr(reader, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    # Fallback: scan metadata dict
     for k in FRAME_KEYS:
         if k in meta:
             try:
                 return int(meta[k])
             except (TypeError, ValueError):
                 continue
-    raise ValueError(f"No frame-count field in metadata (tried {FRAME_KEYS})")
+    raise ValueError(
+        f"No frame count via reader.slices_count/size_z/size_t or metadata "
+        f"(tried {FRAME_KEYS})"
+    )
 
 
 def _parse_channel_count(meta: dict) -> int:
@@ -111,8 +119,8 @@ def setup_msr_session(
             f"Expected layout <TL_dir>/<TL_dir>.msr — run organize_msr.py first."
         )
 
-    meta = _load_meta(msr_path)
-    fc   = _parse_frame_count(meta)
+    meta_reader, meta = _open_reader(msr_path)
+    fc   = _parse_frame_count(meta_reader, meta)
     n_ch = _parse_channel_count(meta)
 
     if channels is None:
