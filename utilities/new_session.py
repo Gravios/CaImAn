@@ -36,6 +36,8 @@ CNMF parameter flags
 ---------------------
   --gSig PX             Gaussian half-width [px]. Sets gSig=[N,N] and gSiz=[4N+1,4N+1].
                         Also auto-derives rf and stride when --rf is omitted.
+  --gSiz PX             Gaussian support size [px]. Overrides the auto-derived
+                        gSiz from --gSig. Sets gSiz=[N,N].
   --rf PX               Patch half-size [px]. Ring constraint: ring_size_factor x gSiz < rf.
   --K N                 Max components per patch.
   --min-corr F          Minimum local correlation for seed pixel.
@@ -421,6 +423,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fr",              type=float, metavar="HZ")
     p.add_argument("--decay-time",      type=float, metavar="S")
     p.add_argument("--gSig",            type=int,   metavar="PX")
+    p.add_argument("--gSiz",            type=int,   metavar="PX",
+                   help="Gaussian support size [px]. If omitted, derived "
+                        "from gSig as 4*gSig+1.")
     p.add_argument("--rf",              type=int,   metavar="PX")
     p.add_argument("--K",               type=int,   metavar="N")
     p.add_argument("--min-corr",        type=float, metavar="F")
@@ -525,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     decay   = args.decay_time if args.decay_time is not None else yd.get("decay_time")
     rf      = args.rf         if args.rf         is not None else yd.get("rf")
     gSig    = args.gSig       if args.gSig       is not None else yd.get("gSig")
+    gSiz    = args.gSiz       if args.gSiz       is not None else yd.get("gSiz")
     species = args.species    if args.species    != "mouse"  else yd.get("species", args.species)
     magnif  = args.magnification if args.magnification != "20x" else yd.get("magnification", args.magnification)
 
@@ -546,11 +552,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if gSig is not None:
         overrides["cnmf.gSig"] = [gSig, gSig]
-        overrides["cnmf.gSiz"] = [gSig * 4 + 1, gSig * 4 + 1]
+        if gSiz is None:
+            # Auto-derive gSiz only when not explicitly supplied.
+            overrides["cnmf.gSiz"] = [gSig * 4 + 1, gSig * 4 + 1]
         if rf is None and args.rf is None:
             rf_auto = 5 * gSig
             overrides.setdefault("cnmf.rf",     rf_auto)
             overrides.setdefault("cnmf.stride", rf_auto // 2)
+
+    if gSiz is not None:
+        overrides["cnmf.gSiz"] = [gSiz, gSiz]
 
     # ── Output paths ───────────────────────────────────────────────────────
     out_py   = dest / f"{session}_pipeline.py"
