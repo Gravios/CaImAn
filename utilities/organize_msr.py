@@ -8,8 +8,8 @@ Source layout (input):
     (e.g. 'c1' stays 'c1', 'd3' stays 'd3', 'r1' stays 'r1').
 
 Canonical layout (output, under --dest):
-    <dest>/<lab>/<prefix>/<prefix>-<sid6>/<prefix>-<sid6>-<YYMMDD>/<TL_dir>/<TL_dir>.msr
-    where TL_dir = <prefix>-<sid6>-<YYMMDD>-TL<NNN>_<HHMMSS>-<MAG>x-<cond>
+    <dest>/<lab>/<prefix>/<prefix>-<sid6>/<prefix>-<sid6>-<YYYYMMDD>/<TL_dir>/<TL_dir>.msr
+    where TL_dir = <prefix>-<sid6>-<YYYYMMDD>-TL<NNN>_<HHMMSS>-<MAG>x-<cond>
 
 TL allocation:
     Per (subject, date), files are sorted by acquisition HHMMSS and assigned
@@ -65,7 +65,7 @@ class Entry:
     src: Path
     sid6: str
     cond: str           # 'c1', 'd3', 'r1'
-    yymmdd: str
+    yyyymmdd: str
     hhmmss: str
     mag: str
     mirror_rel: Path
@@ -82,7 +82,7 @@ def load_metadata(path: Path) -> dict:
 
 
 def parse_dt(meta: dict) -> tuple[str, str]:
-    """Return (YYMMDD, HHMMSS) from any parseable datetime field."""
+    """Return (YYYYMMDD, HHMMSS) from any parseable datetime field."""
     for k in DATE_KEYS + TIME_KEYS:
         if k not in meta:
             continue
@@ -90,7 +90,7 @@ def parse_dt(meta: dict) -> tuple[str, str]:
         for fmt in DATE_FORMATS:
             try:
                 dt = datetime.strptime(raw, fmt)
-                return dt.strftime("%y%m%d"), dt.strftime("%H%M%S")
+                return dt.strftime("%Y%m%d"), dt.strftime("%H%M%S")
             except ValueError:
                 continue
     raise ValueError(f"No parseable datetime field (tried {DATE_KEYS + TIME_KEYS})")
@@ -123,7 +123,7 @@ def plan(src_root: Path) -> tuple[list[Entry], list[tuple[Path, str]]]:
             continue
         try:
             meta = load_metadata(src)
-            yymmdd, hhmmss = parse_dt(meta)
+            yyyymmdd, hhmmss = parse_dt(meta)
             mag = parse_mag(meta)
         except Exception as e:
             skipped.append((src, f"metadata: {e}"))
@@ -138,7 +138,7 @@ def plan(src_root: Path) -> tuple[list[Entry], list[tuple[Path, str]]]:
             src=src,
             sid6=f"{int(sm.group(1)):06d}",
             cond=src.parent.name.lower(),
-            yymmdd=yymmdd,
+            yyyymmdd=yyyymmdd,
             hhmmss=hhmmss,
             mag=mag,
             mirror_rel=mirror_rel,
@@ -147,7 +147,7 @@ def plan(src_root: Path) -> tuple[list[Entry], list[tuple[Path, str]]]:
     # Allocate TL per (subject, date) by acquisition time
     groups: dict[tuple[str, str], list[Entry]] = defaultdict(list)
     for e in planned:
-        groups[(e.sid6, e.yymmdd)].append(e)
+        groups[(e.sid6, e.yyyymmdd)].append(e)
     for entries in groups.values():
         entries.sort(key=lambda e: e.hhmmss)
         for i, e in enumerate(entries, start=1):
@@ -159,8 +159,8 @@ def plan(src_root: Path) -> tuple[list[Entry], list[tuple[Path, str]]]:
 def dest_for(e: Entry, dest_root: Path, prefix: str) -> Path:
     lab      = prefix.split("-")[0]
     subj_dir = f"{prefix}-{e.sid6}"
-    date_dir = f"{prefix}-{e.sid6}-{e.yymmdd}"
-    tl_dir   = f"{prefix}-{e.sid6}-{e.yymmdd}-{e.tl}_{e.hhmmss}-{e.mag}x-{e.cond}"
+    date_dir = f"{prefix}-{e.sid6}-{e.yyyymmdd}"
+    tl_dir   = f"{prefix}-{e.sid6}-{e.yyyymmdd}-{e.tl}_{e.hhmmss}-{e.mag}x-{e.cond}"
     return dest_root / lab / prefix / subj_dir / date_dir / tl_dir / f"{tl_dir}.msr"
 
 
