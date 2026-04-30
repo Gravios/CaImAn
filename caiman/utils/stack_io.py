@@ -76,7 +76,11 @@ def stack_sample(path: PathLike,
         Stacked frames in the requested order.
     """
     import caiman as cm
-    idx = list(indices)
+    # CaImAn's `subindices` API: a *list* means per-axis indexers
+    # ([time, H, W]); a non-list iterable means a flat sequence of frame
+    # indices on the time axis. Convert to ndarray to take the latter
+    # path in both the TIF and MSR branches of cm.load.
+    idx = np.asarray(list(indices), dtype=int)
     arr = np.asarray(cm.load(str(path), subindices=idx))
     if arr.dtype != dtype:
         arr = arr.astype(dtype, copy=False)
