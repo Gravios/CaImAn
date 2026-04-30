@@ -1307,9 +1307,16 @@ def load(file_name: Union[str, list[str]],
             if subindices is None:
                 input_arr = reader.read_whole()
             else:
-                # CaImAn passes subindices as a slice/range/iterable for the time
-                # axis, or a list of per-axis indexers (T, H, W).
-                if isinstance(subindices, list):
+                # CaImAn convention: a *list* is per-axis indexers
+                # ([time, H, W]). But callers occasionally pass a flat list
+                # of integer frame indices; detect that and route through
+                # the time-axis path so we don't try to spatial-index a
+                # bare integer.
+                if isinstance(subindices, list) and all(
+                    isinstance(x, (int, np.integer)) for x in subindices
+                ):
+                    t_idx, spatial = subindices, []
+                elif isinstance(subindices, list):
                     t_idx, spatial = subindices[0], subindices[1:]
                 else:
                     t_idx, spatial = subindices, []
