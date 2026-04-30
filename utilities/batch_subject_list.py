@@ -5,44 +5,48 @@ utilities/batch_subject_list.py
 Run batch-subject for each subject in an explicit list. All unrecognised
 flags are forwarded verbatim to batch-subject.
 
-Subjects are named/passed in three ways (combinable):
+Subjects are specified via flags only — there is no positional form,
+because mixed ordering with passthrough flags (e.g. ``--prefix VALUE``)
+is ambiguous to argparse and would silently swallow flag values into
+the subject list. Use:
 
-  1. Positional arguments:
-        batch-subject-list /path/to/strohA-sa-000070 strohA-sa-000076 ...
-     Relative paths resolve against CWD.
-
-  2. From a file (one subject path per line; # comments and blank lines OK;
-     '-' reads from stdin):
-        batch-subject-list --from-file subjects.txt
-        find . -maxdepth 1 -name 'strohA-sa-000???' | batch-subject-list -f -
-
-  3. With a --root, bare subject names resolve against it:
-        batch-subject-list --root /data/source/ms2p/strohA/strohA-sa \\
-            strohA-sa-000070 strohA-sa-000076
+  -s NAME / --subject NAME   Repeat for each subject. Combinable with -f.
+  -f PATH  / --from-file PATH    One subject per line (# comments OK).
+                                 Use '-' to read from stdin.
+  --root DIR                 Resolve bare names against this directory.
 
 Quick start
 -----------
-  # Three named subjects on the command line, one shared template
-  batch-subject-list strohA-sa-000070 strohA-sa-000076 strohA-sa-000082 \\
+  # Repeated -s flag
+  batch-subject-list \\
+      -s strohA-sa-000070 -s strohA-sa-000076 -s strohA-sa-000082 \\
       --root /data/source/ms2p/strohA/strohA-sa \\
       --run-mc --estimate-params --run -y \\
       --prefix strohA-sa \\
       --template-json /data/source/ms2p/strohA/strohA-ia/strohA-ia-000000/caiman_params.json
 
+  # From a file
+  batch-subject-list -f ./subject_list.txt \\
+      --root /data/source/ms2p/strohA/strohA-sa \\
+      --run-mc --estimate-params --run -y \\
+      --prefix strohA-sa --min-pnr 6 --min-corr 0.45
+
+  # From stdin
+  ls -d /data/source/ms2p/strohA/strohA-sa/strohA-sa-000??? \\
+      | batch-subject-list -f - --run-mc --estimate-params --run -y --prefix strohA-sa
+
 Flags (batch-subject-list)
 --------------------------
-  SUBJECT ...           Zero or more subject paths or names.
-  --from-file PATH | -f Read additional subjects from a file (one per line).
-                        Use '-' for stdin.
-  --root DIR            Resolve bare subject names against this directory.
-                        If a positional/file entry is a bare name (no path
-                        separators) and --root is given, the entry is treated
-                        as <root>/<name>.
-  --stop-on-error       Abort on first failed subject. Default: continue.
+  -s NAME, --subject NAME   Add NAME to the subject list. Repeatable.
+                            Bare names resolve against --root (or CWD).
+  -f PATH, --from-file PATH Read additional subjects from PATH (one per
+                            line; '-' for stdin).
+  --root DIR                Resolve bare subject names against this directory.
+  --stop-on-error           Abort on first failed subject. Default: continue.
 
 Forwarded to batch-subject (examples)
 ---------------------------------------
-  --prefix PREFIX       TL_dir prefix filter (forwarded down to batch-sessions).
+  --prefix PREFIX           TL_dir prefix filter (forwarded to batch-sessions).
   --skip-done -y --run-mc --estimate-params --run --template-json PATH
   (see: batch-subject --help for the full list)
 """
@@ -77,8 +81,9 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         ),
     )
     p.add_argument(
-        "subjects", nargs="*", metavar="SUBJECT",
-        help="Subject directory paths or bare names (resolved with --root).",
+        "-s", "--subject", action="append", default=[], metavar="NAME",
+        help="Subject directory path or bare name (resolved with --root). "
+             "Repeat for multiple subjects.",
     )
     p.add_argument(
         "-f", "--from-file", default=None, metavar="PATH",
@@ -122,8 +127,8 @@ def _resolve(entry: str, root: Path | None) -> Path:
 def main(argv: list[str] | None = None) -> int:
     args, passthrough = parse_args(argv)
 
-    # Collect entries from positional args + --from-file
-    entries: list[str] = list(args.subjects)
+    # Collect entries from -s/--subject + --from-file
+    entries: list[str] = list(args.subject)
     if args.from_file:
         try:
             entries.extend(_read_subject_file(args.from_file))
@@ -133,8 +138,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if not entries:
-        print("Error: no subjects given. Pass them as positional arguments,\n"
-              "       or via --from-file PATH.", file=sys.stderr)
+        print("Error: no subjects given. Pass them with -s/--subject\n"
+              "       (repeatable) or --from-file PATH.", file=sys.stderr)
         return 1
 
     root = Path(args.root).resolve() if args.root else None
