@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 70)
 
         bs_argv = ["--parent", str(date_dir)] + passthrough
+        print("BS_ARGV:", bs_argv, flush=True)
         try:
             rc = _bs_main(bs_argv)
         except SystemExit as exc:
