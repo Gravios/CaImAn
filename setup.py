@@ -98,6 +98,8 @@ setup(
         'stack-sessions      = utilities.stack_sessions:main',
         'stack-bigtiff       = caiman.utils.stack_to_bigtiff:main',
         'rename-stem         = utilities.rename_stem:main',
+        'tiff-viewer         = utilities.tiff_viewer:main',
+        'stack-viewer        = utilities.stack_viewer:main',
     ] },
     data_files=data_files,
     install_requires=[''],
