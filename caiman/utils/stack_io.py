@@ -114,3 +114,108 @@ def stack_evenly_sampled(path: PathLike,
     indices = np.linspace(0, T - 1, n, dtype=int)
     frames  = stack_sample(path, indices, dtype=dtype)
     return frames, indices
+
+
+# ── Persistent-handle reader (for viewers / random access) ────────────────────
+#
+# The helpers above are batch-oriented (cm.load + get_file_size). That's the
+# right shape for a one-shot N-frame sample, but it is the wrong shape for an
+# interactive viewer that pages through frames in arbitrary order, dozens of
+# times per second. A viewer wants a *persistent* file handle and a
+# random-access read_frame(idx) call.
+#
+# StackReader is exactly that: a tiny extension-dispatching adapter with a
+# uniform shape across formats. Backends are kept private — they are an
+# implementation detail of the dispatch.
+
+class StackReader:
+    """Format-agnostic persistent reader for stack files.
+
+    Dispatches to a backend based on file extension (.tif/.tiff/.msr).
+    Holds an open handle for the lifetime of the object so per-frame
+    random access stays cheap.
+
+    Attributes
+    ----------
+    path : Path
+    n_frames : int
+    h, w : int            # frame dimensions
+    dtype : np.dtype      # native dtype as returned by ``read_frame``
+
+    Usage
+    -----
+        with StackReader(path) as r:
+            frame = r.read_frame(123)
+    """
+
+    def __init__(self, path: PathLike):
+        path = Path(path)
+        ext  = path.suffix.lower()
+        if ext in (".tif", ".tiff"):
+            self._backend = _TiffStackBackend(path)
+        elif ext == ".msr":
+            self._backend = _MsrStackBackend(path)
+        else:
+            raise ValueError(
+                f"Unsupported stack format: {ext!r} (path: {path})"
+            )
+        self.path     = path
+        self.n_frames = self._backend.n_frames
+        self.h        = self._backend.h
+        self.w        = self._backend.w
+        self.dtype    = self._backend.dtype
+
+    def read_frame(self, idx: int) -> np.ndarray:
+        return self._backend.read_frame(int(idx))
+
+    def close(self) -> None:
+        self._backend.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+class _TiffStackBackend:
+    def __init__(self, path: Path):
+        import tifffile
+        self._tf = tifffile.TiffFile(str(path))
+        self.n_frames = len(self._tf.pages)
+        if self.n_frames == 0:
+            raise ValueError(f"TIFF has no pages: {path}")
+        probe      = self._tf.pages[0].asarray()
+        self.h     = int(probe.shape[0])
+        self.w     = int(probe.shape[1]) if probe.ndim > 1 else 1
+        self.dtype = probe.dtype
+
+    def read_frame(self, idx: int) -> np.ndarray:
+        return self._tf.pages[idx].asarray()
+
+    def close(self) -> None:
+        try:
+            self._tf.close()
+        except Exception:
+            pass
+
+
+class _MsrStackBackend:
+    def __init__(self, path: Path):
+        from caiman.utils.imspectorreader import IMSpectorReader
+        self._reader  = IMSpectorReader(str(path))
+        self.n_frames = int(self._reader.slices_count or 0)
+        if self.n_frames == 0:
+            raise ValueError(f"MSR has no slices: {path}")
+        self.h     = int(self._reader.size_y)
+        self.w     = int(self._reader.size_x)
+        self.dtype = np.dtype(np.uint16)
+
+    def read_frame(self, idx: int) -> np.ndarray:
+        return self._reader.read_slice(idx)
+
+    def close(self) -> None:
+        # IMSpectorReader opens/closes the file per read_slice — nothing
+        # to release. If a persistent-handle variant lands later, plug it
+        # in here and read_frame stays unchanged.
+        pass
