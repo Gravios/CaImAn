@@ -34,7 +34,6 @@ See docs/ for the full parameter reference and troubleshooting guide.
 # this script as __main__.  Any top-level code outside the guard re-executes
 # in each worker — causing the pipeline body to run 9× (once per worker).
 import os
-import sys
 import json as _j
 from pathlib import Path
 
@@ -86,7 +85,6 @@ if __name__ == "__main__":
     )
 
     import caiman as cm
-    import caiman.mmapping
     import caiman.summary_images as csi
     from caiman.motion_correction import MotionCorrect
 
@@ -302,7 +300,13 @@ if __name__ == "__main__":
     # Use explicit cluster.n_processes when set; fall back to all logical cores
     # (logical=True — hyperthreads help on NNLS workloads) when in SHM mode,
     # or the JSON value when falling back to disk.
-    _json_n = getattr(_P, "cluster", None) and _P.cluster.n_processes or None
+    # Two-step getattr: tolerates missing `cluster` section AND missing
+    # `n_processes` key inside it.  ParamBag.__getattr__ raises
+    # AttributeError on missing keys, so the previous one-liner
+    #   _json_n = getattr(_P, "cluster", None) and _P.cluster.n_processes or None
+    # crashed when the section existed but the key did not.
+    _cluster_cfg = getattr(_P, "cluster", None)
+    _json_n      = getattr(_cluster_cfg, "n_processes", None) if _cluster_cfg else None
     _cluster_n = (
         _json_n or (_psutil.cpu_count(logical=True) or os.cpu_count())
         if _shm_path else

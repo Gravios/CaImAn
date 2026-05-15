@@ -1,7 +1,7 @@
 {
     "_comment": "CaImAn pipeline template. Copy alongside <session>_pipeline.py and rename both. The session name is derived from the script filename \u2014 do not add session_id here.",
     "env": {
-        "_comment": "Applied before any caiman import. CAIMAN_* vars are forced; thread counts use setdefault so shell values take precedence.",
+        "_comment": "Applied before any caiman import. CAIMAN_* vars are forced; thread counts use setdefault so shell values take precedence. Note: CAIMAN_TILE_N and CAIMAN_TILE_SLOTS are recomputed at runtime when running in SHM mode (template_pipeline.py L322-324), so any value set here is only consulted during bootstrap.",
         "CAIMAN_TILE_SLOTS": "3",
         "CAIMAN_DATA": "/data/caiman",
         "CAIMAN_TEMP": "/data/caiman/temp",
@@ -13,13 +13,16 @@
         "MPLBACKEND": "Agg",
         "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
         "CUPY_ACCELERATORS": "",
-        "KERAS_BACKEND": "numpy",
-        "CAIMAN_TILE_N": "4"
+        "KERAS_BACKEND": "numpy"
     },
     "data": {
-        "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f\u22480.4, GCaMP6s\u22481.0). add_baseline: constant added to all pixels during F\u2192C conversion to keep values >0 for stable dF/F. n_channels / n_planes: propagated from acquisition YAML by new_session.py. channel_id: 0-based index of the channel this pipeline analyses (set per-channel when n_channels > 1).",
+        "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f\u22480.4, GCaMP6s\u22481.0). dxy: pixel size in microns [row, col] - forwarded into CNMFParams.data; set per-objective. add_baseline: constant added to all pixels during F\u2192C conversion to keep values >0 for stable dF/F. n_channels / n_planes: propagated from acquisition YAML by new_session.py. channel_id: 0-based index of the channel this pipeline analyses (set per-channel when n_channels > 1).",
         "fr": 30,
         "decay_time": 1.0,
+        "dxy": [
+            1.0,
+            1.0
+        ],
         "add_baseline": 100.0,
         "n_channels": 1,
         "channel_id": 0,
@@ -46,6 +49,7 @@
     },
     "cnmf": {
         "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor \u00d7 gSiz[0] must be < rf.",
+        "_comment_derived": "WARNING: nb_patch, del_duplicates, and normalize_init values declared here are IGNORED by build_cnmf_opts when method_init=corr_pnr. nb_patch is forced to 0; del_duplicates is forced to (gnb==0); normalize_init is forced to False. They are kept in the template for visibility only.",
         "p": 1,
         "gnb": 2,
         "merge_thr": 0.85,
@@ -80,9 +84,11 @@
         "ssub_B": 2
     },
     "quality": {
-        "_comment": "Components must pass all enabled criteria. use_cnn is auto-disabled if model files are missing.",
+        "_comment": "Components must pass all enabled criteria. use_cnn is auto-disabled if model files are missing. *_lowest fields are the hard-reject floors (a component below SNR_lowest, rval_lowest, or cnn_lowest is unconditionally rejected, even if it passes the upper thresholds).",
         "min_SNR": 1.5,
+        "SNR_lowest": 0.5,
         "rval_thr": 0.6,
+        "rval_lowest": -1.0,
         "use_cnn": true,
         "min_cnn_thr": 0.6,
         "cnn_lowest": 0.1
