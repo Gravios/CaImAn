@@ -24,7 +24,7 @@ Typical usage
         cnn_available = _cnn_available,
     )
 
-    cnm  = runner.fit(images, forder_movie_path=fname_mc)
+    cnm  = runner.fit(images)
     cnm2 = runner.refit(cnm, images)
     runner.evaluate(cnm2, images)
     runner.select(cnm2)
@@ -251,19 +251,15 @@ class CNMFRunner:
             ``(n_accepted, n_rejected)`` component counts.
         """
         _eval_dview = cnm2.dview
-        try:
+        cnm2.estimates.evaluate_components(images, cnm2.params, dview=_eval_dview)
+        if cnm2.estimates.idx_components is None:
+            logger.warning("idx_components is None — re-running evaluate_components")
             cnm2.estimates.evaluate_components(images, cnm2.params, dview=_eval_dview)
-            if cnm2.estimates.idx_components is None:
-                logger.warning("idx_components is None — re-running evaluate_components")
-                cnm2.estimates.evaluate_components(images, cnm2.params, dview=_eval_dview)
-        finally:
-            if _eval_dview is not None and 'multiprocessing' in str(type(_eval_dview)):
-                try:
-                    _eval_dview.terminate()
-                    _eval_dview.join()
-                    cnm2.dview = None
-                except Exception:
-                    pass
+        # NB: cluster lifecycle is owned by the pipeline, not by CNMFRunner
+        # (see class docstring).  Do NOT terminate _eval_dview here — the
+        # pipeline's `finally: cm.stop_server(dview=dview)` block handles
+        # teardown, and an early terminate kills the pool the parent still
+        # holds a handle to.
 
         idx_acc = cnm2.estimates.idx_components
         idx_rej = cnm2.estimates.idx_components_bad

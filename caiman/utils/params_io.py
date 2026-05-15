@@ -65,6 +65,14 @@ class ParamBag:
     def __init__(self, data: dict) -> None:
         object.__setattr__(self, "_data", {})
         for k, v in data.items():
+            # Strip comment keys (conventionally prefixed with "_") at every
+            # depth.  Without this, motion_correction.items() — which the
+            # pipeline unpacks as **kwargs into MotionCorrect — would forward
+            # `_comment` and crash; and any future `items()` consumer would
+            # need to re-implement the same filter.  Centralizing it here
+            # keeps the contract uniform: ParamBag never holds comment keys.
+            if isinstance(k, str) and k.startswith("_"):
+                continue
             self._data[k] = self._wrap(v)
 
     # ── internal helpers ──────────────────────────────────────────────────────
@@ -221,9 +229,13 @@ def build_cnmf_opts(
             f"Auto-correcting gSiz to {_gSiz_expected}. "
             f"Update the JSON cnmf section: gSiz=[{_gSiz_expected},{_gSiz_expected}]"
         )
-        # Patch the ParamBag so downstream code also sees the corrected value
-        import types as _types
-        c = _types.SimpleNamespace(**vars(c))
+        # Patch the ParamBag in place so downstream getattr(c, …) reads
+        # still see every other JSON-supplied value.  Reassigning c to a
+        # SimpleNamespace(**vars(c)) would NOT work: ParamBag stores its
+        # dict in a private `_data` attribute (via object.__setattr__), so
+        # vars(c) == {"_data": {...}} — every key would silently fall back
+        # to the build_cnmf_opts hardcoded defaults (K=30, rf=48, …, and
+        # min_corr / min_pnr would disappear entirely, breaking corr_pnr).
         c.gSiz = [_gSiz_expected, _gSiz_expected]
 
     opts = CNMFParams()
