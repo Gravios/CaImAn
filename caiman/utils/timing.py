@@ -43,7 +43,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 
 # ── Resource helpers ──────────────────────────────────────────────────────────

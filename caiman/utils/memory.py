@@ -241,8 +241,18 @@ def cupy_register_cleanup() -> None:
     preventing ``CUDA_ERROR_ILLEGAL_ADDRESS`` at ``moduleUnload`` when both
     CuPy (CUDA 12) and PyTorch (CUDA 13) share the same process.
 
-    Safe to call multiple times — atexit deduplicates identical handlers.
+    Calling more than once registers multiple copies of the handler —
+    ``atexit`` does NOT deduplicate.  Each copy runs at exit, but the
+    cleanup is idempotent (``free_all_blocks()`` on an already-emptied
+    pool is a no-op), so the only cost is a small amount of redundant
+    work at interpreter teardown.  A module-level guard suppresses
+    repeat registration.
     """
+    global _cupy_cleanup_registered
+    if _cupy_cleanup_registered:
+        return
+    _cupy_cleanup_registered = True
+
     import atexit as _atexit
 
     def _cupy_cleanup():
@@ -264,3 +274,6 @@ def cupy_register_cleanup() -> None:
             pass
 
     _atexit.register(_cupy_cleanup)
+
+
+_cupy_cleanup_registered: bool = False
