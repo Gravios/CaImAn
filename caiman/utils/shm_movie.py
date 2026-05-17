@@ -72,20 +72,27 @@ def load_to_shm(
 ) -> str:
     """Copy the C-order mmap *fname_cnmf* into *shm_dir* and return the new path.
 
-    The copy is named ``<session>_cnmf_shm.mmap`` so it is unambiguous and
-    easy to identify in ``/dev/shm``.  If an up-to-date copy already exists
-    (same size, newer mtime) it is reused without re-copying.
+    The copy is named after the source file's basename (i.e.
+    ``<shm_dir>/<basename(fname_cnmf)>``).  If an up-to-date copy already
+    exists (same size, newer-or-equal mtime) it is reused without
+    re-copying.  The copy is performed atomically via a ``.tmp`` file +
+    ``os.rename``, so a mid-copy crash never leaves a corrupt file at
+    ``shm_path``.
 
-    After copying, ``CAIMAN_TILE_SLOTS`` is set to ``"0"`` in the current
-    process environment so that any subsequent ``import caiman`` in workers
-    does not allocate tile buffers.
+    Note: the ``session`` parameter is currently reserved for future use
+    (per-session SHM disambiguation) but is not consumed by this function.
+    It is kept in the signature to avoid breaking the pipeline caller.
+
+    Note: the caller is responsible for managing ``CAIMAN_TILE_SLOTS``.
+    template_pipeline.py sets it to ``"1"`` immediately after a successful
+    ``load_to_shm`` so worker children skip tile-buffer allocation.
 
     Parameters
     ----------
     fname_cnmf
         Absolute path to the disk-backed C-order mmap.
     session
-        Session stem — used to name the SHM file.
+        Reserved (see Notes above).
     shm_dir
         Shared memory filesystem directory (default ``/dev/shm``).
     log
@@ -104,6 +111,7 @@ def load_to_shm(
     """
     if log is None:
         log = logger
+    del session   # currently unused — explicit no-op so linters don't complain
 
     shm_path = os.path.join(shm_dir, os.path.basename(fname_cnmf))
 
@@ -128,7 +136,26 @@ def load_to_shm(
             "  Or disable shm_mode in the pipeline JSON."
         )
 
-    # Reuse an existing SHM copy if it is still valid
+    # Reuse an existing SHM copy if it is still valid.
+    #
+    # Validity check is size + mtime; np.memmap(mode="w+") pre-allocates
+    # the full size on create, so a previous mid-copy crash would leave a
+    # file of the right size but with zeros / partial data in the tail.
+    # An mtime newer than the source would also be satisfied by such a
+    # corrupted file, making it silently reused.
+    #
+    # Guard: clean up any orphaned .tmp from a prior crashed copy first.
+    # Then write to .tmp, fsync, and atomically rename — so a partial
+    # file is never seen at shm_path.  This prevents silent corruption
+    # reuse on the next pipeline invocation.
+    shm_tmp = shm_path + ".tmp"
+    if os.path.exists(shm_tmp):
+        try:
+            os.unlink(shm_tmp)
+            log.info(f"SHM: removed orphaned partial copy {shm_tmp}")
+        except OSError as exc:
+            log.warning(f"SHM: could not remove {shm_tmp}: {exc}")
+
     if (os.path.exists(shm_path)
             and os.path.getsize(shm_path) == movie_bytes
             and os.path.getmtime(shm_path) >= os.path.getmtime(fname_cnmf)):
@@ -140,17 +167,22 @@ def load_to_shm(
             f"SHM: copying {movie_gb:.1f} GB  "
             f"{Path(fname_cnmf).name}  ->  {shm_path}"
         )
-        _fast_copy(fname_cnmf, shm_path, log)
+        _fast_copy(fname_cnmf, shm_tmp, log)
+        # Atomic rename — only after _fast_copy succeeds and flushes.
+        # If the process is killed before this line, shm_tmp is left
+        # behind and gets cleaned up at the top of the next call.
+        os.rename(shm_tmp, shm_path)
         log.info(f"SHM: copy complete  {shm_path}")
 
     return shm_path
 
 
 def release_shm(shm_path: str, log: logging.Logger | None = None) -> None:
-    """Delete the SHM copy and restore ``CAIMAN_TILE_SLOTS``.
+    """Delete the SHM copy created by :func:`load_to_shm`.
 
     Safe to call even if *shm_path* no longer exists (e.g. after a crash
-    that already cleaned up).
+    that already cleaned up).  Does NOT modify ``CAIMAN_TILE_SLOTS`` —
+    that environment variable is managed by the caller.
 
     Parameters
     ----------

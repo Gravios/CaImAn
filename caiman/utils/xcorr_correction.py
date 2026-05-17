@@ -307,32 +307,60 @@ def correct_line_scan(
         log.info("xcorr_correction: shift is zero — writing pass-through copy")
 
     # ── Apply correction ──────────────────────────────────────────────────────
+    # Write to a temporary file and atomically rename on success.  This
+    # serves two purposes:
+    #   (1) A mid-write crash leaves <out>.tmp behind, not a partial <out>
+    #       that the next run's "skip if exists" check would mistake for
+    #       valid output.
+    #   (2) The GPU→CPU fallback must close-and-reopen the writer (see
+    #       below) — using a .tmp path means the partial GPU writes never
+    #       reach <out>.
     log.info(f"xcorr_correction: writing → {out.name}")
     bytes_per_frame = rows * cols * np.dtype(dtype).itemsize
     bigtiff = (n_pages * bytes_per_frame) > 2 ** 31
 
-    with tifffile.TiffFile(str(src)) as tif_in, \
-         tifffile.TiffWriter(str(out), bigtiff=bigtiff) as writer:
+    out_tmp = out.with_suffix(out.suffix + ".tmp")
+    if out_tmp.exists():
+        out_tmp.unlink()   # orphan from a prior crash
 
-        if cp is not None:
-            try:
-                _apply_correction_gpu(
-                    tif_in, writer, n_pages, rows, cols, dtype, shift, cp, log
-                )
-            except Exception as exc:
-                log.warning(
-                    f"xcorr_correction: GPU correction failed ({exc}); "
-                    f"falling back to CPU"
-                )
-                # Re-open because TiffFile cursor may be mid-stream
-                # (writer stays open — just restart page loop from 0)
+    def _open_writer():
+        return tifffile.TiffWriter(str(out_tmp), bigtiff=bigtiff)
+
+    with tifffile.TiffFile(str(src)) as tif_in:
+        writer = _open_writer()
+        try:
+            if cp is not None:
+                try:
+                    _apply_correction_gpu(
+                        tif_in, writer, n_pages, rows, cols, dtype, shift, cp, log
+                    )
+                except Exception as exc:
+                    log.warning(
+                        f"xcorr_correction: GPU correction failed ({exc}); "
+                        f"falling back to CPU"
+                    )
+                    # The GPU path may have written some pages before
+                    # failing.  Restarting the CPU loop from 0 on the
+                    # SAME writer would leave those GPU pages in the
+                    # final file, producing K*chunk extra duplicated
+                    # frames at the start of the output.  Close the
+                    # writer, delete the partial .tmp, and reopen fresh.
+                    writer.close()
+                    if out_tmp.exists():
+                        out_tmp.unlink()
+                    writer = _open_writer()
+                    _apply_correction_cpu(
+                        tif_in, writer, n_pages, rows, cols, dtype, shift, log
+                    )
+            else:
                 _apply_correction_cpu(
                     tif_in, writer, n_pages, rows, cols, dtype, shift, log
                 )
-        else:
-            _apply_correction_cpu(
-                tif_in, writer, n_pages, rows, cols, dtype, shift, log
-            )
+        finally:
+            writer.close()
+
+    # Atomic rename — observers either see no <out> or the complete file.
+    os.replace(str(out_tmp), str(out))
 
     log.info(f"xcorr_correction: done — {out}")
     return str(out)

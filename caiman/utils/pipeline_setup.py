@@ -411,7 +411,22 @@ def clean_stale_shm(
         except OSError:
             pass
 
+    # Several transient artifacts encode the owning PID in their filename.
+    # Skip those whose owner is still alive — most importantly the current
+    # process's own KMP_REGISTERED_LIB file, which Intel OpenMP creates the
+    # first time a parallel region is entered.  If the cleanup unlinks it
+    # the inode survives via the open fd in the running process, but worker
+    # children spawned later cannot attach to the same registration, which
+    # can cause repeated OpenMP re-init and (rarely) deadlock.  Today's
+    # template sets OMP_NUM_THREADS=1 so registration may not happen — but
+    # one env-var change would expose the latent footgun.
+    _pid_re = re.compile(
+        r"(?:__KMP_REGISTERED_LIB_|sem\.loky-)(\d+)"
+    )
     for path in transient:
+        m = _pid_re.search(os.path.basename(path))
+        if m and _pid_alive(int(m.group(1))):
+            continue
         try:
             os.unlink(path)
             logger.info(f"Cleared stale SHM file: {path}")
