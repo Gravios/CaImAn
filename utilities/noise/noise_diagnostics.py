@@ -17,6 +17,8 @@ Tests
   7. fixed_pattern           static spatial pattern vs shot noise floor
   8. saturation              ADC ceiling/floor clipping & dynamic-range usage
   9. frame_discontinuity     frame drops, sync glitches
+ 10. temporal_spectral       periodic temporal noise (mains, physiology,
+                              laser/PMT ripple) via per-pixel & frame-mean PSD
 
 Mapped sources (with `negligible / low / moderate / high` likelihood)
 ---------------------------------------------------------------------
@@ -24,20 +26,30 @@ Mapped sources (with `negligible / low / moderate / high` likelihood)
   horizontal_banding_fixed, horizontal_banding_drifting,
   fast_axis_periodic, galvo_flyback_edge, hot_dead_pixels,
   photobleaching, illumination_drift_increase, fixed_pattern_noise,
-  saturation_clipping, quantization_loss, frame_discontinuity
+  saturation_clipping, quantization_loss, frame_discontinuity,
+  periodic_temporal_global, periodic_temporal_local
+
+Sampling
+--------
+  Default sampling mode is "contiguous": a window of n_frames consecutive
+  frames from a random start offset. This is required for every test that
+  uses temporal structure (photon_transfer differences, drift,
+  frame_discontinuity, temporal_spectral). The older "random" mode is
+  available via `sampling_mode="random"` but disables temporal_spectral.
 
 Usage
 -----
   from noise_diagnostics import run_diagnostics
-  report = run_diagnostics("rec.tif", out_dir="diag_out", n_frames=500)
+  report = run_diagnostics("rec.tif", out_dir="diag_out",
+                           n_frames=500, fs_hz=30.0)
 
   # or CLI
-  python noise_diagnostics.py rec.tif --out diag_out --n_frames 500
+  python noise_diagnostics.py rec.tif --out diag_out --n_frames 500 --fs 30
 
 Outputs
 -------
   diag_out/diagnostic_report.json   full numeric report
-  diag_out/diagnostic_panel.png     9-panel visual summary
+  diag_out/diagnostic_panel.png     12-panel visual summary (4×3 grid)
   diag_out/summary.txt              human-readable top-issue ranking
 
 Dependencies: numpy, scipy, matplotlib, tifffile (optional, for .tif input).
@@ -72,22 +84,42 @@ ArrayLike = Union[np.ndarray, str, Path]
 
 def _load_subset(src: ArrayLike,
                  n_frames: int = 500,
-                 rng_seed: int = 0) -> Tuple[np.ndarray, dict]:
+                 rng_seed: int = 0,
+                 mode: str = "contiguous") -> Tuple[np.ndarray, dict]:
     """Sample n_frames from src and return (frames, info).
+
+    Sampling modes
+    --------------
+    "contiguous" (default): a window of n_frames consecutive frames starting
+        at a random offset. Required for tests that operate on the time axis
+        (photon_transfer, drift, frame_discontinuity, temporal_spectral).
+    "random": n_frames random-scattered frames (the older behaviour). Faster
+        spatial-statistics coverage of a very long recording but invalidates
+        every temporal test — the temporal_spectral test will refuse to run.
 
     For tif inputs, only the sampled pages are decoded — safe on multi-GB stacks.
     """
     rng = np.random.default_rng(rng_seed)
+    if mode not in ("contiguous", "random"):
+        raise ValueError(f"mode must be 'contiguous' or 'random', got {mode!r}")
+
+    def _pick_indices(T: int) -> np.ndarray:
+        n = min(n_frames, T)
+        if mode == "contiguous":
+            start = int(rng.integers(0, T - n + 1)) if T > n else 0
+            return np.arange(start, start + n)
+        return np.sort(rng.choice(T, size=n, replace=False))
 
     if isinstance(src, np.ndarray):
         if src.ndim != 3:
             raise ValueError(f"expected (T, H, W); got {src.shape}")
         T = src.shape[0]
-        n = min(n_frames, T)
-        idx = np.sort(rng.choice(T, size=n, replace=False))
+        idx = _pick_indices(T)
         return (src[idx].astype(np.float32),
-                dict(n_total=T, n_sampled=n, source="ndarray",
-                     dtype_orig=str(src.dtype), fmax_orig=float(src.max())))
+                dict(n_total=T, n_sampled=int(idx.size), source="ndarray",
+                     dtype_orig=str(src.dtype), fmax_orig=float(src.max()),
+                     sampling_mode=mode,
+                     first_idx=int(idx[0]), last_idx=int(idx[-1])))
 
     path = Path(src)
     if not path.exists():
@@ -99,12 +131,13 @@ def _load_subset(src: ArrayLike,
         if a.ndim != 3:
             raise ValueError(f"expected (T, H, W); got {a.shape}")
         T = a.shape[0]
-        n = min(n_frames, T)
-        idx = np.sort(rng.choice(T, size=n, replace=False))
+        idx = _pick_indices(T)
         sub = np.asarray(a[idx], dtype=np.float32)
-        return (sub, dict(n_total=T, n_sampled=n, source=str(path),
+        return (sub, dict(n_total=T, n_sampled=int(idx.size), source=str(path),
                           dtype_orig=str(a.dtype),
-                          fmax_orig=float(sub.max())))
+                          fmax_orig=float(sub.max()),
+                          sampling_mode=mode,
+                          first_idx=int(idx[0]), last_idx=int(idx[-1])))
 
     if suf in (".tif", ".tiff", ".btf"):
         try:
@@ -114,13 +147,15 @@ def _load_subset(src: ArrayLike,
         # is_ome=False avoids loading sibling companion files for OME-TIFF
         with tifffile.TiffFile(path, is_ome=False) as tf:
             n_pages = len(tf.pages)
-            n = min(n_frames, n_pages)
-            idx = np.sort(rng.choice(n_pages, size=n, replace=False))
+            idx = _pick_indices(n_pages)
             stacks = [tf.pages[int(i)].asarray() for i in idx]
         a = np.stack(stacks).astype(np.float32)
-        return (a, dict(n_total=n_pages, n_sampled=n, source=str(path),
+        return (a, dict(n_total=n_pages, n_sampled=int(idx.size),
+                        source=str(path),
                         dtype_orig=str(stacks[0].dtype),
-                        fmax_orig=float(a.max())))
+                        fmax_orig=float(a.max()),
+                        sampling_mode=mode,
+                        first_idx=int(idx[0]), last_idx=int(idx[-1])))
 
     raise ValueError(f"unsupported source: {src!r}")
 
@@ -260,14 +295,22 @@ def _peak_prominence_db(spectrum: np.ndarray,
                         smooth_sigma: float = 6.0,
                         skip_dc: int = 5,
                         prominence_db: float = 1.5) -> List[Tuple[int, float]]:
-    """Peaks above a smoothed 1/f baseline, returned as [(bin_idx, prominence_dB)]."""
+    """Peaks above a smoothed 1/f baseline, returned as [(bin_idx, prominence_dB)].
+
+    A bin is reported only if BOTH (a) scipy's contour-prominence on the
+    dB-excess signal is ≥ prominence_db, AND (b) the dB-excess at the bin
+    itself is ≥ prominence_db. The second check matters on noisy spectra
+    where small wiggles have non-trivial scipy-prominence but the excess
+    above baseline is near zero or negative.
+    """
     s = spectrum.copy().astype(np.float64)
     s[:skip_dc] = 0.0
     baseline = ndimage.gaussian_filter1d(s, smooth_sigma, mode="nearest")
     eps = max(baseline.max(), 1.0) * 1e-9
     excess_db = 10.0 * np.log10((s + eps) / (baseline + eps))
     peaks, _ = sps.find_peaks(excess_db, prominence=prominence_db)
-    return [(int(p), float(excess_db[p])) for p in peaks]
+    return [(int(p), float(excess_db[p])) for p in peaks
+            if excess_db[p] >= prominence_db]
 
 
 def _axis_spectrum(stack: np.ndarray, axis: int) -> np.ndarray:
@@ -487,6 +530,122 @@ def test_frame_discontinuity(stack: np.ndarray) -> dict:
     )
 
 
+def test_temporal_spectral(stack: np.ndarray,
+                           fs_hz: Optional[float] = None,
+                           n_pix_sample: int = 4000,
+                           rng_seed: int = 0) -> dict:
+    """Detect periodic temporal noise via pixel-time-series FFT.
+
+    Three views of temporal periodicity:
+      (1) Frame-mean PSD: globally-coherent oscillation across the FOV
+          (mains pickup, breathing/heartbeat motion, AC compressor cycling,
+          room-light alias, laser intensity ripple).
+      (2) Median per-pixel PSD: typical pixel-level oscillation. Peaks
+          present here but absent in (1) suggest uncorrelated per-pixel
+          periodic noise (rare; usually amplifier-side).
+      (3) Coherence ratio per frame-mean peak: peak height in (1) divided
+          by the median pixel PSD at the same bin. High ratio → coherent
+          across the whole FOV.
+
+    Each pixel trace is linearly detrended before FFT so the spectrum isn't
+    dominated by 1/f drift. A Hann window suppresses spectral leakage.
+
+    Requires contiguous frame sampling. If the loader used random scatter,
+    this test refuses to run and returns an explanatory error field.
+
+    Parameters
+    ----------
+    fs_hz : float, optional
+        Frame rate. If provided, peak frequencies are reported in Hz; the
+        Nyquist limit is fs_hz / 2. Otherwise peaks are in cycles/frame.
+    n_pix_sample : int
+        Number of pixels to FFT for the per-pixel PSD estimate. SVD scales
+        as O(T·n²); 4000 keeps cost low while still giving a stable median.
+    """
+    T, H, W = stack.shape
+    if T < 32:
+        return dict(error=f"too few frames for temporal spectral analysis ({T})")
+
+    rng = np.random.default_rng(rng_seed)
+
+    win = np.hanning(T).astype(np.float32)
+    win_norm = float((win * win).sum())  # for PSD scaling
+
+    # Subsample pixels (avoid full-stack reshape on 512×512 stacks)
+    n_sample = int(min(n_pix_sample, H * W))
+    flat_idx = rng.choice(H * W, size=n_sample, replace=False)
+    yi, xi = np.unravel_index(flat_idx, (H, W))
+    pix_ts = stack[:, yi, xi].astype(np.float32)             # (T, n_sample)
+
+    # Per-pixel linear detrend (suppress 1/f drift that buries narrow peaks)
+    pix_ts = sps.detrend(pix_ts, axis=0, type="linear")
+    Fpix = np.fft.rfft(pix_ts * win[:, None], axis=0)
+    Ppix = (np.abs(Fpix) ** 2) / win_norm                    # (n_freqs, n_sample)
+    Pix_median = np.median(Ppix, axis=1)
+    Pix_mean = Ppix.mean(axis=1)
+
+    # Frame-mean trace (globally-coherent component)
+    fm = stack.mean(axis=(1, 2)).astype(np.float32)
+    fm_dt = sps.detrend(fm, type="linear")
+    Pfm = (np.abs(np.fft.rfft(fm_dt * win)) ** 2) / win_norm
+
+    # Frequency axis (Hz if fs given, else cycles/frame)
+    if fs_hz is not None and fs_hz > 0:
+        freqs = np.fft.rfftfreq(T, d=1.0 / fs_hz)
+        unit = "Hz"
+    else:
+        freqs = np.fft.rfftfreq(T, d=1.0)
+        unit = "cyc/frame"
+
+    # Peak detection on each PSD. Temporal traces are much noisier than
+    # the spatially-averaged spectra used by test_spectral, so we use a
+    # broader baseline and a higher prominence threshold to avoid spurious
+    # peaks on every other bin.
+    peaks_fm  = _peak_prominence_db(Pfm,        smooth_sigma=12.0,
+                                    skip_dc=3, prominence_db=6.0)
+    peaks_pix = _peak_prominence_db(Pix_median, smooth_sigma=12.0,
+                                    skip_dc=3, prominence_db=6.0)
+
+    def _fmt(peaks):
+        out = []
+        for idx, db in peaks:
+            out.append(dict(freq=float(freqs[idx]),
+                            unit=unit,
+                            prominence_db=float(db),
+                            bin=int(idx)))
+        return out
+
+    # Coherence per frame-mean peak: how much higher in frame_mean than typical
+    # pixel PSD at the same bin. Captures "global vs distributed" character.
+    eps = 1e-12
+    coherence = []
+    for idx, db in peaks_fm:
+        ratio_db = 10.0 * np.log10((Pfm[idx] + eps) / (Pix_median[idx] + eps))
+        coherence.append(dict(freq=float(freqs[idx]),
+                              unit=unit,
+                              prominence_db=float(db),
+                              global_to_pixel_db=float(ratio_db),
+                              bin=int(idx)))
+
+    # Sample a handful of detrended pixel traces for the plot panel
+    n_keep = min(8, n_sample)
+    keep_idx = rng.choice(n_sample, size=n_keep, replace=False)
+
+    return dict(
+        frame_mean_peaks=_fmt(peaks_fm),
+        median_pixel_peaks=_fmt(peaks_pix),
+        coherence_at_frame_mean_peaks=coherence,
+        psd_frame_mean=Pfm.tolist(),
+        psd_pixel_median=Pix_median.tolist(),
+        psd_pixel_mean=Pix_mean.tolist(),
+        freqs=freqs.tolist(),
+        freq_unit=unit,
+        fs_hz=float(fs_hz) if fs_hz else None,
+        n_pixels_sampled=int(n_sample),
+        sample_pixel_traces=pix_ts[:, keep_idx].T.tolist(),
+    )
+
+
 # ============================================================================
 # Source-likelihood scoring
 # ============================================================================
@@ -664,6 +823,62 @@ def score_sources(m: dict) -> Dict[str, dict]:
                         "sync timestamps."),
     )
 
+    # 13. Periodic temporal noise — globally coherent across the FOV.
+    # Catches mains pickup (50/60 Hz aliased into baseband), animal physiology
+    # (breathing 1–3 Hz, heartbeat 5–10 Hz in mouse), AC-compressor cycling,
+    # room-lighting alias (100/120 Hz aliased), laser intensity ripple.
+    ts = m.get("temporal_spectral", {})
+    if "error" in ts:
+        src["periodic_temporal_global"] = dict(
+            level="negligible", score=0.0,
+            evidence=dict(error=ts["error"]),
+            recommendation="(temporal spectral test did not run)",
+        )
+        src["periodic_temporal_local"] = dict(
+            level="negligible", score=0.0,
+            evidence=dict(error=ts["error"]),
+            recommendation="(temporal spectral test did not run)",
+        )
+    else:
+        # Global coherent peaks (in frame-mean PSD)
+        fm_peaks = ts.get("frame_mean_peaks", [])
+        fm_max = max((p["prominence_db"] for p in fm_peaks), default=0.0)
+        src["periodic_temporal_global"] = dict(
+            level=_level(fm_max, (3.0, 6.0, 10.0)),
+            score=float(fm_max),
+            evidence=dict(peaks=fm_peaks,
+                          coherence=ts.get("coherence_at_frame_mean_peaks", []),
+                          fs_hz=ts.get("fs_hz")),
+            recommendation=(
+                "Globally-coherent oscillation in frame mean. Interpret the "
+                "frequency: 50/60 Hz mains aliases into baseband (e.g. 60 Hz "
+                "at 30 fps → DC, 50 Hz at 30 fps → 10 Hz); 1–3 Hz = breathing; "
+                "5–10 Hz = mouse heartbeat; 100/120 Hz room lighting aliases "
+                "similarly. Fix: per-pixel notch at the offending bin, or "
+                "regress the frame-mean trace out of every pixel pre-CNMF "
+                "(common-mode subtraction)."
+            ),
+        )
+
+        # Pixel-local periodic peaks — present in median pixel PSD but NOT in
+        # the frame-mean PSD (i.e. not globally coherent). Rare; usually
+        # amplifier-side or per-pixel-readout artifacts.
+        fm_bins = {p["bin"] for p in fm_peaks}
+        local_peaks = [p for p in ts.get("median_pixel_peaks", [])
+                       if p["bin"] not in fm_bins]
+        local_max = max((p["prominence_db"] for p in local_peaks), default=0.0)
+        src["periodic_temporal_local"] = dict(
+            level=_level(local_max, (3.0, 6.0, 10.0)),
+            score=float(local_max),
+            evidence=dict(peaks=local_peaks),
+            recommendation=(
+                "Per-pixel periodic noise without a matching global signature. "
+                "Uncommon. Check the amplifier / digitiser path; verify the "
+                "pixel-clock is stable and not coupling to a switching "
+                "regulator. Software fallback: per-pixel notch."
+            ),
+        )
+
     return src
 
 
@@ -672,8 +887,8 @@ def score_sources(m: dict) -> Dict[str, dict]:
 # ============================================================================
 
 def plot_panel(stack: np.ndarray, m: dict, out_path: Path):
-    """Single 3×3 PNG summary."""
-    fig, axs = plt.subplots(3, 3, figsize=(15, 13))
+    """Single 4×3 PNG summary."""
+    fig, axs = plt.subplots(4, 3, figsize=(15, 17))
 
     M = stack.mean(axis=0)
     axs[0, 0].imshow(M, cmap="gray"); axs[0, 0].axis("off")
@@ -736,18 +951,65 @@ def plot_panel(stack: np.ndarray, m: dict, out_path: Path):
     axs[2, 1].set_title(f"Frame mean: {dr['linear_pct_change']:+.1f}%")
     axs[2, 1].set_xlabel("sampled frame")
 
+    # Top-issues text moves to (2,2) so the temporal-spectral panels can take
+    # the new 4th row.
     axs[2, 2].axis("off")
     srcs = m["sources"]
     order = sorted(srcs.items(),
                    key=lambda kv: (LEVELS.index(kv[1]["level"]), kv[1]["score"]),
                    reverse=True)
     txt = "Top issues by level\n" + "─" * 32 + "\n"
-    for name, info in order[:12]:
+    for name, info in order[:14]:
         marker = {"high": "●●●", "moderate": "●●○", "low": "●○○",
                   "negligible": "○○○"}[info["level"]]
         txt += f"{marker} {info['level']:<10} {name}\n"
     axs[2, 2].text(0, 1, txt, family="monospace",
                    transform=axs[2, 2].transAxes, va="top", fontsize=9)
+
+    # ---- Row 3: temporal spectral views ----
+    ts = m.get("temporal_spectral", {})
+    if "error" not in ts and "freqs" in ts:
+        freqs = np.array(ts["freqs"])
+        Pfm = np.array(ts["psd_frame_mean"])
+        Ppx = np.array(ts["psd_pixel_median"])
+        unit = ts.get("freq_unit", "cyc/frame")
+
+        # Frame-mean PSD with detected peaks marked
+        axs[3, 0].semilogy(freqs[1:], Pfm[1:])
+        for p in ts.get("frame_mean_peaks", []):
+            axs[3, 0].axvline(p["freq"], color="r", alpha=0.4)
+        axs[3, 0].set_title("Frame-mean PSD (global coherent)")
+        axs[3, 0].set_xlabel(unit)
+
+        # Median pixel PSD overlaid with frame-mean PSD for comparison
+        axs[3, 1].semilogy(freqs[1:], Ppx[1:], label="median pixel",
+                           color="C1")
+        axs[3, 1].semilogy(freqs[1:], Pfm[1:], label="frame mean",
+                           color="C0", alpha=0.6)
+        axs[3, 1].set_title("Pixel-median vs frame-mean PSD")
+        axs[3, 1].set_xlabel(unit)
+        axs[3, 1].legend(fontsize=8)
+
+        # Sample detrended pixel traces
+        traces = np.array(ts.get("sample_pixel_traces", []))
+        if traces.size:
+            for i in range(min(traces.shape[0], 8)):
+                axs[3, 2].plot(traces[i] + i * 4 * traces.std(), lw=0.5,
+                               alpha=0.8)
+            axs[3, 2].set_title(f"Detrended pixel traces "
+                                f"({traces.shape[0]} samples, offset)")
+            axs[3, 2].set_xlabel("frame")
+            axs[3, 2].set_yticks([])
+        else:
+            axs[3, 2].axis("off")
+    else:
+        for col in range(3):
+            axs[3, col].axis("off")
+        axs[3, 0].text(0.5, 0.5,
+                       f"temporal_spectral skipped\n{ts.get('error', '')}",
+                       ha="center", va="center",
+                       transform=axs[3, 0].transAxes, fontsize=10,
+                       color="grey")
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=110)
@@ -785,6 +1047,8 @@ def run_diagnostics(src: ArrayLike,
                     out_dir: Union[str, Path] = "diag_out",
                     n_frames: int = 500,
                     rng_seed: int = 0,
+                    fs_hz: Optional[float] = None,
+                    sampling_mode: str = "contiguous",
                     save_panel: bool = True,
                     save_json: bool = True,
                     write_summary: bool = True) -> dict:
@@ -800,21 +1064,30 @@ def run_diagnostics(src: ArrayLike,
         Number of frames to sample (default 500).
     rng_seed : int
         Reproducible sampling.
+    fs_hz : float, optional
+        Frame rate. Required for the temporal_spectral test to report peak
+        frequencies in Hz; if omitted, frequencies are in cycles/frame.
+    sampling_mode : "contiguous" | "random"
+        "contiguous" (default) takes a window of n_frames consecutive frames
+        from a random start — required for temporal analyses. "random"
+        scatters samples through the recording for broader spatial coverage
+        but disables the temporal_spectral test.
 
     Returns
     -------
     dict
         Full report — keys: info, photon_transfer, bidirectional, spectral,
         edge_artifacts, hot_pixels, drift, fixed_pattern, saturation,
-        frame_discontinuity, sources.
+        frame_discontinuity, temporal_spectral, sources.
     """
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     log.info("loading frames from %s ...", src)
-    stack, info = _load_subset(src, n_frames=n_frames, rng_seed=rng_seed)
-    log.info("loaded %d frames of shape %s in %.1f s",
-             info["n_sampled"], stack.shape, time.time() - t0)
+    stack, info = _load_subset(src, n_frames=n_frames, rng_seed=rng_seed,
+                               mode=sampling_mode)
+    log.info("loaded %d frames of shape %s in %.1f s (mode=%s)",
+             info["n_sampled"], stack.shape, time.time() - t0, sampling_mode)
 
     report: dict = dict(info=info)
     report["photon_transfer"]     = test_photon_transfer(stack)
@@ -826,6 +1099,13 @@ def run_diagnostics(src: ArrayLike,
     report["fixed_pattern"]       = test_fixed_pattern(stack)
     report["saturation"]          = test_saturation_quantization(stack, info)
     report["frame_discontinuity"] = test_frame_discontinuity(stack)
+    if sampling_mode == "contiguous":
+        report["temporal_spectral"] = test_temporal_spectral(
+            stack, fs_hz=fs_hz, rng_seed=rng_seed)
+    else:
+        report["temporal_spectral"] = dict(
+            error="temporal_spectral requires contiguous sampling; "
+                  "current mode is 'random'")
     report["sources"]             = score_sources(report)
 
     if save_json:
@@ -851,13 +1131,21 @@ def _main():
     ap.add_argument("--out", default="diag_out", help="output directory")
     ap.add_argument("--n_frames", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fs", type=float, default=None,
+                    help="Frame rate in Hz (enables Hz units in temporal "
+                         "spectral test).")
+    ap.add_argument("--sampling", choices=("contiguous", "random"),
+                    default="contiguous",
+                    help="Frame-sampling mode (default contiguous; required "
+                         "for the temporal_spectral test).")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     run_diagnostics(args.source, out_dir=args.out,
-                    n_frames=args.n_frames, rng_seed=args.seed)
+                    n_frames=args.n_frames, rng_seed=args.seed,
+                    fs_hz=args.fs, sampling_mode=args.sampling)
 
 
 if __name__ == "__main__":
