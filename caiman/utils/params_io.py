@@ -206,12 +206,42 @@ def build_cnmf_opts(
     CNMFParams
         Fully configured params object, ready to pass to ``CNMF()``.
     """
-    from caiman.source_extraction.cnmf.params import CNMFParams
-
     d  = P.data
     mc = P.motion_correction
     c  = P.cnmf
     q  = P.quality
+
+    # ── K (number of components per patch) — validate before any heavy import.
+    # The CaImAn fallback at initialization.py:1846 sets max_number =
+    # ind_search.size / 5 when K is None, i.e. 1/5 of the patch pixel count.
+    # For typical patches that is hundreds of components per patch — silent
+    # over-seeding that paves the FOV with noise-fit "cells".
+    # Rather than carry that footgun forward, refuse K=None with a clear
+    # message that tells the user how to derive a sensible value.
+    # Validated here (before CNMFParams instantiation) so the check is fast
+    # and unit-testable without the full CaImAn import chain.
+    _K = getattr(c, "K", None)
+    if _K is None:
+        raise ValueError(
+            "cnmf.K is None or absent.\n"
+            "  CaImAn's corr_pnr initialiser does NOT do data-driven K\n"
+            "  auto-detection when K is None — it falls back to\n"
+            "  max_number = patch_pixels / 5, which produces tens to hundreds\n"
+            "  of components per patch and paves the FOV with noise fits.\n"
+            "  \n"
+            "  Set cnmf.K to an explicit integer in the JSON.  Typical values:\n"
+            "    sparse 2P (50-200 visible cells):     K=3-5    per patch\n"
+            "    dense 2P (200-500 visible cells):     K=8-15   per patch\n"
+            "    very dense / 1P-style:                K=20-40  per patch\n"
+            "  \n"
+            "  For a data-driven estimate from the Cn/PNR images, run\n"
+            "  caiman.utils.params_estimator.estimate_params() on the\n"
+            "  motion-corrected movie sample — it returns a recommended K\n"
+            "  along with gSig/gSiz/rf/stride/min_corr/min_pnr."
+        )
+    _K = int(_K)
+
+    from caiman.source_extraction.cnmf.params import CNMFParams
 
     # ── Sanity-check and auto-correct gSiz ───────────────────────────────────
     # gSiz must equal 4*gSig+1.  If the JSON was hand-edited to change gSig
@@ -290,7 +320,7 @@ def build_cnmf_opts(
         or getattr(getattr(P, "gpu", None), "precompute_chunk_frames", None)
     )
     opts.set("init", {
-        "K"              : getattr(c, "K", 30),
+        "K"              : _K,
         "gSig"           : getattr(c, "gSig", [8, 8]),
         "gSiz"           : getattr(c, "gSiz", [33, 33]),
         "method_init"    : getattr(c, "method_init", "corr_pnr"),
