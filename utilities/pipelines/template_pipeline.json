@@ -50,6 +50,7 @@
     "cnmf": {
         "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor \u00d7 gSiz[0] must be < rf.",
         "_comment_derived": "WARNING: nb_patch, del_duplicates, and normalize_init values declared here are IGNORED by build_cnmf_opts when method_init=corr_pnr. nb_patch is forced to 0; del_duplicates is forced to (gnb==0); normalize_init is forced to False. They are kept in the template for visibility only.",
+        "_comment_seeding": "SEEDING SEMANTICS (corr_pnr init): (a) K MUST be an explicit integer per patch. K=null falls back to caiman/source_extraction/cnmf/initialization.py:1846 max_number = patch_pixels/5, which is hundreds of components per patch and paves the FOV with noise fits. Use caiman.utils.params_estimator.estimate_params for a data-driven K. (b) min_pnr is INTERNALLY RESCALED by sqrt(tsub) inside greedyROI_corr (initialization.py:1282). Setting min_pnr=6.0 with tsub=2 means the seeding gate uses min_pnr=6.0*sqrt(2)\u22488.49 internally. (c) The actual seeding gate is the PRODUCT min_corr*min_pnr (initialization.py:1861 min_v_search = min_corr*min_pnr). Both individual thresholds AND the product matter — setting one tight and the other loose does not behave like setting one of them at the product value.",
         "p": 1,
         "gnb": 2,
         "merge_thr": 0.85,
