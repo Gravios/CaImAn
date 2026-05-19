@@ -227,12 +227,36 @@ def estimate_params(
         cn, pnr, min_corr, logger=logger)), 1)
 
     # ── K: seeds per patch ────────────────────────────────────────────────────
-    # 3× expected neurons per patch, clamped to [20, 60].
-    n_neurons_typical = 70
-    neurons_per_patch = max(1.0, n_neurons_typical / max(1, n_patches_typical))
-    K = int(np.clip(round(neurons_per_patch * 3), 20, 60))
+    # Data-driven cell-count estimate from the Cn × PNR active region.
+    # A pixel is "active" if it clears both the just-estimated thresholds.
+    # Each cell occupies roughly π·gSig² active pixels (1-σ footprint area
+    # of an isotropic 2-D Gaussian with the estimated PSF width).  This is
+    # conservative — the actual area where a cell's pixels clear threshold
+    # is larger near the centre and smaller at the rim — but it gives the
+    # right magnitude.
+    #
+    # Per-patch budget = (estimated cells / n_patches) × headroom, where
+    # headroom=2.0 accounts for cells straddling patch boundaries (counted
+    # in two adjacent patches and merged later) and for the corr_pnr seeder
+    # finding extra local maxima that get rejected at evaluation.
+    #
+    # The previous formula used a hardcoded n_neurons_typical=70 with a
+    # clamp floor of K=20.  For sparse-cell recordings the floor produced
+    # K=20 even when the data showed ~70 cells across 121 patches — a 30×
+    # overestimate that fed the K=null over-seeding trap.
+    active_mask = (cn >= min_corr) & (pnr >= min_pnr)
+    n_active_px = int(active_mask.sum())
+    cell_area_px = math.pi * float(gSig) ** 2
+    n_cells_est = max(1.0, n_active_px / max(cell_area_px, 1.0))
+    K_raw = math.ceil(n_cells_est * 2.0 / max(1, n_patches_typical))
+    # Sensible bounds: K=3 is the minimum that still allows merging
+    # ambiguity at boundaries; K=40 caps any over-estimate from a Cn map
+    # contaminated by horizontal banding or other periodic noise.
+    K = int(max(3, min(K_raw, 40)))
     logger.info(
-        f"  K={K}  (estimated {neurons_per_patch:.1f} neurons/patch × 3 headroom)"
+        f"  K={K}  (data-driven: {n_active_px} active px, "
+        f"{n_cells_est:.0f} cells est., {n_patches_typical} patches, "
+        f"raw={K_raw}, clamped to [3, 40])"
     )
 
     # ── dF/F window ───────────────────────────────────────────────────────────
