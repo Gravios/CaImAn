@@ -331,6 +331,29 @@ class CNMF(object):
         # fast sequential frame reads instead of scattered C-order reads.
         if hasattr(self, '_forder_movie_path') and self._forder_movie_path:
             cnm._forder_movie_path = self._forder_movie_path
+        # ── Suppress footprint dilation during refit's spatial update ──────
+        # update_spatial_components grows each component's search region by
+        # 1 expandcore dilation + dist iterations of se dilation.  With the
+        # CaImAn defaults (expandcore=3×3 cross, se=3×3 square, dist=3) that
+        # is ~7 px of radial growth — for a 5-px init footprint it expands
+        # the search region to ~17 px (= gSiz here), so the NNLS step picks
+        # up every pixel within that dilated region that has weak temporal
+        # correlation with the trace.  Result: bloated 17-px diamond
+        # footprints in refit even when the init footprints were tight.
+        #
+        # Inside greedyROI_corr the fork already sets se=ones((1,1)) for the
+        # patch-internal final spatial update, but that's a local options
+        # dict and never propagates to self.params.spatial.  Force the
+        # override here so the full-FOV spatial update in refit's fit()
+        # respects the tight init footprints instead of re-expanding them.
+        import numpy as _np_refit
+        cnm.params.set('spatial', {
+            'se':         _np_refit.ones((1, 1), dtype=_np_refit.uint8),
+            'dist':       1,
+            'expandcore': _np_refit.ones((1, 1), dtype=_np_refit.uint8),
+        })
+        _refit_log.info('refit(): forced spatial.se/expandcore=ones((1,1)), '
+                        'dist=1 to suppress footprint dilation')
         try:
             cnm.fit(images)
         except Exception:
