@@ -348,12 +348,10 @@ class CNMF(object):
         # respects the tight init footprints instead of re-expanding them.
         import numpy as _np_refit
         cnm.params.set('spatial', {
-            'se':         _np_refit.ones((1, 1), dtype=_np_refit.uint8),
-            'dist':       1,
-            'expandcore': _np_refit.ones((1, 1), dtype=_np_refit.uint8),
+            'expandCore': _np_refit.ones((1, 1), dtype=_np_refit.uint8),
         })
-        _refit_log.info('refit(): forced spatial.se/expandcore=ones((1,1)), '
-                        'dist=1 to suppress footprint dilation')
+        _refit_log.info("refit(): forced spatial.expandCore=ones((1,1)) "
+                        "to suppress footprint dilation")
         try:
             cnm.fit(images)
         except Exception:
