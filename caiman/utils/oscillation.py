@@ -415,8 +415,38 @@ class OscillationAnalyzer:
         # photobleaching drift that swamp the multitaper spectral estimate.
         # Subtract a per-component running median (window = 10 s) before
         # averaging so only oscillatory structure remains.
-        if hasattr(estimates, "f") and estimates.f is not None:
-            fm = np.atleast_2d(np.array(estimates.f, dtype=np.float64))
+        f_arr = getattr(estimates, "f", None)
+        if f_arr is None:
+            self.bg = None
+            log.warning("estimates.f not found — background analysis disabled")
+        elif np.asarray(f_arr).size == 0 or np.asarray(f_arr).shape[0] == 0:
+            # CNMF was run with nb=0 (no background components requested).
+            # Without the empty-axis guard, `fm.mean(axis=0)` returns an
+            # all-NaN trace that silently poisons every downstream spectrum.
+            self.bg = None
+            log.warning(f"estimates.f is empty (shape={np.asarray(f_arr).shape}, "
+                        f"nb=0 in CNMF params) — background analysis disabled")
+        else:
+            fm = np.atleast_2d(np.array(f_arr, dtype=np.float64))
+
+            # NaN-tolerant: uniform_filter1d propagates NaN across ±win/2
+            # samples, so a few bad samples destroy the whole trace.
+            # Linearly interpolate gaps per-row first.
+            n_bad = int((~np.isfinite(fm)).sum())
+            if n_bad:
+                log.warning(f"estimates.f has {n_bad} non-finite samples "
+                            f"({n_bad/fm.size*100:.3f}%) — interpolating")
+                for i in range(fm.shape[0]):
+                    bad = ~np.isfinite(fm[i])
+                    if not bad.any():
+                        continue
+                    good_idx = np.flatnonzero(~bad)
+                    if good_idx.size == 0:
+                        fm[i, :] = 0.0
+                    else:
+                        fm[i, bad] = np.interp(np.flatnonzero(bad),
+                                               good_idx, fm[i, good_idx])
+
             win = max(3, int(fs * 10) | 1)          # 10-s window, odd
             try:
                 from scipy.ndimage import uniform_filter1d as _uf1
@@ -425,11 +455,15 @@ class OscillationAnalyzer:
             except Exception:
                 fm = fm - fm.mean(axis=1, keepdims=True)   # DC removal fallback
             self.bg = fm.mean(axis=0)
-            log.info(f"Background: {fm.shape[0]} component(s), "
-                     f"{fm.shape[1]} frames  (detrended, window={win} samples)")
-        else:
-            self.bg = None
-            log.warning("estimates.f not found — background analysis disabled")
+
+            if not np.isfinite(self.bg).all():
+                log.warning("Background trace still contains non-finite "
+                            "values after detrend — disabling background")
+                self.bg = None
+            else:
+                log.info(f"Background: {fm.shape[0]} component(s), "
+                         f"{fm.shape[1]} frames  "
+                         f"(detrended, window={win} samples)")
 
         # ── Neural population ────────────────────────────────────────────
         neural_mat = None
