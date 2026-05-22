@@ -97,7 +97,14 @@ def _load_subset(src: ArrayLike,
         spatial-statistics coverage of a very long recording but invalidates
         every temporal test — the temporal_spectral test will refuse to run.
 
-    For tif inputs, only the sampled pages are decoded — safe on multi-GB stacks.
+    Supported sources
+    -----------------
+    - in-memory (T, H, W) ndarray
+    - .npy (memory-mapped)
+    - .tif/.tiff/.btf via tifffile (only sampled pages decoded; safe on
+      multi-GB stacks)
+    - .msr/.h5/.hdf5/.nwb via caiman.utils.stack_io.stack_sample (Leica LAS
+      X / MSR through IMSpectorReader; HDF5 and NWB through cm.load)
     """
     rng = np.random.default_rng(rng_seed)
     if mode not in ("contiguous", "random"):
@@ -153,6 +160,39 @@ def _load_subset(src: ArrayLike,
         return (a, dict(n_total=n_pages, n_sampled=int(idx.size),
                         source=str(path),
                         dtype_orig=str(stacks[0].dtype),
+                        fmax_orig=float(a.max()),
+                        sampling_mode=mode,
+                        first_idx=int(idx[0]), last_idx=int(idx[-1])))
+
+    if suf in (".msr", ".h5", ".hdf5", ".nwb"):
+        # Format-agnostic dispatch via caiman.utils.stack_io. Picks up MSR
+        # (Leica LAS X resonant-scanner raw files via IMSpectorReader), HDF5,
+        # and NWB. The same _pick_indices closure as the tif branch keeps the
+        # sampling semantics identical across formats so test statistics are
+        # comparable.
+        try:
+            from caiman.utils.stack_io import stack_size, stack_sample
+        except ImportError as e:
+            raise RuntimeError(
+                f"{suf} input requires caiman.utils.stack_io"
+            ) from e
+        _, T_total = stack_size(path)
+        idx = _pick_indices(int(T_total))
+        a = stack_sample(path, idx, dtype=np.float32)
+        # Defensive squeeze for backends that yield (T, 1, H, W) or
+        # (T, H, W, 1) — IMSpectorReader returns (T, H, W) but cm.load may
+        # add singleton axes for some HDF5/NWB layouts.
+        if a.ndim == 4 and a.shape[1] == 1:
+            a = a[:, 0]
+        elif a.ndim == 4 and a.shape[-1] == 1:
+            a = a[..., 0]
+        if a.ndim != 3:
+            raise ValueError(
+                f"unexpected frame shape from stack_sample: {a.shape}"
+            )
+        return (a, dict(n_total=int(T_total), n_sampled=int(idx.size),
+                        source=str(path),
+                        dtype_orig="via stack_sample (cast to float32)",
                         fmax_orig=float(a.max()),
                         sampling_mode=mode,
                         first_idx=int(idx[0]), last_idx=int(idx[-1])))
@@ -1057,7 +1097,7 @@ def run_diagnostics(src: ArrayLike,
     Parameters
     ----------
     src : ndarray or path
-        (T, H, W) array or path to .tif/.tiff/.btf/.npy.
+        (T, H, W) array or path to .tif/.tiff/.btf/.npy/.msr/.h5/.nwb.
     out_dir : path
         Where to write report/panel/summary. Created if missing.
     n_frames : int
@@ -1127,7 +1167,7 @@ def run_diagnostics(src: ArrayLike,
 
 def _main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("source", help=".tif/.tiff/.btf/.npy path")
+    ap.add_argument("source", help=".tif/.tiff/.btf/.npy/.msr/.h5/.nwb path")
     ap.add_argument("--out", default="diag_out", help="output directory")
     ap.add_argument("--n_frames", type=int, default=500)
     ap.add_argument("--seed", type=int, default=0)
