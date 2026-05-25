@@ -1,11 +1,17 @@
-# noise_diagnostics — 2P imaging noise characterization
+# utilities/noise — 2P noise characterization and correction
 
-A standalone diagnostic suite that runs a battery of tests on a sampled subset
-of frames from a 2P calcium imaging recording and maps the metrics to a
-calibrated likelihood (`negligible | low | moderate | high`) for each of ~13
-known noise sources, with a one-line recommended fix per source.
+Two cooperating modules:
 
-## What it tests
+- **`noise_diagnostics.py`** (read-only): runs a battery of tests on a sampled
+  subset of frames and maps the metrics to a calibrated likelihood
+  (`negligible | low | moderate | high`) for each of ~13 known noise sources,
+  with a one-line recommended fix per source.
+- **`noise_correction.py`** (writes): pure-function primitives that target the
+  fixable diagnostic flags. The two modules share a vocabulary —
+  `recommend_corrections(report)` reads a diagnostic JSON and returns an
+  ordered correction recipe.
+
+## noise_diagnostics — what it tests
 
 | # | Test                  | Metrics                                              |
 |---|-----------------------|------------------------------------------------------|
@@ -100,3 +106,82 @@ if high:
 The recommendations field gives you the right hook to drive parameter changes
 (e.g. setting `bord_px` to `dead_cols_left + dead_cols_right + 4` when
 `galvo_flyback_edge` is at least moderate).
+
+---
+
+## noise_correction — primitives
+
+| function | addresses flag | technique |
+|---|---|---|
+| `replace_hot_pixels` | hot/dead pixels | per-frame 3×3 spatial-median substitution; pixels flagged by combined high local-z + low variance/mean ratio |
+| `correct_bidirectional` | `bidirectional_phase_offset` | **sub-pixel** even-row shift via `scipy.ndimage.shift(order=1)`. Complements the existing **integer-pixel** `caiman.utils.xcorr_correction.correct_line_scan` |
+| `subtract_row_pedestal` | `horizontal_banding_fixed` / `_drifting` | per-row temporal-median or per-frame-median offset subtraction (rank-1 banding removal) |
+| `regress_common_mode` | `periodic_temporal_global` | OLS projection of the centred frame-mean (or a user-supplied trace) out of every pixel |
+| `notch_temporal` | known mains/aliased line | per-pixel `scipy.signal.iirnotch` + `filtfilt`, chunked across pixels |
+
+Plus glue:
+- `recommend_corrections(report, stack=None)` — read a diagnostic report dict
+  and return `[(callable, kwargs), ...]` in priority order.
+- `apply_corrections(stack, ops)` — chain runner.
+
+### Provenance
+All five primitives are textbook techniques. Implementations are written from
+scratch to avoid GPL-3-vs-GPL-2 license mixing with suite2p (whose
+bidirectional-shift algorithm is closest in spirit to `correct_bidirectional`).
+The algorithm families are cited per-function in the docstrings: suite2p
+(Pachitariu 2017), NoRMCorre (Pnevmatikakis 2017), CompCor (Behzadi 2007).
+
+### Usage
+
+```python
+from utilities.noise.noise_diagnostics import run_diagnostics
+from utilities.noise.noise_correction import recommend_corrections, apply_corrections
+import numpy as np
+
+# Diagnose
+rep = run_diagnostics(stack, out_dir="diag", n_frames=3000, fs_hz=30,
+                      sampling_mode="contiguous")
+
+# Build recipe (pass stack so the stricter var/mean hot-pixel detector runs)
+ops = recommend_corrections(rep, min_level="moderate", stack=stack.astype(np.float32))
+# e.g. ops == [(replace_hot_pixels, {"mask": ...}),
+#              (correct_bidirectional, {"shift_px": -0.51}),
+#              (subtract_row_pedestal, {"mode": "temporal_median"}),
+#              (regress_common_mode, {})]
+
+# Apply in order, returns a corrected (T, H, W) float32 stack
+out = apply_corrections(stack, ops)
+
+# Or apply individually with custom args
+from utilities.noise.noise_correction import notch_temporal
+out = notch_temporal(stack, fs_hz=30, freq_hz=10.0, Q=30)  # surgical mains removal
+```
+
+### Signal-level validation
+
+On a synthetic 1024×256×256 stack with 30 cells and four injected artifacts
+(0.6 px bidir shift, 4-DN banding at 0.10 cyc/px, 3 hot pixels at +200 DN,
+5-DN 10 Hz mains-alias line), the auto-built recipe restores all four metrics
+to near-reference:
+
+| metric                        | pre        | post       | reduction |
+|-------------------------------|-----------:|-----------:|----------:|
+| slow-axis PSD at banding freq | 5.3e+04    | 1.1e+01    | 37 dB     |
+| adjacent-row \|diff\|         | 1.75       | 0.62       | back below ref 0.68 |
+| hot-pixel z-score (mean)      | 53.6       | -0.0       | back to noise floor |
+| frame-mean PSD at 10 Hz       | 1.4e+06    | 4.5e-04    | 95 dB     |
+
+### Caveats
+
+- The diagnostic's `test_hot_pixels` uses an absolute-variance threshold and
+  may miss hot pixels on bright FOVs where shot noise raises the variance
+  floor. The correction module's `detect_hot_pixels` uses variance/mean (the
+  Poisson gain estimate) and is more reliable. Pass `stack=...` to
+  `recommend_corrections` to use it.
+- `correct_bidirectional` runs `scipy.ndimage.shift(order=1)` over the entire
+  stack — O(T·H·W). On a 14 GB recording that's a few seconds; chunked
+  variants for multi-session batch processing are a follow-up.
+- `notch_temporal` is opt-in. The default for `periodic_temporal_global` is
+  `regress_common_mode`, which removes whatever is globally coherent without
+  notching biology. Use notch when you have explicit confidence in a frequency
+  (e.g. a known 50 Hz mains line aliasing to 10 Hz at 30 fps).
