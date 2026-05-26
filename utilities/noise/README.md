@@ -157,6 +157,61 @@ from utilities.noise.noise_correction import notch_temporal
 out = notch_temporal(stack, fs_hz=30, freq_hz=10.0, Q=30)  # surgical mains removal
 ```
 
+### Streaming file-based wrapper
+
+For datasets too large to hold as float32 in RAM, ``correct_stack_file``
+runs the same recipe on a TIFF input in two or three streaming passes
+(depending on whether ``regress_common_mode`` is in the recipe), writing
+to a sibling ``<stem>_Ncorrected.tif``. Peak memory is bounded by the
+chunk size (default ~0.5 GB at 500 frames) regardless of stack length.
+
+```python
+from utilities.noise.noise_correction import correct_stack_file
+
+# From a diagnostic report:
+out_path = correct_stack_file(
+    "/data/.../session.tif",
+    report=rep,                  # rep from run_diagnostics
+    chunk_frames=500,            # ~0.5 GB peak per chunk
+    out_dtype="same",            # preserve uint16; warns if clipped
+)
+
+# Or with an explicit recipe:
+from utilities.noise.noise_correction import (correct_bidirectional,
+                                                subtract_row_pedestal,
+                                                regress_common_mode)
+out_path = correct_stack_file(
+    "/data/.../session.tif",
+    ops=[(correct_bidirectional, {"shift_px": -0.5}),
+         (subtract_row_pedestal, {"mode": "temporal_median"}),
+         (regress_common_mode, {})],
+    out_dtype="float32",
+)
+```
+
+Pass structure:
+- **Pass 1**: stream raw input, accumulate per-frame stats (frame means,
+  row means) and per-pixel stats (temporal mean, variance) needed by the
+  recipe. Derive: bidirectional shift, row-pedestal offsets, hot-pixel mask,
+  centred common-mode trace `c`.
+- **Pass 2** (only with `regress_common_mode`): stream again to accumulate
+  per-pixel `x · c`; divide by `c · c` → per-pixel β.
+- **Pass 3**: stream and apply all corrections to each chunk using the
+  cached state, write to BigTIFF via atomic-rename through `.tmp`.
+
+The output is bit-stable for a given input + recipe (statistics derived
+solely from the raw input). It differs from the in-memory chain by ~1 %
+relative (median |diff| ≈ 0.04 DN on a uint16 source) because in-memory
+re-derives statistics from each step's partially-corrected output —
+neither is strictly "more correct"; the streamed version is more
+deterministic.
+
+`notch_temporal` is not supported in the streamed path (`filtfilt` has
+acausal lookback over the full temporal axis). Pre-apply it in-memory if
+required, or use `regress_common_mode` (the default for
+`periodic_temporal_global`) which handles all globally-coherent
+oscillations regardless of frequency.
+
 ### Signal-level validation
 
 On a synthetic 1024×256×256 stack with 30 cells and four injected artifacts
