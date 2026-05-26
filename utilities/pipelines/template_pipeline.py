@@ -145,7 +145,90 @@ if __name__ == "__main__":
     check_tiff()
     qc_raw()
 
-    # ── 1b. Line-scan phase correction ──────────────────────────────────────
+    # ── 1b. Noise correction ───────────────────────────────────────────────
+    # Diagnose noise sources on the raw stack, build a correction recipe from
+    # flagged sources at or above min_level, apply via streaming wrapper.
+    # Writes <session>_Ncorrected.tif and uses it for all downstream
+    # processing. Runs BEFORE xcorr_correction so that hot-pixel replacement
+    # and row-pedestal subtraction operate on the raw data; if the noise
+    # recipe includes sub-pixel correct_bidirectional, xcorr will see
+    # residual ~0 shift below and no-op.
+    #
+    # Skipped entirely (no file rewrite) if the diagnostic finds nothing
+    # actionable at min_level, so this block can stay enabled across many
+    # sessions safely.
+    _nc_cfg    = getattr(_P, "noise_correction", None)
+    _nc_enable = bool(getattr(_nc_cfg, "enabled", False)) if _nc_cfg else False
+    _nc_applied = False
+    _nc_recipe  = []
+
+    if _nc_enable:
+        _nc_min_level = str(getattr(_nc_cfg, "min_level", "moderate"))
+        _nc_chunk     = int(getattr(_nc_cfg, "chunk_frames", 500))
+        _nc_dtype     = str(getattr(_nc_cfg, "out_dtype", "same"))
+        _nc_n_frames  = int(getattr(_nc_cfg, "diagnostic_n_frames", 3000))
+        _nc_smode     = str(getattr(_nc_cfg, "diagnostic_sampling_mode",
+                                     "contiguous"))
+        _nc_report = None
+
+        @timer.step("Noise diagnostic")
+        def run_noise_diagnostic():
+            global _nc_report
+            from utilities.noise.noise_diagnostics import run_diagnostics
+            _nc_report = run_diagnostics(
+                fnames,
+                out_dir=str(outdir / "diag"),
+                n_frames=_nc_n_frames,
+                fs_hz=float(_P.data.fr),
+                sampling_mode=_nc_smode,
+            )
+
+        run_noise_diagnostic()
+
+        # Determine whether any flagged source warrants correction.
+        _LEVELS = ["negligible", "low", "moderate", "high"]
+        _cutoff = _LEVELS.index(_nc_min_level)
+        # Skip sources without registered corrections or that are commonly
+        # false-positive on cellular data.
+        _skip = {"shot_noise_dominated", "fixed_pattern_noise",
+                  "quantization_loss", "saturation_clipping",
+                  "photobleaching", "illumination_drift_increase",
+                  "frame_discontinuity", "fast_axis_periodic",
+                  "galvo_flyback_edge"}
+        _flagged = {n: d for n, d in _nc_report.get("sources", {}).items()
+                    if _LEVELS.index(d["level"]) >= _cutoff and n not in _skip}
+
+        if _flagged:
+            logger.info(
+                f"Noise diagnostic flagged at >= {_nc_min_level}: "
+                f"{sorted(_flagged.keys())}")
+
+            @timer.step("Noise correction")
+            def run_noise_correction():
+                global fnames, _nc_applied, _nc_recipe
+                from utilities.noise.noise_correction import (
+                    correct_stack_file, recommend_corrections)
+                _nc_recipe = [fn.__name__ for fn, _ in
+                               recommend_corrections(_nc_report,
+                                                       min_level=_nc_min_level)]
+                logger.info(f"Noise correction recipe: {_nc_recipe}")
+                fnames = correct_stack_file(
+                    fnames,
+                    report=_nc_report,
+                    chunk_frames=_nc_chunk,
+                    out_dtype=_nc_dtype,
+                    logger=logger,
+                )
+                _nc_applied = True
+                logger.info(f"Noise correction done: {Path(fnames).name}")
+
+            run_noise_correction()
+        else:
+            logger.info(
+                f"Noise diagnostic clean at >= {_nc_min_level}; "
+                f"skipping correction.")
+
+    # ── 1c. Line-scan phase correction ──────────────────────────────────────
     # Resonant and galvo-resonant scanners acquire alternating rows in opposite
     # directions.  A mechanical phase delay causes a consistent column shift
     # between even and odd rows (the "comb" artefact).  Correct before MC so
@@ -379,6 +462,13 @@ if __name__ == "__main__":
     if _n_total    is not None: _extra["Components (total)"]    = _n_total
     if _n_accepted is not None: _extra["Components (accepted)"] = _n_accepted
     if _n_rejected is not None: _extra["Components (rejected)"] = _n_rejected
+    if _nc_enable:
+        if _nc_applied:
+            _extra["Noise correction"] = (
+                f"applied  ({', '.join(_nc_recipe)})")
+        else:
+            _extra["Noise correction"] = (
+                f"enabled, no flags at >= {_nc_min_level}")
     if _xcorr_enable:
         _extra["Line-scan X shift"] = (
             f"enabled  (max_shift={_xcorr_max_shift} px)")
