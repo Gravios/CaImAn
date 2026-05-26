@@ -107,6 +107,15 @@
         "mc_batch_size": null,
         "_comment_mc": "mc_batch_size: GPU frames per MC batch. null = auto (uses 85% of free VRAM). Set an int to cap (e.g. 2000 for 16 GB GPUs)."
     },
+    "noise_correction": {
+        "_comment": "Streaming noise correction via utilities/noise. Runs the noise diagnostic on the raw stack, builds a recipe from flagged sources at or above min_level, applies via streaming wrapper (peak RAM ~ chunk_frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes). Skipped if the diagnostic finds nothing actionable, so safe to leave enabled. Writes <session>_Ncorrected.tif used for all downstream steps. Runs BEFORE xcorr_correction.",
+        "enabled": false,
+        "min_level": "moderate",
+        "chunk_frames": 500,
+        "out_dtype": "same",
+        "diagnostic_n_frames": 3000,
+        "diagnostic_sampling_mode": "contiguous"
+    },
     "xcorr_correction": {
         "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",
         "enabled": false,
