@@ -193,10 +193,19 @@ if __name__ == "__main__":
         _skip = {"shot_noise_dominated", "fixed_pattern_noise",
                   "quantization_loss", "saturation_clipping",
                   "photobleaching", "illumination_drift_increase",
-                  "frame_discontinuity", "fast_axis_periodic",
+                  "frame_discontinuity",
                   "galvo_flyback_edge"}
         _flagged = {n: d for n, d in _nc_report.get("sources", {}).items()
                     if _LEVELS.index(d["level"]) >= _cutoff and n not in _skip}
+
+        # fast_axis_periodic has an asymmetric trigger inside
+        # recommend_corrections: any level >= 'low' triggers a column-
+        # pedestal correction, regardless of min_level. Reflect that here
+        # so the step isn't skipped when fast_axis_periodic is the only
+        # actionable flag.
+        _fap = _nc_report.get("sources", {}).get("fast_axis_periodic")
+        if _fap and _LEVELS.index(_fap["level"]) >= _LEVELS.index("low"):
+            _flagged.setdefault("fast_axis_periodic", _fap)
 
         if _flagged:
             logger.info(

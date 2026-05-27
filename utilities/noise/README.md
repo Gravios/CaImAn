@@ -116,6 +116,7 @@ The recommendations field gives you the right hook to drive parameter changes
 | `replace_hot_pixels` | hot/dead pixels | per-frame 3×3 spatial-median substitution; pixels flagged by combined high local-z + low variance/mean ratio |
 | `correct_bidirectional` | `bidirectional_phase_offset` | **sub-pixel** even-row shift via `scipy.ndimage.shift(order=1)`. Complements the existing **integer-pixel** `caiman.utils.xcorr_correction.correct_line_scan` |
 | `subtract_row_pedestal` | `horizontal_banding_fixed` / `_drifting` | per-row temporal-median or per-frame-median offset subtraction (rank-1 banding removal) |
+| `subtract_column_pedestal` | `fast_axis_periodic` | per-column temporal-median or per-frame-median offset subtraction — removes FOV-uniform vertical-stripe artifacts from resonant-scanner velocity non-linearity or column-clocked detector structure |
 | `regress_common_mode` | `periodic_temporal_global` | OLS projection of the centred frame-mean (or a user-supplied trace) out of every pixel |
 | `notch_temporal` | known mains/aliased line | per-pixel `scipy.signal.iirnotch` + `filtfilt`, chunked across pixels |
 

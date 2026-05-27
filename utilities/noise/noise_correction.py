@@ -163,6 +163,58 @@ def subtract_row_pedestal(stack: np.ndarray,
     return out
 
 
+def subtract_column_pedestal(stack: np.ndarray,
+                             mode: str = "temporal_median") -> np.ndarray:
+    """Remove a per-column offset that is fixed across time (vertical stripes).
+
+    Symmetric twin of ``subtract_row_pedestal`` for the fast-scan axis. The
+    common motivating artifact on resonant-scanner 2P systems is per-column
+    brightness variation caused by scanner-velocity nonlinearity or detector
+    column-clocked structure — produces the dense vertical-stripe pattern
+    that contaminates correlation images and makes CNMF hallucinate
+    column-aligned "cells".
+
+    Modes
+    -----
+    "temporal_median" (default): for each column c, compute the temporal
+        median of ``stack[:, :, c].mean(axis=1)`` (one number per column),
+        then subtract ``pedestal[c] - global_median`` from column c of every
+        frame. FOV-uniform fixed pattern.
+
+    "per_frame_median": for each (frame, column), compute the median of that
+        column and subtract its deviation from the frame median. Use this
+        when the stripe amplitude drifts over time (rare on stable systems).
+
+    Caveat
+    ------
+    Column-pedestal subtraction removes any signal that is FOV-uniform
+    along the slow (y) axis. Real cells are not column-aligned and span
+    only a few rows, so they contribute negligibly to a column's temporal-
+    mean intensity — but if the FOV happens to contain a vertical blood
+    vessel or a vertical columnar structure that is genuinely present in
+    the biology, this primitive will partially flatten it. Inspect the
+    correction's effect on the temporal-mean image before committing to it
+    as a default for a given preparation.
+
+    Returns a new (T, H, W) float32 array.
+    """
+    if mode not in ("temporal_median", "per_frame_median"):
+        raise ValueError(f"mode must be one of "
+                         f"'temporal_median'/'per_frame_median'; got {mode!r}")
+    out = stack.astype(np.float32, copy=True)
+    if mode == "temporal_median":
+        col_traces = stack.mean(axis=1)                 # (T, W)
+        pedestal = np.median(col_traces, axis=0)        # (W,)
+        offset = pedestal - np.median(pedestal)         # (W,)
+        out -= offset[None, None, :]
+    else:  # per_frame_median
+        col_med = np.median(stack, axis=1)              # (T, W)
+        frame_med = np.median(col_med, axis=1, keepdims=True)  # (T, 1)
+        offset = col_med - frame_med                    # (T, W)
+        out -= offset[:, None, :]
+    return out
+
+
 # ============================================================================
 # 3. Common-mode regression
 # ============================================================================
@@ -365,6 +417,7 @@ _CORRECTION_PRIORITY = [
     "replace_hot_pixels",
     "correct_bidirectional",
     "subtract_row_pedestal",
+    "subtract_column_pedestal",
     "regress_common_mode",
     "notch_temporal",
 ]
@@ -437,6 +490,20 @@ def recommend_corrections(report: Dict[str, Any],
         ops.append((subtract_row_pedestal, {"mode": "temporal_median"}))
     elif _flagged("horizontal_banding_drifting"):
         ops.append((subtract_row_pedestal, {"mode": "per_frame_median"}))
+
+    # Column pedestal — triggered by fast_axis_periodic. We use an
+    # **asymmetric trigger threshold** here: any level at or above "low"
+    # qualifies, regardless of the global ``min_level``. Rationale: the
+    # ``fast_axis_periodic`` test reports peak prominence in dB on the
+    # fast-axis spatial spectrum, and even a modest ~3 dB peak corresponds
+    # to vertical stripes that severely degrade CNMF's correlation image
+    # and produce floods of false-positive column-aligned components
+    # (observed empirically on resonant-scanner data). The fix is cheap
+    # and FOV-uniform structure is rarely real biology, so we trigger
+    # whenever the test sees anything at all.
+    fap = srcs.get("fast_axis_periodic")
+    if fap is not None and levels.index(fap["level"]) >= levels.index("low"):
+        ops.append((subtract_column_pedestal, {"mode": "temporal_median"}))
 
     if _flagged("periodic_temporal_global"):
         # Default: common-mode regression. It removes whatever is globally
@@ -644,12 +711,16 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
     needs_row_means = "subtract_row_pedestal" in ops_names and any(
         kw.get("mode", "temporal_median") == "temporal_median"
         for fn, kw in ops if fn.__name__ == "subtract_row_pedestal")
+    needs_col_means = "subtract_column_pedestal" in ops_names and any(
+        kw.get("mode", "temporal_median") == "temporal_median"
+        for fn, kw in ops if fn.__name__ == "subtract_column_pedestal")
     needs_common_mode = "regress_common_mode" in ops_names
     needs_temporal_stats = ("correct_bidirectional" in ops_names or
                              "replace_hot_pixels" in ops_names)
 
     frame_means = np.empty(n_pages, dtype=np.float32) if needs_common_mode else None
     row_means = np.empty((n_pages, rows), dtype=np.float32) if needs_row_means else None
+    col_means = np.empty((n_pages, cols), dtype=np.float32) if needs_col_means else None
     temporal_sum = np.zeros((rows, cols), dtype=np.float64) if needs_temporal_stats else None
     temporal_sumsq = np.zeros((rows, cols), dtype=np.float64) if needs_temporal_stats else None
 
@@ -660,6 +731,8 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                 frame_means[start:end] = block.mean(axis=(1, 2))
             if row_means is not None:
                 row_means[start:end] = block.mean(axis=2)
+            if col_means is not None:
+                col_means[start:end] = block.mean(axis=1)
             if temporal_sum is not None:
                 temporal_sum += block.sum(axis=0)
                 temporal_sumsq += (block.astype(np.float64) ** 2).sum(axis=0)
@@ -702,6 +775,14 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         state["subtract_row_pedestal"] = {"offsets": row_offsets}
         log_.info("  row pedestal: |offsets| max = %.2f, median %.2f",
                   float(np.max(np.abs(row_offsets))), float(np.median(np.abs(row_offsets))))
+
+    if col_means is not None:
+        # temporal_median column pedestal — single offset per column
+        pedestal = np.median(col_means, axis=0).astype(np.float32)
+        col_offsets = (pedestal - np.median(pedestal)).astype(np.float32)
+        state["subtract_column_pedestal"] = {"offsets": col_offsets}
+        log_.info("  column pedestal: |offsets| max = %.2f, median %.2f",
+                  float(np.max(np.abs(col_offsets))), float(np.median(np.abs(col_offsets))))
 
     if frame_means is not None:
         c = (frame_means - frame_means.mean()).astype(np.float32)
@@ -753,6 +834,8 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                                                        shift_px=state[name]["shift_px"])
                     elif name == "subtract_row_pedestal":
                         block = block - state[name]["offsets"][None, :, None]
+                    elif name == "subtract_column_pedestal":
+                        block = block - state[name]["offsets"][None, None, :]
                     elif name == "regress_common_mode":
                         beta = state[name]["beta"]
                         c_chunk = state[name]["c"][start:end]
@@ -796,6 +879,7 @@ __all__ = [
     "estimate_bidirectional_shift",
     "correct_bidirectional",
     "subtract_row_pedestal",
+    "subtract_column_pedestal",
     "regress_common_mode",
     "notch_temporal",
     "detect_hot_pixels",
