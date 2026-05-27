@@ -497,36 +497,33 @@ def apply_corrections(stack: np.ndarray,
 # plus a few MB for the (H, W) accumulators — bounded and trivial against
 # the chunk size.
 
-def _open_tiff_for_read(src: "Path"):
-    """Open a multi-page TIFF for sequential page reads. Returns
-    (tif, n_pages, rows, cols, dtype)."""
-    import tifffile  # local import — only needed for the file path
-    tif = tifffile.TiffFile(str(src))
-    n_pages = len(tif.pages)
-    if n_pages == 0:
-        tif.close()
-        raise ValueError(f"{src}: no pages found")
-    first = tif.pages[0].asarray()
-    if first.ndim == 2:
-        rows, cols = first.shape
-    elif first.ndim == 3:
-        rows, cols = first.shape[-2], first.shape[-1]
-    else:
-        tif.close()
-        raise ValueError(f"unexpected frame shape: {first.shape}")
-    return tif, n_pages, rows, cols, first.dtype
+def _open_stack_for_read(src: "Path"):
+    """Open a stack file via caiman.utils.stack_io.StackReader for sequential
+    sequential page reads. Returns (reader, n_pages, rows, cols, dtype)."""
+    from caiman.utils.stack_io import StackReader
+    reader = StackReader(src)
+    if reader.n_frames == 0:
+        reader.close()
+        raise ValueError(f"{src}: no frames found")
+    return reader, reader.n_frames, reader.h, reader.w, reader.dtype
 
 
-def _iter_chunks(tif, n_pages: int, chunk_frames: int):
-    """Yield (start, end, block) tuples of contiguous pages as float32."""
+def _iter_chunks(reader, n_pages: int, chunk_frames: int):
+    """Yield (start, end, block) tuples of contiguous frames as float32.
+
+    ``reader`` must be an open ``StackReader`` (or any object exposing
+    ``read_frame(idx) -> np.ndarray``). Frames are stacked along axis 0
+    and squeezed if the backend returned extra leading dimensions.
+    """
     for start in range(0, n_pages, chunk_frames):
         end = min(start + chunk_frames, n_pages)
-        block = np.stack(
-            [tif.pages[i].asarray() for i in range(start, end)], axis=0
-        ).astype(np.float32, copy=False)
-        # collapse leading non-(H, W) dims if present, like xcorr_correction does
-        if block.ndim > 3:
-            block = block.reshape(end - start, *block.shape[-2:])
+        frames = []
+        for i in range(start, end):
+            fr = reader.read_frame(i)
+            if fr.ndim > 2:
+                fr = fr.reshape(fr.shape[-2], fr.shape[-1])
+            frames.append(fr)
+        block = np.stack(frames, axis=0).astype(np.float32, copy=False)
         yield start, end, block
 
 
@@ -539,21 +536,25 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                        overwrite: bool = False,
                        logger: Optional[logging.Logger] = None,
                        ) -> str:
-    """Apply a noise-correction recipe to a TIFF stack, streaming.
+    """Apply a noise-correction recipe to a stack file, streaming.
 
-    Reads ``src_tif`` in chunks, computes per-correction statistics in a
-    streaming first pass, then writes the corrected stack to
-    ``<stem>_Ncorrected.tif`` (or ``out_tif`` if given). Peak memory is
-    bounded by the chunk size — ~0.5 GB at the default 500 frames.
+    Reads ``src_tif`` in chunks via ``caiman.utils.stack_io.StackReader``
+    (supports ``.tif``/``.tiff``/``.msr`` — same format coverage as the
+    diagnostic), computes per-correction statistics in a streaming first
+    pass, then writes the corrected stack to ``<stem>_Ncorrected.tif``
+    (or ``out_tif`` if given). Output is always TIFF (BigTIFF if needed)
+    regardless of input format. Peak memory is bounded by the chunk size
+    — ~0.5 GB at the default 500 frames.
 
     Recipe selection: pass ``ops`` for explicit control, or ``report``
     (a diagnostic JSON dict) to derive the recipe via
-    ``recommend_corrections``. Pass both is an error.
+    ``recommend_corrections``. Passing both is an error.
 
     Parameters
     ----------
     src_tif : path
-        Input TIFF (single- or multi-page; BigTIFF supported).
+        Input stack — TIFF, BigTIFF, or MSR. (Argument name retained for
+        backward compatibility; it does not have to be a TIFF.)
     ops : list of (callable, kwargs) tuples, optional
         Explicit correction recipe. Each callable must be one of the
         module's primitives (the streaming dispatcher knows them by name).
@@ -566,7 +567,7 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
     chunk_frames : int
         Frames per chunk for the streaming passes. Default 500.
     out_dtype : {"same", "float32", "uint16"}
-        Output dtype. "same" preserves the source dtype (with clipping
+        Output dtype. "same" preserves the input dtype (with clipping
         warning if corrections push values out of range). "float32"
         preserves all precision at 2× file size for uint16 sources.
     overwrite : bool
@@ -618,7 +619,7 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         return str(out)
 
     # ── Pass 1: per-frame stats + per-pixel temporal stats ─────────────────
-    tif, n_pages, rows, cols, src_dtype = _open_tiff_for_read(src)
+    reader, n_pages, rows, cols, src_dtype = _open_stack_for_read(src)
     log_.info("correct_stack_file: %d frames %d×%d dtype=%s",
               n_pages, rows, cols, src_dtype)
 
@@ -654,7 +655,7 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
 
     log_.info("correct_stack_file: pass 1/3 — collecting statistics")
     try:
-        for start, end, block in _iter_chunks(tif, n_pages, chunk_frames):
+        for start, end, block in _iter_chunks(reader, n_pages, chunk_frames):
             if frame_means is not None:
                 frame_means[start:end] = block.mean(axis=(1, 2))
             if row_means is not None:
@@ -663,7 +664,7 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                 temporal_sum += block.sum(axis=0)
                 temporal_sumsq += (block.astype(np.float64) ** 2).sum(axis=0)
     finally:
-        tif.close()
+        reader.close()
 
     # Derive per-correction state from the gathered stats.
     state: Dict[str, Any] = {}
@@ -713,14 +714,14 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         log_.info("correct_stack_file: pass 2/3 — per-pixel x·c accumulator")
         c = state["regress_common_mode"]["c"]
         per_pixel_xTc = np.zeros((rows, cols), dtype=np.float64)
-        tif, *_ = _open_tiff_for_read(src)
+        reader, *_ = _open_stack_for_read(src)
         try:
-            for start, end, block in _iter_chunks(tif, n_pages, chunk_frames):
+            for start, end, block in _iter_chunks(reader, n_pages, chunk_frames):
                 c_chunk = c[start:end]   # (n,)
                 # block (n, H, W) · c_chunk (n,) → (H, W)
                 per_pixel_xTc += np.tensordot(c_chunk, block, axes=([0], [0]))
         finally:
-            tif.close()
+            reader.close()
         beta = (per_pixel_xTc / state["regress_common_mode"]["c_dot_c"]
                 ).astype(np.float32)
         state["regress_common_mode"]["beta"] = beta
@@ -739,10 +740,10 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         out_tmp.unlink()
 
     clipped_total = 0
-    tif, *_ = _open_tiff_for_read(src)
+    reader, *_ = _open_stack_for_read(src)
     try:
         with tifffile.TiffWriter(str(out_tmp), bigtiff=bigtiff) as writer:
-            for start, end, block in _iter_chunks(tif, n_pages, chunk_frames):
+            for start, end, block in _iter_chunks(reader, n_pages, chunk_frames):
                 for fn, kw in ops:
                     name = fn.__name__
                     if name == "replace_hot_pixels":
@@ -780,7 +781,7 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                 for fi in range(block_out.shape[0]):
                     writer.write(block_out[fi], contiguous=True)
     finally:
-        tif.close()
+        reader.close()
 
     os.replace(str(out_tmp), str(out))
     if clipped_total > 0:
