@@ -117,6 +117,7 @@ The recommendations field gives you the right hook to drive parameter changes
 | `correct_bidirectional` | `bidirectional_phase_offset` | **sub-pixel** even-row shift via `scipy.ndimage.shift(order=1)`. Complements the existing **integer-pixel** `caiman.utils.xcorr_correction.correct_line_scan` |
 | `subtract_row_pedestal` | `horizontal_banding_fixed` / `_drifting` | per-row temporal-median or per-frame-median offset subtraction (rank-1 banding removal) |
 | `subtract_column_pedestal` | `fast_axis_periodic` | per-column temporal-median or per-frame-median offset subtraction — removes FOV-uniform vertical-stripe artifacts from resonant-scanner velocity non-linearity or column-clocked detector structure |
+| `subtract_fixed_pattern` | `fixed_pattern_noise` | 2D FFT notch on the temporal mean — detects isolated spectral peaks (with prominence threshold above the spectral floor) outside a central cell-scale-preserving disk, zeros them with conjugate-symmetric mirrors, inverse-transforms, subtracts the resulting FPN map from every frame. Targets oriented/lattice structures (the strohA recording's `(fy=±0.109, fx=±0.031)` lattice is the motivating example) that survive axis-aligned corrections |
 | `regress_common_mode` | `periodic_temporal_global` | OLS projection of the centred frame-mean (or a user-supplied trace) out of every pixel |
 | `notch_temporal` | known mains/aliased line | per-pixel `scipy.signal.iirnotch` + `filtfilt`, chunked across pixels |
 
