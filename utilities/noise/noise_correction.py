@@ -222,6 +222,7 @@ def subtract_column_pedestal(stack: np.ndarray,
 def detect_fpn_peaks(M: np.ndarray,
                      cell_scale_px: float = 12.0,
                      prominence_db: float = 15.0,
+                     max_peaks: int = 32,
                      ) -> Tuple[np.ndarray, np.ndarray]:
     """Locate isolated 2D FFT peaks in the temporal-mean image that
     correspond to fixed periodic spatial structure (FPN).
@@ -235,6 +236,28 @@ def detect_fpn_peaks(M: np.ndarray,
     F_shifted : (H, W) complex
         The fftshift'd 2D FFT of ``M - M.mean()`` — returned so callers
         that already paid the FFT cost don't have to repeat it.
+
+    Parameters
+    ----------
+    cell_scale_px : float
+        Spatial scale (radius, in pixels) below which Fourier content is
+        protected by the central-disk mask. Defaults to 12 (covering
+        cells up to ~24 px diameter).
+    prominence_db : float
+        Minimum height in dB above the median spectral floor for a bin
+        to qualify as a candidate peak. Default 15.
+    max_peaks : int
+        Hard cap on the number of peaks detected, after sorting all
+        candidates by prominence (highest first). This is essential for
+        full-FOV temporal means: the shot-noise floor falls as 1/√T, so
+        on long recordings (T ≥ 10³) the dB-prominence test catches many
+        small peaks induced by random cell positioning rather than real
+        FPN. Real lattice peaks consistently rise 40-70 dB above the
+        floor, far above any cell-induced peak (typically 15-30 dB), so
+        keeping the top ``max_peaks`` by prominence reliably selects the
+        FPN. Default 32 — generous enough for a 2D lattice with several
+        harmonics and their 4-fold conjugate mirrors, restrictive enough
+        to prevent catastrophic over-notching of cellular content.
 
     Algorithm
     ---------
@@ -287,9 +310,22 @@ def detect_fpn_peaks(M: np.ndarray,
     is_lmax = (P_db == ndimage.maximum_filter(P_db, size=3))
     candidates = is_lmax & (P_db > threshold_db) & (~central_mask)
 
+    # Cap at top-K by prominence (sorted highest first). Essential for
+    # full-FOV temporal means where cell-induced spectral noise produces
+    # many small candidates that all pass a fixed dB threshold; the real
+    # FPN peaks consistently rise much higher above the floor, so taking
+    # the top-K reliably selects them. See max_peaks docstring.
+    candidate_coords = np.argwhere(candidates)
+    if len(candidate_coords) > max_peaks:
+        candidate_proms = P_db[candidate_coords[:, 0], candidate_coords[:, 1]]
+        keep_idx = np.argsort(candidate_proms)[::-1][:max_peaks]
+        candidate_coords = candidate_coords[keep_idx]
+        log.debug("detect_fpn_peaks: %d candidates → capped at top %d by prominence",
+                   int(candidates.sum()), max_peaks)
+
     # Build notch mask: 1-bin radius around each peak + conjugate pair
     notch_mask = np.zeros_like(candidates, dtype=bool)
-    for y, x in np.argwhere(candidates):
+    for y, x in candidate_coords:
         for sy, sx in [(y, x), ((H - y) % H, (W - x) % W)]:
             y0, y1 = max(0, sy - 1), min(H, sy + 2)
             x0, x1 = max(0, sx - 1), min(W, sx + 2)
@@ -303,6 +339,7 @@ def detect_fpn_peaks(M: np.ndarray,
 def subtract_fixed_pattern(stack: np.ndarray,
                             cell_scale_px: float = 12.0,
                             prominence_db: float = 15.0,
+                            max_peaks: int = 32,
                             return_fpn: bool = False
                             ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """Subtract a 2D-periodic fixed-pattern noise component from every frame.
@@ -357,7 +394,8 @@ def subtract_fixed_pattern(stack: np.ndarray,
     stack = np.asarray(stack, dtype=np.float32)
     M = stack.mean(axis=0)
     notch_mask, F_shifted = detect_fpn_peaks(
-        M, cell_scale_px=cell_scale_px, prominence_db=prominence_db)
+        M, cell_scale_px=cell_scale_px,
+        prominence_db=prominence_db, max_peaks=max_peaks)
 
     if not notch_mask.any():
         log.info("subtract_fixed_pattern: no peaks above %.1f dB prominence; "
@@ -975,8 +1013,10 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                             if fn.__name__ == "subtract_fixed_pattern"), {})
         cell_scale = float(fpn_kwargs.get("cell_scale_px", 12.0))
         prom = float(fpn_kwargs.get("prominence_db", 15.0))
+        mx_peaks = int(fpn_kwargs.get("max_peaks", 32))
         notch_mask, F_shifted = detect_fpn_peaks(
-            temporal_mean, cell_scale_px=cell_scale, prominence_db=prom)
+            temporal_mean, cell_scale_px=cell_scale,
+            prominence_db=prom, max_peaks=mx_peaks)
         if notch_mask.any():
             F_clean = F_shifted.copy()
             F_clean[notch_mask] = 0
