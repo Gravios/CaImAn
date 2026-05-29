@@ -190,7 +190,7 @@ if __name__ == "__main__":
         _cutoff = _LEVELS.index(_nc_min_level)
         # Skip sources without registered corrections or that are commonly
         # false-positive on cellular data.
-        _skip = {"shot_noise_dominated", "fixed_pattern_noise",
+        _skip = {"shot_noise_dominated",
                   "quantization_loss", "saturation_clipping",
                   "photobleaching", "illumination_drift_increase",
                   "frame_discontinuity",

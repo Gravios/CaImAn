@@ -216,7 +216,171 @@ def subtract_column_pedestal(stack: np.ndarray,
 
 
 # ============================================================================
-# 3. Common-mode regression
+# 3. Fixed-pattern noise — 2D FFT notch on the temporal mean
+# ============================================================================
+
+def detect_fpn_peaks(M: np.ndarray,
+                     cell_scale_px: float = 12.0,
+                     prominence_db: float = 15.0,
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """Locate isolated 2D FFT peaks in the temporal-mean image that
+    correspond to fixed periodic spatial structure (FPN).
+
+    Returns
+    -------
+    notch_mask : (H, W) bool
+        Bins to zero in the fftshift'd 2D FFT of M. Includes a 1-bin
+        radius around each detected peak and its conjugate-symmetric
+        counterpart (required to keep ``ifft2`` real-valued).
+    F_shifted : (H, W) complex
+        The fftshift'd 2D FFT of ``M - M.mean()`` — returned so callers
+        that already paid the FFT cost don't have to repeat it.
+
+    Algorithm
+    ---------
+    1. 2D FFT of mean-subtracted M, fftshift so DC sits at the centre.
+    2. Mask out a central disk of radius ``1/(2·cell_scale_px)`` cyc/px
+       so cell-scale and slower spatial structure is preserved (the
+       broad spectral lobes from cells, vignetting, blood vessels never
+       form isolated peaks — they're protected anyway, but the disk
+       guards against unusually compact cells getting clipped).
+    3. Estimate a noise floor as ``median(P_db)`` over the non-central
+       bins. The median is robust to a handful of FPN peaks.
+    4. Detect local maxima with 3×3 neighbourhood that exceed
+       ``floor + prominence_db``. These are the FPN peaks.
+    5. For each peak (y, x), mark the 3×3 bin neighbourhood AND the
+       conjugate-symmetric peak ``((H - y) % H, (W - x) % W)`` and
+       its neighbourhood. Conjugate marking is needed because the
+       inverse FFT of a non-conjugate-symmetric spectrum is complex;
+       any single-peak notch would otherwise leak an imaginary part
+       into the inverse and corrupt the output.
+
+    Robustness to cellular content
+    ------------------------------
+    Cells produce broad, smooth spectral content (their footprint is
+    spatially localised → their FFT is spread). They do NOT produce
+    isolated sharp peaks. The local-maxima + prominence test specifically
+    rejects them. This is what makes the routine safe to fire on the
+    ``fixed_pattern_noise`` flag even when that flag has a known
+    false-positive tendency on cellular FOVs.
+    """
+    M = np.asarray(M, dtype=np.float32)
+    H, W = M.shape
+
+    # FFT of mean-subtracted M, shifted so DC is at center
+    F_shifted = np.fft.fftshift(np.fft.fft2(M - M.mean()))
+    P = np.abs(F_shifted) ** 2
+    P_db = 10.0 * np.log10(P + 1e-12)
+    cy, cx = H // 2, W // 2
+
+    # Central-disk mask — preserve cell-scale spatial content
+    yy, xx = np.ogrid[:H, :W]
+    r_norm = np.sqrt(((yy - cy) / H) ** 2 + ((xx - cx) / W) ** 2)
+    cell_freq = 1.0 / (2.0 * max(cell_scale_px, 1.0))
+    central_mask = r_norm < cell_freq
+
+    # Noise floor estimate (median of non-central bins)
+    floor_db = float(np.median(P_db[~central_mask]))
+    threshold_db = floor_db + prominence_db
+
+    # Local maxima above threshold (3x3 neighbourhood)
+    is_lmax = (P_db == ndimage.maximum_filter(P_db, size=3))
+    candidates = is_lmax & (P_db > threshold_db) & (~central_mask)
+
+    # Build notch mask: 1-bin radius around each peak + conjugate pair
+    notch_mask = np.zeros_like(candidates, dtype=bool)
+    for y, x in np.argwhere(candidates):
+        for sy, sx in [(y, x), ((H - y) % H, (W - x) % W)]:
+            y0, y1 = max(0, sy - 1), min(H, sy + 2)
+            x0, x1 = max(0, sx - 1), min(W, sx + 2)
+            notch_mask[y0:y1, x0:x1] = True
+
+    log.debug("detect_fpn_peaks: floor=%.1f dB, %d candidates, %d notched bins",
+              floor_db, int(candidates.sum()), int(notch_mask.sum()))
+    return notch_mask, F_shifted
+
+
+def subtract_fixed_pattern(stack: np.ndarray,
+                            cell_scale_px: float = 12.0,
+                            prominence_db: float = 15.0,
+                            return_fpn: bool = False
+                            ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """Subtract a 2D-periodic fixed-pattern noise component from every frame.
+
+    Detects oriented or lattice spatial structure that persists across
+    time (the kind that survives bidirectional correction, common-mode
+    regression, and row/column pedestal subtraction because it's neither
+    axis-aligned nor temporally coherent). The standard example on
+    resonant-scanner 2P data is a 2D lattice from scanner-clock pickup or
+    detector-electronics structure — appears as a faint diamond/mesh
+    pattern in the temporal mean and a forest of sharp peaks in its
+    2D FFT.
+
+    Algorithm: compute temporal mean M, FFT, mask the central disk,
+    detect isolated peaks at ≥ ``prominence_db`` above the median spectral
+    floor, zero those peaks (with conjugate-symmetric pairs), inverse
+    FFT, and subtract ``(M - M_clean)`` from every frame.
+
+    Caveats
+    -------
+    - The FPN must be both **spatially periodic** (concentrated at
+      discrete FFT peaks) and **temporally stable** (visible in the
+      temporal mean). Drifting FPN, broad spectral pickup, and non-
+      periodic fixed structure are not addressed.
+    - If the data is shot-noise dominated and the FPN sits below the
+      shot-noise spectral floor, no peaks will pass the prominence
+      threshold and the function is a no-op. To check what was actually
+      removed, pass ``return_fpn=True``.
+    - Cells produce broad spectral content and do not usually form
+      isolated sharp peaks; the routine is robust against detecting
+      cellular content as FPN in the common case. However, if cells
+      happen to be approximately periodically distributed (e.g. neat
+      cortical columns or a regularly-spaced injection grid), the
+      between-cell spacing CAN produce isolated low-frequency peaks
+      that the notch will detect and zero. This is benign in practice
+      — the subtracted FPN amplitude in such cases is typically <1 DN
+      and per-pixel time series (and therefore CNMF outputs) are
+      unaffected, because the notch only modifies the spatial
+      time-average, not the temporal variation. If you suspect this is
+      happening, inspect ``return_fpn=True`` output: spurious peaks
+      tend to be at low frequency (just outside the central mask) and
+      their summed energy is small.
+
+    Returns
+    -------
+    out : (T, H, W) float32
+        The corrected stack (always returned).
+    fpn : (H, W) float32, optional
+        The fixed-pattern map subtracted from every frame (only when
+        ``return_fpn=True``).
+    """
+    stack = np.asarray(stack, dtype=np.float32)
+    M = stack.mean(axis=0)
+    notch_mask, F_shifted = detect_fpn_peaks(
+        M, cell_scale_px=cell_scale_px, prominence_db=prominence_db)
+
+    if not notch_mask.any():
+        log.info("subtract_fixed_pattern: no peaks above %.1f dB prominence; "
+                  "no-op", prominence_db)
+        out = stack.copy()
+        fpn = np.zeros_like(M)
+        return (out, fpn) if return_fpn else out
+
+    F_clean = F_shifted.copy()
+    F_clean[notch_mask] = 0
+    M_clean = np.real(np.fft.ifft2(np.fft.ifftshift(F_clean))) + M.mean()
+    fpn = (M - M_clean).astype(np.float32)
+
+    log.info("subtract_fixed_pattern: notched %d FFT bins, "
+              "fpn std=%.3f max|fpn|=%.2f DN",
+              int(notch_mask.sum()), float(fpn.std()), float(np.abs(fpn).max()))
+
+    out = stack - fpn[None, :, :]
+    return (out, fpn) if return_fpn else out
+
+
+# ============================================================================
+# 4. Common-mode regression
 # ============================================================================
 
 def regress_common_mode(stack: np.ndarray,
@@ -418,6 +582,7 @@ _CORRECTION_PRIORITY = [
     "correct_bidirectional",
     "subtract_row_pedestal",
     "subtract_column_pedestal",
+    "subtract_fixed_pattern",
     "regress_common_mode",
     "notch_temporal",
 ]
@@ -504,6 +669,17 @@ def recommend_corrections(report: Dict[str, Any],
     fap = srcs.get("fast_axis_periodic")
     if fap is not None and levels.index(fap["level"]) >= levels.index("low"):
         ops.append((subtract_column_pedestal, {"mode": "temporal_median"}))
+
+    # 2D fixed-pattern noise — oriented/lattice structure in the temporal
+    # mean that survives axis-aligned corrections (the column-aligned
+    # 32-px lattice on the strohA recording is the motivating example).
+    # The detector is robust against false positives on cellular FOVs
+    # because cells produce broad spectral content, not isolated peaks
+    # — so the routine is a no-op when no peaks pass the prominence
+    # test. Triggers on the diagnostic's ``fixed_pattern_noise`` flag at
+    # the user's chosen ``min_level``.
+    if _flagged("fixed_pattern_noise"):
+        ops.append((subtract_fixed_pattern, {}))
 
     if _flagged("periodic_temporal_global"):
         # Default: common-mode regression. It removes whatever is globally
@@ -716,7 +892,8 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         for fn, kw in ops if fn.__name__ == "subtract_column_pedestal")
     needs_common_mode = "regress_common_mode" in ops_names
     needs_temporal_stats = ("correct_bidirectional" in ops_names or
-                             "replace_hot_pixels" in ops_names)
+                             "replace_hot_pixels" in ops_names or
+                             "subtract_fixed_pattern" in ops_names)
 
     frame_means = np.empty(n_pages, dtype=np.float32) if needs_common_mode else None
     row_means = np.empty((n_pages, rows), dtype=np.float32) if needs_row_means else None
@@ -784,6 +961,40 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
         log_.info("  column pedestal: |offsets| max = %.2f, median %.2f",
                   float(np.max(np.abs(col_offsets))), float(np.median(np.abs(col_offsets))))
 
+    if "subtract_fixed_pattern" in ops_names and temporal_sum is not None:
+        # 2D FFT notch on the temporal mean. Streaming detects FPN from
+        # the RAW temporal mean (pass-1 stats), not from the temporal
+        # mean of the bidir/pedestal-corrected stack. For typical bidir
+        # shifts (sub-pixel) and pedestal magnitudes (a few DN), the
+        # FPN peak locations in M are unchanged by those earlier
+        # corrections — the lattice frequencies are an intrinsic
+        # property of the acquisition. If the recipe didn't include
+        # any earlier in-place modification of M, the result is exactly
+        # equivalent to the in-memory chain.
+        fpn_kwargs = next((kw for fn, kw in ops
+                            if fn.__name__ == "subtract_fixed_pattern"), {})
+        cell_scale = float(fpn_kwargs.get("cell_scale_px", 12.0))
+        prom = float(fpn_kwargs.get("prominence_db", 15.0))
+        notch_mask, F_shifted = detect_fpn_peaks(
+            temporal_mean, cell_scale_px=cell_scale, prominence_db=prom)
+        if notch_mask.any():
+            F_clean = F_shifted.copy()
+            F_clean[notch_mask] = 0
+            M_clean = (np.real(np.fft.ifft2(np.fft.ifftshift(F_clean)))
+                       + temporal_mean.mean()).astype(np.float32)
+            fpn_map = (temporal_mean - M_clean).astype(np.float32)
+            state["subtract_fixed_pattern"] = {"fpn": fpn_map}
+            log_.info("  fixed pattern: notched %d FFT bins, "
+                      "fpn std=%.3f, max|fpn|=%.2f DN",
+                      int(notch_mask.sum()), float(fpn_map.std()),
+                      float(np.abs(fpn_map).max()))
+        else:
+            log_.info("  fixed pattern: no peaks above %.1f dB prominence; "
+                      "dropping op from recipe", prom)
+            ops = [(fn, kw) for fn, kw in ops
+                    if fn.__name__ != "subtract_fixed_pattern"]
+            ops_names = [fn.__name__ for fn, _ in ops]
+
     if frame_means is not None:
         c = (frame_means - frame_means.mean()).astype(np.float32)
         c_dot_c = float(c @ c)
@@ -836,6 +1047,8 @@ def correct_stack_file(src_tif: "Union[str, os.PathLike]",
                         block = block - state[name]["offsets"][None, :, None]
                     elif name == "subtract_column_pedestal":
                         block = block - state[name]["offsets"][None, None, :]
+                    elif name == "subtract_fixed_pattern":
+                        block = block - state[name]["fpn"][None, :, :]
                     elif name == "regress_common_mode":
                         beta = state[name]["beta"]
                         c_chunk = state[name]["c"][start:end]
@@ -880,6 +1093,8 @@ __all__ = [
     "correct_bidirectional",
     "subtract_row_pedestal",
     "subtract_column_pedestal",
+    "detect_fpn_peaks",
+    "subtract_fixed_pattern",
     "regress_common_mode",
     "notch_temporal",
     "detect_hot_pixels",
