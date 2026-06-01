@@ -346,6 +346,38 @@ if __name__ == "__main__":
     images.filename = Yr.filename
     logger.info(f"Data: {images.shape}  dtype={images.dtype}")
 
+    # ── 4b. Temporal detrend ───────────────────────────────────────────────
+    # Remove a slow per-pixel polynomial trend (default linear) before Cn /
+    # CNMF.  SUPPORT preserves the brightness-decay ramp; left in, every pixel
+    # shares one dominant slow component and the local-correlation image
+    # saturates (Cn -> ~1, min_corr gate dead).  Detrending removes the ramp
+    # and restores Cn contrast.  Written back to the C-order mmap so both the
+    # seeded (single-FOV) and patch paths read detrended data.
+    _dt_cfg = getattr(_P, "detrend", None)
+    if bool(getattr(_dt_cfg, "enabled", False)):
+        @timer.step("Temporal detrend")
+        def run_detrend():
+            global images, Yr
+            from utilities.noise.noise_correction import detrend_temporal
+            _order = int(getattr(_dt_cfg, "order", 1))
+            _pm    = bool(getattr(_dt_cfg, "preserve_mean", True))
+            _npix  = Yr.shape[0]
+            Yr_rw  = np.memmap(fname_cnmf, mode="r+", dtype=np.float32,
+                               shape=Yr.shape, order="C")
+            _CH = 8192
+            for _i in range(0, _npix, _CH):
+                _blk = np.asarray(Yr_rw[_i:_i + _CH])               # (n, T)
+                _d = detrend_temporal(_blk.T[:, :, None],
+                                      order=_order, preserve_mean=_pm)
+                Yr_rw[_i:_i + _CH] = _d[:, :, 0].T                  # (n, T)
+            Yr_rw.flush(); del Yr_rw
+            Yr, _dims_dt, _T_dt = cm.mmapping.load_memmap(fname_cnmf)
+            images = np.reshape(Yr.T, [T] + list(dims), order="F")
+            images.filename = Yr.filename
+            logger.info(f"Temporal detrend applied: order={_order} "
+                        f"preserve_mean={_pm}")
+        run_detrend()
+
     cupy_flush(logger, label="before summary-image step")
 
     @timer.step("Correlation image (Cn)")
@@ -434,6 +466,45 @@ if __name__ == "__main__":
         single_thread=False,
     )
 
+    # ── Anatomical seeding (census-complete extraction) ────────────────────
+    # When enabled, detect cells on a summary projection (or load an external
+    # label image) and seed CNMF with them.  Bypasses corr_pnr/min_corr
+    # detection (degenerate on SUPPORT-denoised data) and keeps silent cells
+    # for an inactive-cell count.  Seeding forces single-FOV extraction
+    # (run_CNMF_patches ignores Ain) — handled inside CNMFRunner.fit.
+    _seed = None
+    _seed_cfg = getattr(_P, "seeding", None)
+    if bool(getattr(_seed_cfg, "enabled", False)):
+        @timer.step("Anatomical seeding")
+        def build_seed():
+            global _seed
+            from caiman.utils import seeding as _sd
+            _src = str(getattr(_seed_cfg, "source", "projection"))
+            if _src == "label_file":
+                _lbl = _sd.load_label_image(str(_seed_cfg.label_file))
+            else:
+                _proj = _sd.summary_projection(
+                    images,
+                    kind=str(getattr(_seed_cfg, "projection", "max_div_mean")))
+                np.save(str(outdir / f"{session}_seed_projection.npy"), _proj)
+                _lbl = _sd.segment_anatomical(
+                    _proj,
+                    diameter=getattr(_seed_cfg, "diameter", None),
+                    flow_threshold=float(getattr(_seed_cfg, "flow_threshold", 0.4)),
+                    cellprob_threshold=float(getattr(_seed_cfg,
+                                                     "cellprob_threshold", 0.0)),
+                    gpu=bool(getattr(_seed_cfg, "use_gpu", True)))
+                np.save(str(outdir / f"{session}_seed_labels.npy"), _lbl)
+            _Ain = _sd.masks_to_Ain(
+                _lbl, dims=dims,
+                min_pixels=int(getattr(_seed_cfg, "min_pixels", 8)))
+            _Cin, _b, _f = _sd.complete_seed(
+                _Ain, Yr, nb=int(getattr(_seed_cfg, "nb", 2)))
+            _seed = (_Ain, _Cin, _b, _f)
+            logger.info(f"Anatomical seeding: {_Ain.shape[1]} ROIs seeded "
+                        f"(single-FOV; corr_pnr/min_corr bypassed)")
+        build_seed()
+
     runner = CNMFRunner(
         _P, session, outdir,
         fname_mc      = fname_mc,
@@ -446,7 +517,7 @@ if __name__ == "__main__":
     )
 
     try:
-        cnm2 = runner.run_all(images, Yr=Yr, qc=qc, Cn=Cn, timer=timer)
+        cnm2 = runner.run_all(images, Yr=Yr, qc=qc, Cn=Cn, timer=timer, seed=_seed)
         del images, Yr, Cn
 
     finally:
@@ -471,6 +542,14 @@ if __name__ == "__main__":
     if _n_total    is not None: _extra["Components (total)"]    = _n_total
     if _n_accepted is not None: _extra["Components (accepted)"] = _n_accepted
     if _n_rejected is not None: _extra["Components (rejected)"] = _n_rejected
+    try:
+        _census = getattr(cnm2.estimates, "census", None)
+        if _census:
+            _extra["Census (total ROIs)"] = _census["n_total"]
+            _extra["Census (active)"]     = _census["n_active"]
+            _extra["Census (inactive)"]   = _census["n_inactive"]
+    except Exception:
+        pass
     if _nc_enable:
         if _nc_applied:
             _extra["Noise correction"] = (

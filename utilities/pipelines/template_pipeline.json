@@ -50,7 +50,7 @@
     "cnmf": {
         "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor \u00d7 gSiz[0] must be < rf.",
         "_comment_derived": "WARNING: nb_patch, del_duplicates, and normalize_init values declared here are IGNORED by build_cnmf_opts when method_init=corr_pnr. nb_patch is forced to 0; del_duplicates is forced to (gnb==0); normalize_init is forced to False. They are kept in the template for visibility only.",
-        "_comment_seeding": "SEEDING SEMANTICS (corr_pnr init): (a) K MUST be an explicit integer per patch. K=null falls back to caiman/source_extraction/cnmf/initialization.py:1846 max_number = patch_pixels/5, which is hundreds of components per patch and paves the FOV with noise fits. Use caiman.utils.params_estimator.estimate_params for a data-driven K. (b) min_pnr is INTERNALLY RESCALED by sqrt(tsub) inside greedyROI_corr (initialization.py:1282). Setting min_pnr=6.0 with tsub=2 means the seeding gate uses min_pnr=6.0*sqrt(2)\u22488.49 internally. (c) The actual seeding gate is the PRODUCT min_corr*min_pnr (initialization.py:1861 min_v_search = min_corr*min_pnr). Both individual thresholds AND the product matter — setting one tight and the other loose does not behave like setting one of them at the product value.",
+        "_comment_seeding": "SEEDING SEMANTICS (corr_pnr init): (a) K MUST be an explicit integer per patch. K=null falls back to caiman/source_extraction/cnmf/initialization.py:1846 max_number = patch_pixels/5, which is hundreds of components per patch and paves the FOV with noise fits. Use caiman.utils.params_estimator.estimate_params for a data-driven K. (b) min_pnr is INTERNALLY RESCALED by sqrt(tsub) inside greedyROI_corr (initialization.py:1282). Setting min_pnr=6.0 with tsub=2 means the seeding gate uses min_pnr=6.0*sqrt(2)\u22488.49 internally. (c) The actual seeding gate is the PRODUCT min_corr*min_pnr (initialization.py:1861 min_v_search = min_corr*min_pnr). Both individual thresholds AND the product matter \u2014 setting one tight and the other loose does not behave like setting one of them at the product value.",
         "p": 1,
         "gnb": 2,
         "merge_thr": 0.85,
@@ -130,6 +130,25 @@
         "win_s": 4.0,
         "overlap_s": null,
         "adaptive": true,
+        "use_gpu": true
+    },
+    "detrend": {
+        "_comment": "Per-pixel polynomial temporal detrend applied to the movie before Cn/CNMF. Removes the slow brightness-decay ramp (photobleaching) that SUPPORT preserves by design; this also de-saturates the local-correlation image so Cn regains contrast. order=1 is a straight linear detrend; 2-3 removes a curved bleach decay. preserve_mean keeps each pixel's F0 so dF/F stays stable. Written back to the C-order mmap; fast calcium transients are untouched.",
+        "enabled": false,
+        "order": 1,
+        "preserve_mean": true
+    },
+    "seeding": {
+        "_comment": "Anatomical seeding for census-complete extraction. enabled=true detects cells on a summary projection (or loads an external label image) and seeds CNMF with them. This BYPASSES corr_pnr/min_corr detection entirely \u2014 required when SUPPORT denoising saturates the local-correlation image (Cn -> ~1, every pixel passes min_corr). Seeding forces single-FOV extraction (rf=None) because run_CNMF_patches/map_reduce.py have no Ain/seed_method parameter. Silent cells are KEPT and counted (estimates.census), not pruned. source: 'projection' (segment a Cn-free summary image with Cellpose-SAM) or 'label_file' (load masks from Cellpose GUI / suite2p / manual; path in label_file). nb should equal cnmf.gnb. Requires cellpose>=4 for source=projection.",
+        "enabled": false,
+        "source": "projection",
+        "projection": "max_div_mean",
+        "label_file": null,
+        "diameter": 15,
+        "flow_threshold": 0.4,
+        "cellprob_threshold": 0.0,
+        "min_pixels": 8,
+        "nb": 2,
         "use_gpu": true
     }
 }

@@ -200,12 +200,14 @@ class CNMFRunner:
             # because estimates.A is non-None).
             Ain, Cin, b_in, f_in = seed
             K = int(Ain.shape[1])
+            _nb_seed = int(b_in.shape[1])
             self._opts.set("patch", {"rf": None, "stride": None,
                                      "only_init": False})
             self._opts.set("preprocess", {"p": self._p})
-            self._opts.set("init", {"seed_method": "manual", "K": K})
+            self._opts.set("init", {"seed_method": "manual", "K": K,
+                                    "nb": _nb_seed})
             logger.info(
-                f"CNMF seeded single-FOV: K={K} footprints "
+                f"CNMF seeded single-FOV: K={K} footprints, nb={_nb_seed} "
                 f"(patches disabled — run_CNMF_patches ignores Ain)"
             )
             cnm = _cnmf_mod.CNMF(self._n_processes, params=self._opts,
