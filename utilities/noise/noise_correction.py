@@ -473,10 +473,38 @@ def regress_common_mode(stack: np.ndarray,
     return (out, c) if return_trace else out
 
 
+_NOISE_GPU_XP = None  # cached array module for the GPU path (resolved once)
+
+
+def _detrend_xp(use_gpu: bool):
+    """Return cupy (if requested and usable) else numpy. Resolved once per
+    process so chunked callers don't re-smoke-test the device each call."""
+    global _NOISE_GPU_XP
+    if not use_gpu:
+        return np
+    if _NOISE_GPU_XP is not None:
+        return _NOISE_GPU_XP
+    try:
+        import cupy as cp
+        _ = cp.array([1.0])                       # smoke-test allocation
+        log.info("detrend_temporal: CuPy GPU backend active")
+        _NOISE_GPU_XP = cp
+    except Exception as e:                          # pragma: no cover
+        log.warning(f"detrend_temporal: CuPy unavailable ({e}); using NumPy")
+        _NOISE_GPU_XP = np
+    return _NOISE_GPU_XP
+
+
+def _detrend_to_numpy(arr, xp) -> np.ndarray:
+    """Move an array to host numpy regardless of backend."""
+    return np.asarray(arr) if xp is np else xp.asnumpy(arr)
+
+
 def detrend_temporal(stack: np.ndarray,
                      order: int = 1,
                      preserve_mean: bool = True,
-                     return_trend: bool = False
+                     return_trend: bool = False,
+                     use_gpu: bool = False
                      ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """Remove a slow per-pixel polynomial trend over time (default: linear).
 
@@ -501,29 +529,37 @@ def detrend_temporal(stack: np.ndarray,
         dF/F divides by).  If False, also remove the per-pixel mean.
     return_trend : bool
         If True, also return the removed ``(T, H, W)`` trend.
+    use_gpu : bool
+        Run the regression on the GPU via CuPy when available (the two
+        matmuls and the tiny ``(order, order)`` solve map cleanly to the
+        device).  Falls back to NumPy if CuPy is missing.  Output is always
+        returned as host NumPy (callers write it back to a host mmap).
 
     Returns the corrected ``(T, H, W)`` float32 stack (and trend if asked).
     """
     if order < 1:
         raise ValueError(f"order must be >= 1, got {order}")
     T, H, W = stack.shape
-    t = np.linspace(-1.0, 1.0, T, dtype=np.float64)
+    xp = _detrend_xp(use_gpu)
+
+    t = xp.linspace(-1.0, 1.0, T, dtype=xp.float64)
     cols = []
     for k in range(1, order + 1):
         ck = t ** k
         cols.append(ck - ck.mean())          # mean-centre → removal keeps F0
-    B = np.stack(cols, axis=1).astype(np.float32)        # (T, order)
+    B = xp.stack(cols, axis=1).astype(xp.float32)        # (T, order)
 
-    flat = stack.reshape(T, H * W).astype(np.float32)
-    betas = np.linalg.solve(B.T @ B, B.T @ flat)         # (order, H*W)
+    flat = xp.asarray(stack.reshape(T, H * W), dtype=xp.float32)  # upload if GPU
+    betas = xp.linalg.solve(B.T @ B, B.T @ flat)         # (order, H*W)
     trend = B @ betas                                    # (T, H*W), 0 mean / pixel
     out = flat - trend
     if not preserve_mean:
         out = out - out.mean(axis=0, keepdims=True)
-    out = out.reshape(T, H, W)
+
+    out_np = _detrend_to_numpy(out, xp).reshape(T, H, W)
     if return_trend:
-        return out, trend.reshape(T, H, W)
-    return out
+        return out_np, _detrend_to_numpy(trend, xp).reshape(T, H, W)
+    return out_np
 
 
 # ============================================================================
