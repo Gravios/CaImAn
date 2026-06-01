@@ -140,10 +140,10 @@
         "use_gpu": true
     },
     "seeding": {
-        "_comment": "Anatomical seeding for census-complete extraction. enabled=true detects cells on a summary projection (or loads an external label image) and seeds CNMF with them. This BYPASSES corr_pnr/min_corr detection entirely \u2014 required when SUPPORT denoising saturates the local-correlation image (Cn -> ~1, every pixel passes min_corr). Seeding forces single-FOV extraction (rf=None) because run_CNMF_patches/map_reduce.py have no Ain/seed_method parameter. Silent cells are KEPT and counted (estimates.census), not pruned. source: 'projection' (segment a Cn-free summary image with Cellpose-SAM) or 'label_file' (load masks from Cellpose GUI / suite2p / manual; path in label_file). nb should equal cnmf.gnb. Requires cellpose>=4 for source=projection.",
+        "_comment": "Anatomical seeding for census-complete extraction. enabled=true detects cells on a summary projection (or loads an external label image) and seeds CNMF with them, BYPASSING corr_pnr/min_corr detection (degenerate on SUPPORT-denoised data). projection: use 'mean' for an ANATOMICAL census \u2014 it shows every soma by baseline GCaMP fluorescence, including silent cells. Do NOT use 'max_div_mean' for the census: it is suite2p's FUNCTIONAL input and highlights only active cells (it found just the 4 most active here), defeating the silent-cell count. nb is the number of global full-FOV background components for the seeded single-FOV fit \u2014 keep small (1-2); it is NOT the patch-mode gnb. Silent cells are kept and counted (estimates.census). source: 'projection' (Cellpose-SAM, needs cellpose>=4) or 'label_file' (Cellpose GUI/suite2p/manual masks).",
         "enabled": false,
         "source": "projection",
-        "projection": "max_div_mean",
+        "projection": "mean",
         "label_file": null,
         "diameter": 15,
         "flow_threshold": 0.4,
