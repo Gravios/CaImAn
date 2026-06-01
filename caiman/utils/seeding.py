@@ -255,7 +255,18 @@ def complete_seed(Ain: sparse.spmatrix, Yr: np.ndarray, nb: int = 2,
     Cin = np.empty((K, T), dtype=dtype)
     for i in range(0, T, chunk):
         Cin[:, i:i + chunk] = AT @ np.asarray(Yr[:, i:i + chunk], dtype=dtype)
+    _cin_raw_min, _cin_raw_max = float(Cin.min()), float(Cin.max())
+    # Mean of Yr over the union of footprint pixels (sampled) — if this is ~0
+    # the movie is empty at the seeds (alignment/movie bug); if it is ~baseline
+    # but pre-clip Cin is <=0 the footprints carry no positive signal.
+    _fp_pix = np.unique(Ain.indices)
+    _fp_sample = _fp_pix[:min(_fp_pix.size, 4096)]
+    _yr_fp_mean = float(np.asarray(Yr[_fp_sample, :], dtype=np.float64).mean()) \
+        if _fp_sample.size else float("nan")
     np.clip(Cin, 0, None, out=Cin)
+    logger.info("complete_seed: pre-clip Cin range [%.4g, %.4g]; mean Yr over "
+                "%d footprint px = %.4g", _cin_raw_min, _cin_raw_max,
+                _fp_pix.size, _yr_fp_mean)
 
     # Residual on a temporal subsample → randomized-SVD spatial background basis.
     sub = np.linspace(0, T - 1, num=min(T, t_sub), dtype=int)

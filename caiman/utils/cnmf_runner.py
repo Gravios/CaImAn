@@ -277,6 +277,17 @@ class CNMFRunner:
             ``(n_accepted, n_rejected)`` component counts.
         """
         _eval_dview = cnm2.dview
+        # Guard: evaluate_components -> evaluate_components_CNN crashes on an
+        # empty component set (np.maximum(coms, half_crop) broadcast error,
+        # and qc footprint max() on a zero-size array). When the seeded fit
+        # produced nothing, short-circuit to a clean (0, 0) instead.
+        if cnm2.estimates.A is None or cnm2.estimates.A.shape[1] == 0:
+            logger.warning("No components to evaluate (0 components) — skipping "
+                           "evaluation. Check the seed: see the complete_seed "
+                           "diagnostics for an all-zero Cin.")
+            cnm2.estimates.idx_components = np.array([], dtype=int)
+            cnm2.estimates.idx_components_bad = np.array([], dtype=int)
+            return 0, 0
         cnm2.estimates.evaluate_components(images, cnm2.params, dview=_eval_dview)
         if cnm2.estimates.idx_components is None:
             logger.warning("idx_components is None — re-running evaluate_components")
