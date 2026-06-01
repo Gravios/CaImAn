@@ -274,6 +274,17 @@ def complete_seed(Ain: sparse.spmatrix, Yr: np.ndarray, nb: int = 2,
 
     logger.info("complete_seed: Cin %s, b_in %s, f_in %s (nb=%d)",
                 Cin.shape, b_in.shape, f_in.shape, nb_eff)
+    _cfin = np.isfinite(Cin).all()
+    logger.info("complete_seed: Cin range [%.4g, %.4g] per-row sums "
+                "min=%.4g (zero rows: %d / %d); finite: Cin=%s b_in=%s f_in=%s",
+                float(np.nanmin(Cin)), float(np.nanmax(Cin)),
+                float(Cin.sum(axis=1).min()), int((Cin.sum(axis=1) == 0).sum()),
+                Cin.shape[0], _cfin, bool(np.isfinite(b_in).all()),
+                bool(np.isfinite(f_in).all()))
+    if not _cfin:
+        logger.warning("complete_seed: Cin contains non-finite values — the "
+                       "detrended movie likely has NaN/Inf; seeded components "
+                       "will be eliminated as empty/nan in update_spatial.")
     return Cin, b_in, f_in
 
 
