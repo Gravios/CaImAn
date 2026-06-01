@@ -155,7 +155,23 @@ def update_spatial_components(Y, C=None, f=None, A_in=None, sn=None, dims=None,
         for i in ff:
             ind_list.insert(i, 0)
         ind_list = np.array(ind_list, dtype=int)
-        ind2_ = [ind_list[np.setdiff1d(a,ff)] if len(a) else a for a in ind2_]
+        # ind2_ entries may carry background indices (nr .. nr+nb-1) appended by
+        # computing_indicator. setdiff1d against ff (neural only) leaves those
+        # background indices in place, so feeding them straight into ind_list
+        # (sized to nr) overflows. Remap the neural part through ind_list and
+        # shift the background indices to the new neural count. No-op when a
+        # support carries no background index (a[a >= nr] empty).
+        new_nr = int(nr - np.size(ff))
+
+        def _reindex_support(a):
+            if len(a) == 0:
+                return a
+            a = np.asarray(a)
+            neu = ind_list[np.setdiff1d(a[a < nr], ff)]
+            bg = a[a >= nr] - nr + new_nr
+            return np.hstack((neu, bg)) if bg.size else neu
+
+        ind2_ = [_reindex_support(a) for a in ind2_]
 
     nr = C.shape[0]
     if normalize_yyt_one and C is not None:
