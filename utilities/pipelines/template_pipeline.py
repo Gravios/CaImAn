@@ -361,6 +361,7 @@ if __name__ == "__main__":
             from utilities.noise.noise_correction import detrend_temporal
             _order = int(getattr(_dt_cfg, "order", 1))
             _pm    = bool(getattr(_dt_cfg, "preserve_mean", True))
+            _gpu   = bool(getattr(_dt_cfg, "use_gpu", True))
             _npix  = Yr.shape[0]
             Yr_rw  = np.memmap(fname_cnmf, mode="r+", dtype=np.float32,
                                shape=Yr.shape, order="C")
@@ -368,14 +369,15 @@ if __name__ == "__main__":
             for _i in range(0, _npix, _CH):
                 _blk = np.asarray(Yr_rw[_i:_i + _CH])               # (n, T)
                 _d = detrend_temporal(_blk.T[:, :, None],
-                                      order=_order, preserve_mean=_pm)
+                                      order=_order, preserve_mean=_pm,
+                                      use_gpu=_gpu)
                 Yr_rw[_i:_i + _CH] = _d[:, :, 0].T                  # (n, T)
             Yr_rw.flush(); del Yr_rw
             Yr, _dims_dt, _T_dt = cm.mmapping.load_memmap(fname_cnmf)
             images = np.reshape(Yr.T, [T] + list(dims), order="F")
             images.filename = Yr.filename
             logger.info(f"Temporal detrend applied: order={_order} "
-                        f"preserve_mean={_pm}")
+                        f"preserve_mean={_pm} use_gpu={_gpu}")
         run_detrend()
 
     cupy_flush(logger, label="before summary-image step")

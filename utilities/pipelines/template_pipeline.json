@@ -133,10 +133,11 @@
         "use_gpu": true
     },
     "detrend": {
-        "_comment": "Per-pixel polynomial temporal detrend applied to the movie before Cn/CNMF. Removes the slow brightness-decay ramp (photobleaching) that SUPPORT preserves by design; this also de-saturates the local-correlation image so Cn regains contrast. order=1 is a straight linear detrend; 2-3 removes a curved bleach decay. preserve_mean keeps each pixel's F0 so dF/F stays stable. Written back to the C-order mmap; fast calcium transients are untouched.",
+        "_comment": "Per-pixel polynomial temporal detrend applied to the movie before Cn/CNMF. Removes the slow brightness-decay ramp (photobleaching) that SUPPORT preserves; also de-saturates the local-correlation image. order=1 linear; 2-3 for curved bleach decay. preserve_mean keeps F0 so dF/F stays stable. use_gpu runs the regression via CuPy (two matmuls + tiny solve per pixel-chunk) with NumPy fallback. Written back to the C-order mmap; fast transients are untouched.",
         "enabled": false,
         "order": 1,
-        "preserve_mean": true
+        "preserve_mean": true,
+        "use_gpu": true
     },
     "seeding": {
         "_comment": "Anatomical seeding for census-complete extraction. enabled=true detects cells on a summary projection (or loads an external label image) and seeds CNMF with them. This BYPASSES corr_pnr/min_corr detection entirely \u2014 required when SUPPORT denoising saturates the local-correlation image (Cn -> ~1, every pixel passes min_corr). Seeding forces single-FOV extraction (rf=None) because run_CNMF_patches/map_reduce.py have no Ain/seed_method parameter. Silent cells are KEPT and counted (estimates.census), not pruned. source: 'projection' (segment a Cn-free summary image with Cellpose-SAM) or 'label_file' (load masks from Cellpose GUI / suite2p / manual; path in label_file). nb should equal cnmf.gnb. Requires cellpose>=4 for source=projection.",
