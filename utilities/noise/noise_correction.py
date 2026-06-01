@@ -473,6 +473,59 @@ def regress_common_mode(stack: np.ndarray,
     return (out, c) if return_trace else out
 
 
+def detrend_temporal(stack: np.ndarray,
+                     order: int = 1,
+                     preserve_mean: bool = True,
+                     return_trend: bool = False
+                     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """Remove a slow per-pixel polynomial trend over time (default: linear).
+
+    Fits and subtracts an order-``order`` polynomial in time *independently
+    per pixel*.  The polynomial basis columns are mean-centred over time, so
+    the removal has zero temporal mean per pixel and the per-pixel baseline
+    is preserved (``preserve_mean=True``) — only the slope (and higher terms)
+    are taken out.  This targets the global brightness decay / photobleaching
+    ramp that survives denoising (SUPPORT preserves slow dynamics by design),
+    and which, left in, makes every pixel share one dominant slow component
+    and saturates the local-correlation image.
+
+    For ``order=1`` this is a straight linear detrend; raise to 2-3 to remove
+    a curved bleach decay while leaving fast calcium transients untouched.
+
+    Parameters
+    ----------
+    order : int
+        Polynomial order to remove (1 = linear).  Must be >= 1.
+    preserve_mean : bool
+        Keep each pixel's temporal mean (recommended — protects the F0 that
+        dF/F divides by).  If False, also remove the per-pixel mean.
+    return_trend : bool
+        If True, also return the removed ``(T, H, W)`` trend.
+
+    Returns the corrected ``(T, H, W)`` float32 stack (and trend if asked).
+    """
+    if order < 1:
+        raise ValueError(f"order must be >= 1, got {order}")
+    T, H, W = stack.shape
+    t = np.linspace(-1.0, 1.0, T, dtype=np.float64)
+    cols = []
+    for k in range(1, order + 1):
+        ck = t ** k
+        cols.append(ck - ck.mean())          # mean-centre → removal keeps F0
+    B = np.stack(cols, axis=1).astype(np.float32)        # (T, order)
+
+    flat = stack.reshape(T, H * W).astype(np.float32)
+    betas = np.linalg.solve(B.T @ B, B.T @ flat)         # (order, H*W)
+    trend = B @ betas                                    # (T, H*W), 0 mean / pixel
+    out = flat - trend
+    if not preserve_mean:
+        out = out - out.mean(axis=0, keepdims=True)
+    out = out.reshape(T, H, W)
+    if return_trend:
+        return out, trend.reshape(T, H, W)
+    return out
+
+
 # ============================================================================
 # 4. Temporal notch filter (per-pixel, chunked)
 # ============================================================================
