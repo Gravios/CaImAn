@@ -166,6 +166,7 @@ class CNMFRunner:
         self,
         images: np.ndarray,
         Yr: Optional[np.ndarray] = None,
+        seed: Optional[tuple] = None,
     ):
         """Construct a ``CNMF`` object and run the initial fit.
 
@@ -188,8 +189,31 @@ class CNMFRunner:
         """
         from caiman.source_extraction import cnmf as _cnmf_mod
 
-        cnm = _cnmf_mod.CNMF(self._n_processes,
-                              params=self._opts, dview=self._dview)
+        if seed is not None:
+            # ── Seeded single-FOV extraction ──────────────────────────────────
+            # Seeding is honoured ONLY on the single-FOV branch of cnmf.fit
+            # (rf is None).  run_CNMF_patches / map_reduce.py have no Ain or
+            # seed_method parameter, so in patch mode the seed is silently
+            # ignored and each patch re-runs greedy/corr_pnr init.  We therefore
+            # disable patches and run the full spatial/temporal update directly
+            # on the provided footprints (only_init=False; init is skipped
+            # because estimates.A is non-None).
+            Ain, Cin, b_in, f_in = seed
+            K = int(Ain.shape[1])
+            self._opts.set("patch", {"rf": None, "stride": None,
+                                     "only_init": False})
+            self._opts.set("preprocess", {"p": self._p})
+            self._opts.set("init", {"seed_method": "manual", "K": K})
+            logger.info(
+                f"CNMF seeded single-FOV: K={K} footprints "
+                f"(patches disabled — run_CNMF_patches ignores Ain)"
+            )
+            cnm = _cnmf_mod.CNMF(self._n_processes, params=self._opts,
+                                 dview=self._dview,
+                                 Ain=Ain, Cin=Cin, b_in=b_in, f_in=f_in)
+        else:
+            cnm = _cnmf_mod.CNMF(self._n_processes,
+                                 params=self._opts, dview=self._dview)
         cnm._forder_movie_path = self._fname_mc
 
         if Yr is not None:
@@ -288,6 +312,45 @@ class CNMFRunner:
         cnm2.estimates.select_components(use_object=True)
         logger.info(f"Selected {cnm2.estimates.A.shape[1]} components")
 
+    def select_census(self, cnm2) -> None:
+        """Census-mode selection: relabel active/inactive, prune nothing.
+
+        Unlike :meth:`select` (which discards rejected components), seeded
+        ROIs that fail component evaluation are *silent cells*, not false
+        positives — they are anatomically real by construction.  This method
+        keeps every component, records the active/inactive split on
+        ``estimates.census``, and leaves ``idx_components`` /
+        ``idx_components_bad`` in place as the active/inactive index sets.
+
+        ``estimates.census`` is a dict with ``n_total``, ``n_active``,
+        ``n_inactive`` and the corresponding index lists, consumed by the
+        pipeline report and available to downstream oscillation analysis
+        (inactive-cell and background traces carry slow hemodynamic / network
+        components).
+
+        Parameters
+        ----------
+        cnm2
+            Evaluated ``CNMF`` object (after :meth:`evaluate`).
+        """
+        e = cnm2.estimates
+        n_total = int(e.A.shape[1])
+        idx_acc = (list(e.idx_components)
+                   if e.idx_components is not None else list(range(n_total)))
+        idx_inact = (list(e.idx_components_bad)
+                     if e.idx_components_bad is not None else [])
+        e.census = {
+            "n_total":     n_total,
+            "n_active":    len(idx_acc),
+            "n_inactive":  len(idx_inact),
+            "idx_active":  idx_acc,
+            "idx_inactive": idx_inact,
+        }
+        logger.info(
+            f"Census: {n_total} ROIs = {len(idx_acc)} active + "
+            f"{len(idx_inact)} inactive (silent cells kept, not pruned)"
+        )
+
     def detrend_dff(self, cnm2) -> None:
         """Compute dF/F traces in-place.
 
@@ -352,6 +415,7 @@ class CNMFRunner:
         qc=None,
         Cn: Optional[np.ndarray] = None,
         timer=None,
+        seed: Optional[tuple] = None,
     ):
         """Run fit → refit → evaluate → select → dF/F → save in one call.
 
@@ -385,12 +449,19 @@ class CNMFRunner:
                     return fn()
             return fn()
 
-        cnm = _step("CNMF fit",    lambda: self.fit(images, Yr=Yr))
+        seeded = seed is not None
+
+        cnm = _step("CNMF fit", lambda: self.fit(images, Yr=Yr, seed=seed))
         if qc is not None:
             _step("QC: initial fit", lambda: qc.cnmf_fit(cnm, Cn))
 
-        cnm2 = _step("CNMF refit", lambda: self.refit(cnm, images))
-        del cnm
+        if seeded:
+            # The seeded single-FOV fit already ran the full spatial/temporal
+            # update, so there is no separate greedy-init pass to refit.
+            cnm2 = cnm
+        else:
+            cnm2 = _step("CNMF refit", lambda: self.refit(cnm, images))
+            del cnm
 
         n_acc, n_rej = _step("Component evaluation",
                              lambda: self.evaluate(cnm2, images))
@@ -401,7 +472,10 @@ class CNMFRunner:
                 qc.component_evaluation(cnm2, Cn),
             ))
 
-        self.select(cnm2)
+        if seeded:
+            self.select_census(cnm2)   # relabel; keep inactive (silent) cells
+        else:
+            self.select(cnm2)          # legacy: prune rejected components
         _step("dF/F computation",  lambda: self.detrend_dff(cnm2))
 
         if qc is not None:
