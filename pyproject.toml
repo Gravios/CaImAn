@@ -57,6 +57,10 @@ jupyter = [
   "pyqtgraph",
   "tk"
 ]
+seeding = [
+  "cellpose >= 4.0",
+  "imageio"
+]
 
 [build-system]
 requires = ["cython", "numpy", "setuptools", "wheel"]
