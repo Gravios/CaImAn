@@ -143,7 +143,7 @@
         "_comment": "Anatomical seeding for census-complete extraction. enabled=true detects cells on a summary projection (or loads an external label image) and seeds CNMF with them, BYPASSING corr_pnr/min_corr detection (degenerate on SUPPORT-denoised data). projection: use 'mean' for an ANATOMICAL census \u2014 it shows every soma by baseline GCaMP fluorescence, including silent cells. Do NOT use 'max_div_mean' for the census: it is suite2p's FUNCTIONAL input and highlights only active cells (it found just the 4 most active here), defeating the silent-cell count. nb is the number of global full-FOV background components for the seeded single-FOV fit \u2014 keep small (1-2); it is NOT the patch-mode gnb. Silent cells are kept and counted (estimates.census). source: 'projection' (Cellpose-SAM, needs cellpose>=4) or 'label_file' (Cellpose GUI/suite2p/manual masks).",
         "enabled": false,
         "source": "projection",
-        "projection": "mean",
+        "projection": "std",
         "label_file": null,
         "diameter": 15,
         "flow_threshold": 0.4,

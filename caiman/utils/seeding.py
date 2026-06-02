@@ -163,7 +163,14 @@ def masks_to_Ain(masks: ArrayLike,
     """
     footprints = list(_iter_masks(masks, dims))
     if not footprints:
-        raise ValueError("no masks found — empty label image?")
+        raise ValueError(
+            "no masks found — the segmenter returned an empty label image. "
+            "For low-baseline GCaMP the 'mean' projection has little soma "
+            "contrast (cells are bright only in individual active frames); "
+            "try seeding.projection='std' or 'max', lower "
+            "seeding.cellprob_threshold (e.g. -1.0), and inspect the saved "
+            "*_seed_projection.npy / *_seed_labels.npy to see what the "
+            "segmenter received.")
 
     d1, d2 = footprints[0].shape
     if dims is not None and tuple(dims) != (d1, d2):
