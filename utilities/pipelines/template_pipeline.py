@@ -487,15 +487,29 @@ if __name__ == "__main__":
             else:
                 _proj = _sd.summary_projection(
                     images,
-                    kind=str(getattr(_seed_cfg, "projection", "max_div_mean")))
+                    kind=str(getattr(_seed_cfg, "projection", "max_div_mean")),
+                    q=getattr(_seed_cfg, "percentile", 90.0))
                 np.save(str(outdir / f"{session}_seed_projection.npy"), _proj)
-                _lbl = _sd.segment_anatomical(
-                    _proj,
-                    diameter=getattr(_seed_cfg, "diameter", None),
-                    flow_threshold=float(getattr(_seed_cfg, "flow_threshold", 0.4)),
-                    cellprob_threshold=float(getattr(_seed_cfg,
-                                                     "cellprob_threshold", 0.0)),
-                    gpu=bool(getattr(_seed_cfg, "use_gpu", True)))
+                _segmenter = str(getattr(_seed_cfg, "segmenter", "cellpose"))
+                if _segmenter == "watershed":
+                    _lbl = _sd.segment_watershed(
+                        _proj,
+                        min_distance=int(getattr(_seed_cfg, "min_distance", 5)),
+                        threshold_rel=float(getattr(_seed_cfg,
+                                                    "threshold_rel", 0.2)),
+                        use_otsu=bool(getattr(_seed_cfg, "use_otsu", False)),
+                        smooth_sigma=float(getattr(_seed_cfg,
+                                                   "smooth_sigma", 1.0)),
+                        min_pixels=int(getattr(_seed_cfg, "min_pixels", 8)))
+                else:
+                    _lbl = _sd.segment_anatomical(
+                        _proj,
+                        diameter=getattr(_seed_cfg, "diameter", None),
+                        flow_threshold=float(getattr(_seed_cfg,
+                                                     "flow_threshold", 0.4)),
+                        cellprob_threshold=float(getattr(_seed_cfg,
+                                                         "cellprob_threshold", 0.0)),
+                        gpu=bool(getattr(_seed_cfg, "use_gpu", True)))
                 np.save(str(outdir / f"{session}_seed_labels.npy"), _lbl)
             _Ain = _sd.masks_to_Ain(
                 _lbl, dims=dims,
