@@ -47,7 +47,8 @@ ArrayLike = Union[np.ndarray, Sequence[np.ndarray]]
 # ── Summary projections ───────────────────────────────────────────────────────
 
 def summary_projection(images: np.ndarray, kind: str = "max_div_mean",
-                       eps: float = 1e-6) -> np.ndarray:
+                       eps: float = 1e-6,
+                       q: Union[float, Sequence[float]] = 90.0) -> np.ndarray:
     """Collapse a ``(T, d1, d2)`` movie to a 2-D image for segmentation.
 
     Parameters
@@ -74,6 +75,17 @@ def summary_projection(images: np.ndarray, kind: str = "max_div_mean",
 
     T = images.shape[0]
     chunk = max(1, min(T, 2000))
+
+    if kind == "percentile":
+        d1, d2 = images.shape[1:]
+        qq = list(q) if isinstance(q, (list, tuple, np.ndarray)) else [float(q)]
+        out = np.empty((d1, d2), dtype=np.float32)
+        rstep = max(1, int(5e8 // (T * d2 * 4)))   # ~0.5 GB per (T, rstep, d2) block
+        for r0 in range(0, d1, rstep):
+            blk = np.asarray(images[:, r0:r0 + rstep, :], dtype=np.float32)
+            pp = np.percentile(blk, qq, axis=0)         # (len(qq), rs, d2)
+            out[r0:r0 + rstep] = pp.mean(axis=0) if len(qq) > 1 else pp[0]
+        return out
 
     if kind in ("mean", "max_div_mean", "std"):
         acc = np.zeros(images.shape[1:], dtype=np.float64)
@@ -399,3 +411,77 @@ def segment_anatomical(projection: np.ndarray,
     n = int(masks.max())
     logger.info("segment_anatomical: Cellpose-SAM found %d cells", n)
     return np.asarray(masks).astype(np.int32)
+
+
+def segment_watershed(projection: np.ndarray,
+                      min_distance: int = 5,
+                      threshold_rel: float = 0.2,
+                      threshold_abs: Optional[float] = None,
+                      use_otsu: bool = False,
+                      smooth_sigma: float = 1.0,
+                      min_pixels: int = 8) -> np.ndarray:
+    """Segment somata from a 2-D projection by marker-controlled watershed.
+
+    A deterministic, model-free alternative to Cellpose-SAM: smooth, threshold
+    to a foreground mask, take local maxima as seeds, and flood the negative
+    intensity so each soma fills its own basin.  No GPU or downloaded weights,
+    and it does not silently return "0 cells" on modest contrast.  Pairs well
+    with a high-``percentile`` projection of the *motion-corrected* movie.
+
+    Parameters
+    ----------
+    min_distance
+        Minimum separation (px) between soma centres (~soma radius).
+    threshold_rel
+        Foreground cut as a fraction of the (5th-pct, max) span; lower admits
+        dimmer cells.
+    threshold_abs
+        Absolute foreground cut; overrides ``threshold_rel``.
+    use_otsu
+        Use Otsu's threshold for the foreground.
+    smooth_sigma
+        Gaussian pre-smoothing (px).
+    min_pixels
+        Drop basins smaller than this.
+    """
+    from scipy import ndimage as ndi
+    from skimage.feature import peak_local_max
+    from skimage.segmentation import watershed
+
+    img = np.asarray(projection, dtype=np.float32)
+    img_s = ndi.gaussian_filter(img, smooth_sigma) if smooth_sigma else img
+
+    if use_otsu:
+        from skimage.filters import threshold_otsu
+        thr = float(threshold_otsu(img_s))
+    elif threshold_abs is not None:
+        thr = float(threshold_abs)
+    else:
+        lo = float(np.percentile(img_s, 5))
+        thr = lo + float(threshold_rel) * (float(img_s.max()) - lo)
+
+    fg = img_s > thr
+    coords = peak_local_max(img_s, min_distance=int(min_distance),
+                            labels=fg, threshold_abs=thr)
+    if coords.shape[0] == 0:
+        logger.warning("segment_watershed: no maxima above threshold "
+                       "(thr=%.4g) — returning empty labels", thr)
+        return np.zeros(img.shape, dtype=np.int32)
+
+    markers = np.zeros(img_s.shape, dtype=np.int32)
+    markers[tuple(coords.T)] = np.arange(1, coords.shape[0] + 1)
+    labels = watershed(-img_s, markers, mask=fg)
+
+    counts = np.bincount(labels.ravel())
+    small = np.where(counts < min_pixels)[0]
+    small = small[small != 0]
+    if small.size:
+        labels[np.isin(labels, small)] = 0
+    uniq = np.unique(labels); uniq = uniq[uniq != 0]
+    remap = np.zeros(int(labels.max()) + 1, dtype=np.int32)
+    remap[uniq] = np.arange(1, uniq.size + 1)
+    labels = remap[labels]
+
+    logger.info("segment_watershed: %d cells (min_distance=%d, thr=%.4g)",
+                int(labels.max()), int(min_distance), thr)
+    return labels.astype(np.int32)
