@@ -270,22 +270,31 @@ def complete_seed(Ain: sparse.spmatrix, Yr: np.ndarray, nb: int = 2,
     chunk = max(1, min(T, 4000))
     AT = Ain.T  # (K, npix)
 
-    # Cin = Ain^T Yr, chunked over time.
+    # Per-pixel temporal mean (one chunked pass). Seeding must not depend on
+    # the movie's absolute DC: a detrended / sign-shifted movie can sit at a
+    # negative baseline, which makes a plain Ain^T @ Yr entirely negative and
+    # the non-negativity clip would zero every trace, dropping the seed as
+    # "empty". De-baselining per pixel captures activity above each pixel's
+    # own mean, so Cin reflects transients regardless of baseline sign.
+    mu = np.zeros(npix, dtype=np.float64)
+    for i in range(0, T, chunk):
+        mu += np.asarray(Yr[:, i:i + chunk], dtype=np.float64).sum(axis=1)
+    mu /= float(T)
+    AT_mu = np.asarray(AT @ mu.astype(dtype)).reshape(K)  # (K,) footprint baseline
+
+    # Cin = Ain^T (Yr - mu), chunked over time (mu folded in algebraically).
     Cin = np.empty((K, T), dtype=dtype)
     for i in range(0, T, chunk):
         Cin[:, i:i + chunk] = AT @ np.asarray(Yr[:, i:i + chunk], dtype=dtype)
+    Cin -= AT_mu[:, None]
     _cin_raw_min, _cin_raw_max = float(Cin.min()), float(Cin.max())
-    # Mean of Yr over the union of footprint pixels (sampled) — if this is ~0
-    # the movie is empty at the seeds (alignment/movie bug); if it is ~baseline
-    # but pre-clip Cin is <=0 the footprints carry no positive signal.
     _fp_pix = np.unique(Ain.indices)
-    _fp_sample = _fp_pix[:min(_fp_pix.size, 4096)]
-    _yr_fp_mean = float(np.asarray(Yr[_fp_sample, :], dtype=np.float64).mean()) \
-        if _fp_sample.size else float("nan")
-    np.clip(Cin, 0, None, out=Cin)
-    logger.info("complete_seed: pre-clip Cin range [%.4g, %.4g]; mean Yr over "
-                "%d footprint px = %.4g", _cin_raw_min, _cin_raw_max,
-                _fp_pix.size, _yr_fp_mean)
+    _yr_fp_mean = float(mu[_fp_pix].mean()) if _fp_pix.size else float("nan")
+    # Shift each row to start at 0 (non-negative trace, shape preserved).
+    Cin -= Cin.min(axis=1, keepdims=True)
+    logger.info("complete_seed: de-baselined Cin range [%.4g, %.4g]; mean Yr "
+                "over %d footprint px = %.4g (per-pixel mean removed)",
+                _cin_raw_min, _cin_raw_max, _fp_pix.size, _yr_fp_mean)
 
     # Residual on a temporal subsample → randomized-SVD spatial background basis.
     sub = np.linspace(0, T - 1, num=min(T, t_sub), dtype=int)
