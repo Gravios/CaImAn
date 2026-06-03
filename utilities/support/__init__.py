@@ -45,7 +45,7 @@ from .cli.paths import (
     resolve_checkpoint,
     resolve_input_paths,
 )
-from .cli.test import denoise_stack, load_model
+from .cli.test import denoise_array, denoise_mmap, denoise_stack, load_model
 from .network import SUPPORT as SUPPORTNet
 
 __all__ = [
@@ -54,6 +54,8 @@ __all__ = [
     "add_architecture_arguments",
     "checkpoint_path",
     "default_output_path",
+    "denoise_array",
+    "denoise_mmap",
     "denoise_stack",
     "experiment_dir",
     "find_checkpoints",
