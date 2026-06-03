@@ -61,6 +61,9 @@ seeding = [
   "cellpose >= 4.0",
   "imageio"
 ]
+support = [
+  "tensorboard"
+]
 
 [build-system]
 requires = ["cython", "numpy", "setuptools", "wheel"]

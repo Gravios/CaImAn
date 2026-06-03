@@ -276,6 +276,90 @@ if __name__ == "__main__":
 
         qc_xcorr()
 
+    # ── 1d. SUPPORT denoising ─────────────────────────────────────────────────
+    # Self-supervised spatio-temporal denoising via utilities/support
+    # (vendored from NICALab/SUPPORT, restructured CLI + ModelConfig sidecar).
+    # Runs AFTER noise_correction + xcorr but BEFORE motion correction so
+    # that MC sees denoised frames (better registration on low-SNR data).
+    #
+    # Stages 4b (temporal_detrend) and 5 (anatomical seeding) downstream
+    # were designed assuming this step ran: SUPPORT preserves the slow
+    # photobleach ramp (4b removes it), and saturates the local-
+    # correlation image so that corr_pnr-based seeding is degenerate
+    # (5 falls back to Cellpose anatomical seeding).
+    #
+    # Memory: SUPPORT loads the whole TIFF into RAM as float32 (~4× the
+    # uint16 file size). For 18540×512×512 that is 18.5 GB. Fine on
+    # g294-z21 (755 GB) but a real constraint for larger 3D recordings.
+    #
+    # Skipped entirely (no file rewrite) when disabled; safe to leave
+    # enabled across sessions that share a scope+gain configuration if a
+    # checkpoint is available for that configuration.
+    _sp_cfg = getattr(_P, "support", None)
+    _sp_enable = bool(getattr(_sp_cfg, "enabled", False)) if _sp_cfg else False
+
+    if _sp_enable:
+        @timer.step("SUPPORT denoise")
+        def run_support_denoise():
+            global fnames
+            from utilities.support import (denoise_stack, load_model,
+                                            ModelConfig, resolve_checkpoint,
+                                            default_output_path)
+            import torch as _torch
+
+            _sp_cp = resolve_checkpoint(
+                checkpoint=getattr(_sp_cfg, "checkpoint", None),
+                results_dir=getattr(_sp_cfg, "results_dir", None),
+                exp_name=getattr(_sp_cfg, "exp_name", None),
+                epoch=getattr(_sp_cfg, "epoch", None),
+            )
+            logger.info(f"SUPPORT checkpoint: {_sp_cp}")
+
+            _sp_arch = ModelConfig.load_for_checkpoint(_sp_cp)
+            if _sp_arch is None:
+                logger.info(
+                    "SUPPORT: no sidecar JSON; using default architecture "
+                    "(matches shipped bs3.pth)")
+                _sp_arch = ModelConfig()
+            else:
+                logger.info(
+                    f"SUPPORT: loaded sidecar — exp_name={_sp_arch.exp_name} "
+                    f"epoch={_sp_arch.epoch}")
+
+            _sp_cuda = _torch.cuda.is_available()
+            _sp_model = load_model(_sp_cp, _sp_arch, use_cuda=_sp_cuda)
+
+            _sp_patch_size = list(getattr(_sp_cfg, "patch_size", None)
+                                    or _sp_arch.patch_size)
+            _sp_patch_interval = list(getattr(_sp_cfg, "patch_interval",
+                                               [1, 32, 32]))
+            _sp_batch = int(getattr(_sp_cfg, "batch_size", 8))
+            _sp_edges = str(getattr(_sp_cfg, "include_edges", "none"))
+
+            _sp_out = default_output_path(Path(fnames),
+                                           suffix="SUPPORTdenoised")
+            denoise_stack(
+                Path(fnames), _sp_out, _sp_model,
+                patch_size=_sp_patch_size,
+                patch_interval=_sp_patch_interval,
+                batch_size=_sp_batch,
+                include_edges=_sp_edges,
+            )
+            fnames = str(_sp_out)
+            logger.info(f"SUPPORT denoise done: {Path(fnames).name}")
+
+            # Release CUDA memory before motion correction (which uses
+            # CuPy, not PyTorch — they must not contend simultaneously
+            # for the same VRAM in the next stage).
+            del _sp_model
+            _torch.cuda.empty_cache()
+            try:
+                cupy_flush()
+            except Exception as _e:
+                logger.debug(f"cupy_flush after SUPPORT: {_e}")
+
+        run_support_denoise()
+
     # mc_stem: stem of the TIFF actually fed into motion correction.
     # When xcorr correction is enabled this is e.g. "session_Xcorrected";
     # otherwise it is the bare session name.  All downstream glob patterns

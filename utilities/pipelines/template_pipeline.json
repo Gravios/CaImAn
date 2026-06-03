@@ -1,162 +1,184 @@
 {
-    "_comment": "CaImAn pipeline template. Copy alongside <session>_pipeline.py and rename both. The session name is derived from the script filename \u2014 do not add session_id here.",
-    "env": {
-        "_comment": "Applied before any caiman import. CAIMAN_* vars are forced; thread counts use setdefault so shell values take precedence. Note: CAIMAN_TILE_N and CAIMAN_TILE_SLOTS are recomputed at runtime when running in SHM mode (template_pipeline.py L322-324), so any value set here is only consulted during bootstrap.",
-        "CAIMAN_TILE_SLOTS": "3",
-        "CAIMAN_DATA": "/data/caiman",
-        "CAIMAN_TEMP": "/data/caiman/temp",
-        "CAIMAN_SHM": "/dev/shm",
-        "MKL_NUM_THREADS": "1",
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "MPLBACKEND": "Agg",
-        "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
-        "CUPY_ACCELERATORS": "",
-        "KERAS_BACKEND": "numpy"
-    },
-    "data": {
-        "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f\u22480.4, GCaMP6s\u22481.0). dxy: pixel size in microns [row, col] - forwarded into CNMFParams.data; set per-objective. add_baseline: constant added to all pixels during F\u2192C conversion to keep values >0 for stable dF/F. n_channels / n_planes: propagated from acquisition YAML by new_session.py. channel_id: 0-based index of the channel this pipeline analyses (set per-channel when n_channels > 1).",
-        "fr": 30,
-        "decay_time": 1.0,
-        "dxy": [
-            1.0,
-            1.0
-        ],
-        "add_baseline": 100.0,
-        "n_channels": 1,
-        "channel_id": 0,
-        "n_planes": 1
-    },
-    "motion_correction": {
-        "_comment": "pw_rigid: piecewise-rigid MC (false=rigid, recommended for most 2P). max_shifts: [row, col] px. border_nan: 'copy' replicates border pixels; 'min' fills with movie minimum.",
-        "max_shifts": [
-            6,
-            6
-        ],
-        "strides": [
-            64,
-            64
-        ],
-        "overlaps": [
-            32,
-            32
-        ],
-        "max_deviation_rigid": 3,
-        "pw_rigid": false,
-        "shifts_opencv": true,
-        "border_nan": "copy"
-    },
-    "cnmf": {
-        "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor \u00d7 gSiz[0] must be < rf.",
-        "_comment_derived": "WARNING: nb_patch, del_duplicates, and normalize_init values declared here are IGNORED by build_cnmf_opts when method_init=corr_pnr. nb_patch is forced to 0; del_duplicates is forced to (gnb==0); normalize_init is forced to False. They are kept in the template for visibility only.",
-        "_comment_seeding": "SEEDING SEMANTICS (corr_pnr init): (a) K MUST be an explicit integer per patch. K=null falls back to caiman/source_extraction/cnmf/initialization.py:1846 max_number = patch_pixels/5, which is hundreds of components per patch and paves the FOV with noise fits. Use caiman.utils.params_estimator.estimate_params for a data-driven K. (b) min_pnr is INTERNALLY RESCALED by sqrt(tsub) inside greedyROI_corr (initialization.py:1282). Setting min_pnr=6.0 with tsub=2 means the seeding gate uses min_pnr=6.0*sqrt(2)\u22488.49 internally. (c) The actual seeding gate is the PRODUCT min_corr*min_pnr (initialization.py:1861 min_v_search = min_corr*min_pnr). Both individual thresholds AND the product matter \u2014 setting one tight and the other loose does not behave like setting one of them at the product value.",
-        "p": 1,
-        "gnb": 2,
-        "merge_thr": 0.85,
-        "rf": 20,
-        "stride": 10,
-        "K": 15,
-        "gSig": [
-            4,
-            4
-        ],
-        "gSiz": [
-            17,
-            17
-        ],
-        "ring_size_factor": 0.9,
-        "min_corr": 0.4,
-        "min_pnr": 6.0,
-        "ssub": 1,
-        "tsub": 2,
-        "method_init": "corr_pnr",
-        "method_deconv": "oasis",
-        "method_ls": "lasso_lars",
-        "dff_quantile_min": 8,
-        "dff_frames_window": 500,
-        "nb_patch": 0,
-        "del_duplicates": false,
-        "normalize_init": false,
-        "maxthr": 0.1,
-        "extract_cc": true,
-        "bas_nonneg": true,
-        "rolling_sum": true,
-        "ssub_B": 2
-    },
-    "quality": {
-        "_comment": "Components must pass all enabled criteria. use_cnn is auto-disabled if model files are missing. *_lowest fields are the hard-reject floors (a component below SNR_lowest, rval_lowest, or cnn_lowest is unconditionally rejected, even if it passes the upper thresholds).",
-        "min_SNR": 1.5,
-        "SNR_lowest": 0.5,
-        "rval_thr": 0.6,
-        "rval_lowest": -1.0,
-        "use_cnn": true,
-        "min_cnn_thr": 0.6,
-        "cnn_lowest": 0.1
-    },
-    "cluster": {
-        "_comment": "n_processes: null=auto (all CPUs). Reduce ram_budget_frac if workers OOM. Lower worker_overhead_frac if actual worker RAM < estimated. worker_overhead_frac: multiplier on analytical RAM estimate per worker (default 1.6). Lower to allow more workers when empirical RSS < estimate. ram_budget_frac: fraction of total RAM available for workers after reserving movie+parent.",
-        "n_processes": 128,
-        "ram_budget_frac": 0.95,
-        "worker_overhead_frac": 1.1,
-        "blas_threads_per_worker": 1
-    },
-    "gpu": {
-        "_comment": "precompute_chunk_frames: frames per GPU filter chunk. Peak VRAM \u2248 2 \u00d7 frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes. Reduce if GPU OOM during precompute.",
-        "precompute_chunk_frames": 500,
-        "mc_batch_size": null,
-        "_comment_mc": "mc_batch_size: GPU frames per MC batch. null = auto (uses 85% of free VRAM). Set an int to cap (e.g. 2000 for 16 GB GPUs)."
-    },
-    "noise_correction": {
-        "_comment": "Streaming noise correction via utilities/noise. Runs the noise diagnostic on the raw stack, builds a recipe from flagged sources at or above min_level, applies via streaming wrapper (peak RAM ~ chunk_frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes). Skipped if the diagnostic finds nothing actionable, so safe to leave enabled. Writes <session>_Ncorrected.tif used for all downstream steps. Runs BEFORE xcorr_correction.",
-        "enabled": false,
-        "min_level": "moderate",
-        "chunk_frames": 500,
-        "out_dtype": "same",
-        "diagnostic_n_frames": 3000,
-        "diagnostic_sampling_mode": "contiguous"
-    },
-    "xcorr_correction": {
-        "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",
-        "enabled": false,
-        "max_shift": 16,
-        "n_frames": 500,
-        "use_gpu": true
-    },
-    "oscillation": {
-        "_comment": "Multitaper (DPSS) oscillation analysis run after CNMF on the accepted component traces and neuropil background. enabled=true runs OscillationAnalyzer.run_all and saves a QC figure. NW: DPSS time-bandwidth product (2=fine resolution, 4=low variance). win_s: spectrogram window length in seconds (Delta_f ~ 2*NW/win_s). overlap_s: window overlap in seconds; null = win_s/2 (50%). adaptive: use adaptive taper weighting (recommended). use_gpu: accelerate via CuPy when available.",
-        "enabled": true,
-        "NW": 4.0,
-        "win_s": 4.0,
-        "overlap_s": null,
-        "adaptive": true,
-        "use_gpu": true
-    },
-    "detrend": {
-        "_comment": "Per-pixel polynomial temporal detrend applied to the movie before Cn/CNMF. Removes the slow brightness-decay ramp (photobleaching) that SUPPORT preserves; also de-saturates the local-correlation image. order=1 linear; 2-3 for curved bleach decay. preserve_mean keeps F0 so dF/F stays stable. use_gpu runs the regression via CuPy (two matmuls + tiny solve per pixel-chunk) with NumPy fallback. Written back to the C-order mmap; fast transients are untouched.",
-        "enabled": false,
-        "order": 1,
-        "preserve_mean": true,
-        "use_gpu": true
-    },
-    "seeding": {
-        "_comment": "Anatomical seeding for census-complete extraction. Detection runs AFTER motion correction (registered frames \u2014 unregistered movies smear somata and ruin the projection). segmenter: 'watershed' (deterministic, model-free skimage; no GPU/weights; tune via min_distance/threshold_rel/smooth_sigma) or 'cellpose' (Cellpose-SAM, needs cellpose>=4). projection: 'percentile' (recommended for low-baseline GCaMP; set percentile=90 or a list like [80,90,95] averaged), or 'std'/'max'/'mean'/'max_div_mean' (mean has little soma contrast here). nb = global full-FOV background for the seeded single-FOV fit (1-2). Seeding BYPASSES corr_pnr/min_corr. Truly-silent cells are invisible to any functional projection \u2014 a complete inactive-cell census needs a structural channel. Inspect *_seed_projection.npy / *_seed_labels.npy.",
-        "enabled": false,
-        "source": "projection",
-        "segmenter": "peaks",
-        "projection": "percentile",
-        "percentile": 90,
-        "label_file": null,
-        "min_distance": 5,
-        "radius": 4,
-        "threshold_rel": 0.2,
-        "smooth_sigma": 1.0,
-        "use_otsu": false,
-        "diameter": 15,
-        "flow_threshold": 0.4,
-        "cellprob_threshold": 0.0,
-        "min_pixels": 8,
-        "nb": 2,
-        "use_gpu": true
-    }
+  "_comment": "CaImAn pipeline template. Copy alongside <session>_pipeline.py and rename both. The session name is derived from the script filename \u2014 do not add session_id here.",
+  "env": {
+    "_comment": "Applied before any caiman import. CAIMAN_* vars are forced; thread counts use setdefault so shell values take precedence. Note: CAIMAN_TILE_N and CAIMAN_TILE_SLOTS are recomputed at runtime when running in SHM mode (template_pipeline.py L322-324), so any value set here is only consulted during bootstrap.",
+    "CAIMAN_TILE_SLOTS": "3",
+    "CAIMAN_DATA": "/data/caiman",
+    "CAIMAN_TEMP": "/data/caiman/temp",
+    "CAIMAN_SHM": "/dev/shm",
+    "MKL_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "MPLBACKEND": "Agg",
+    "PYTORCH_NO_CUDA_MEMORY_CACHING": "1",
+    "CUPY_ACCELERATORS": "",
+    "KERAS_BACKEND": "numpy"
+  },
+  "data": {
+    "_comment": "fr: acquisition frame rate [Hz]. decay_time: GCaMP decay constant [s] (GCaMP6f\u22480.4, GCaMP6s\u22481.0). dxy: pixel size in microns [row, col] - forwarded into CNMFParams.data; set per-objective. add_baseline: constant added to all pixels during F\u2192C conversion to keep values >0 for stable dF/F. n_channels / n_planes: propagated from acquisition YAML by new_session.py. channel_id: 0-based index of the channel this pipeline analyses (set per-channel when n_channels > 1).",
+    "fr": 30,
+    "decay_time": 1.0,
+    "dxy": [
+      1.0,
+      1.0
+    ],
+    "add_baseline": 100.0,
+    "n_channels": 1,
+    "channel_id": 0,
+    "n_planes": 1
+  },
+  "motion_correction": {
+    "_comment": "pw_rigid: piecewise-rigid MC (false=rigid, recommended for most 2P). max_shifts: [row, col] px. border_nan: 'copy' replicates border pixels; 'min' fills with movie minimum.",
+    "max_shifts": [
+      6,
+      6
+    ],
+    "strides": [
+      64,
+      64
+    ],
+    "overlaps": [
+      32,
+      32
+    ],
+    "max_deviation_rigid": 3,
+    "pw_rigid": false,
+    "shifts_opencv": true,
+    "border_nan": "copy"
+  },
+  "cnmf": {
+    "_comment": "See docs/configuration.md for full parameter descriptions. Ring constraint: ring_size_factor \u00d7 gSiz[0] must be < rf.",
+    "_comment_derived": "WARNING: nb_patch, del_duplicates, and normalize_init values declared here are IGNORED by build_cnmf_opts when method_init=corr_pnr. nb_patch is forced to 0; del_duplicates is forced to (gnb==0); normalize_init is forced to False. They are kept in the template for visibility only.",
+    "_comment_seeding": "SEEDING SEMANTICS (corr_pnr init): (a) K MUST be an explicit integer per patch. K=null falls back to caiman/source_extraction/cnmf/initialization.py:1846 max_number = patch_pixels/5, which is hundreds of components per patch and paves the FOV with noise fits. Use caiman.utils.params_estimator.estimate_params for a data-driven K. (b) min_pnr is INTERNALLY RESCALED by sqrt(tsub) inside greedyROI_corr (initialization.py:1282). Setting min_pnr=6.0 with tsub=2 means the seeding gate uses min_pnr=6.0*sqrt(2)\u22488.49 internally. (c) The actual seeding gate is the PRODUCT min_corr*min_pnr (initialization.py:1861 min_v_search = min_corr*min_pnr). Both individual thresholds AND the product matter \u2014 setting one tight and the other loose does not behave like setting one of them at the product value.",
+    "p": 1,
+    "gnb": 2,
+    "merge_thr": 0.85,
+    "rf": 20,
+    "stride": 10,
+    "K": 15,
+    "gSig": [
+      4,
+      4
+    ],
+    "gSiz": [
+      17,
+      17
+    ],
+    "ring_size_factor": 0.9,
+    "min_corr": 0.4,
+    "min_pnr": 6.0,
+    "ssub": 1,
+    "tsub": 2,
+    "method_init": "corr_pnr",
+    "method_deconv": "oasis",
+    "method_ls": "lasso_lars",
+    "dff_quantile_min": 8,
+    "dff_frames_window": 500,
+    "nb_patch": 0,
+    "del_duplicates": false,
+    "normalize_init": false,
+    "maxthr": 0.1,
+    "extract_cc": true,
+    "bas_nonneg": true,
+    "rolling_sum": true,
+    "ssub_B": 2
+  },
+  "quality": {
+    "_comment": "Components must pass all enabled criteria. use_cnn is auto-disabled if model files are missing. *_lowest fields are the hard-reject floors (a component below SNR_lowest, rval_lowest, or cnn_lowest is unconditionally rejected, even if it passes the upper thresholds).",
+    "min_SNR": 1.5,
+    "SNR_lowest": 0.5,
+    "rval_thr": 0.6,
+    "rval_lowest": -1.0,
+    "use_cnn": true,
+    "min_cnn_thr": 0.6,
+    "cnn_lowest": 0.1
+  },
+  "cluster": {
+    "_comment": "n_processes: null=auto (all CPUs). Reduce ram_budget_frac if workers OOM. Lower worker_overhead_frac if actual worker RAM < estimated. worker_overhead_frac: multiplier on analytical RAM estimate per worker (default 1.6). Lower to allow more workers when empirical RSS < estimate. ram_budget_frac: fraction of total RAM available for workers after reserving movie+parent.",
+    "n_processes": 128,
+    "ram_budget_frac": 0.95,
+    "worker_overhead_frac": 1.1,
+    "blas_threads_per_worker": 1
+  },
+  "gpu": {
+    "_comment": "precompute_chunk_frames: frames per GPU filter chunk. Peak VRAM \u2248 2 \u00d7 frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes. Reduce if GPU OOM during precompute.",
+    "precompute_chunk_frames": 500,
+    "mc_batch_size": null,
+    "_comment_mc": "mc_batch_size: GPU frames per MC batch. null = auto (uses 85% of free VRAM). Set an int to cap (e.g. 2000 for 16 GB GPUs)."
+  },
+  "noise_correction": {
+    "_comment": "Streaming noise correction via utilities/noise. Runs the noise diagnostic on the raw stack, builds a recipe from flagged sources at or above min_level, applies via streaming wrapper (peak RAM ~ chunk_frames \u00d7 d1 \u00d7 d2 \u00d7 4 bytes). Skipped if the diagnostic finds nothing actionable, so safe to leave enabled. Writes <session>_Ncorrected.tif used for all downstream steps. Runs BEFORE xcorr_correction.",
+    "enabled": false,
+    "min_level": "moderate",
+    "chunk_frames": 500,
+    "out_dtype": "same",
+    "diagnostic_n_frames": 3000,
+    "diagnostic_sampling_mode": "contiguous"
+  },
+  "support": {
+    "_comment": "SUPPORT self-supervised denoising (utilities/support, vendored from NICALab/SUPPORT). Runs AFTER noise_correction + xcorr_correction and BEFORE motion correction. Loads the full TIFF into RAM as float32 (~4 bytes per pixel-frame). Requires a pre-trained checkpoint; train via `python -m utilities.support train ...` once per scope+gain configuration, then point all pipelines at that checkpoint. Writes <session>_SUPPORTdenoised.tif. Subsequent stages 4b (temporal_detrend) and 5 (anatomical seeding) were designed assuming this stage runs \u2014 Cn saturates without temporal detrend, and corr_pnr-based seeding is degenerate on denoised data.",
+    "enabled": false,
+    "checkpoint": "utilities/support/trained_models/bs3.pth",
+    "exp_name": null,
+    "results_dir": null,
+    "epoch": null,
+    "patch_size": [
+      61,
+      64,
+      64
+    ],
+    "patch_interval": [
+      1,
+      32,
+      32
+    ],
+    "batch_size": 8,
+    "include_edges": "none",
+    "_comment_paths": "Two ways to specify the model. Either set `checkpoint` to a .pth path (sidecar JSON next to it gives the architecture automatically; for shipped pretrained models without a sidecar, the architecture defaults match the shipped bs3.pth). Or set `exp_name` + `results_dir` to look up the latest checkpoint from a training run; set `epoch` to pin a specific epoch.",
+    "_comment_edges": "include_edges='none' drops (input_frames-1)//2 frames at each end of the stack (60 frames at the default in_channels=61). Use 'mirror' to preserve original stack length via mirror-padded extrapolation; use 'repeat' for edge-frame replication. 'mirror' requires the stack to be at least pad+1 frames long."
+  },
+  "xcorr_correction": {
+    "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",
+    "enabled": false,
+    "max_shift": 16,
+    "n_frames": 500,
+    "use_gpu": true
+  },
+  "oscillation": {
+    "_comment": "Multitaper (DPSS) oscillation analysis run after CNMF on the accepted component traces and neuropil background. enabled=true runs OscillationAnalyzer.run_all and saves a QC figure. NW: DPSS time-bandwidth product (2=fine resolution, 4=low variance). win_s: spectrogram window length in seconds (Delta_f ~ 2*NW/win_s). overlap_s: window overlap in seconds; null = win_s/2 (50%). adaptive: use adaptive taper weighting (recommended). use_gpu: accelerate via CuPy when available.",
+    "enabled": true,
+    "NW": 4.0,
+    "win_s": 4.0,
+    "overlap_s": null,
+    "adaptive": true,
+    "use_gpu": true
+  },
+  "detrend": {
+    "_comment": "Per-pixel polynomial temporal detrend applied to the movie before Cn/CNMF. Removes the slow brightness-decay ramp (photobleaching) that SUPPORT preserves; also de-saturates the local-correlation image. order=1 linear; 2-3 for curved bleach decay. preserve_mean keeps F0 so dF/F stays stable. use_gpu runs the regression via CuPy (two matmuls + tiny solve per pixel-chunk) with NumPy fallback. Written back to the C-order mmap; fast transients are untouched.",
+    "enabled": false,
+    "order": 1,
+    "preserve_mean": true,
+    "use_gpu": true
+  },
+  "seeding": {
+    "_comment": "Anatomical seeding for census-complete extraction. Detection runs AFTER motion correction (registered frames \u2014 unregistered movies smear somata and ruin the projection). segmenter: 'watershed' (deterministic, model-free skimage; no GPU/weights; tune via min_distance/threshold_rel/smooth_sigma) or 'cellpose' (Cellpose-SAM, needs cellpose>=4). projection: 'percentile' (recommended for low-baseline GCaMP; set percentile=90 or a list like [80,90,95] averaged), or 'std'/'max'/'mean'/'max_div_mean' (mean has little soma contrast here). nb = global full-FOV background for the seeded single-FOV fit (1-2). Seeding BYPASSES corr_pnr/min_corr. Truly-silent cells are invisible to any functional projection \u2014 a complete inactive-cell census needs a structural channel. Inspect *_seed_projection.npy / *_seed_labels.npy.",
+    "enabled": false,
+    "source": "projection",
+    "segmenter": "peaks",
+    "projection": "percentile",
+    "percentile": 90,
+    "label_file": null,
+    "min_distance": 5,
+    "radius": 4,
+    "threshold_rel": 0.2,
+    "smooth_sigma": 1.0,
+    "use_otsu": false,
+    "diameter": 15,
+    "flow_threshold": 0.4,
+    "cellprob_threshold": 0.0,
+    "min_pixels": 8,
+    "nb": 2,
+    "use_gpu": true
+  }
 }
