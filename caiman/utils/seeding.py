@@ -471,7 +471,7 @@ def segment_watershed(projection: np.ndarray,
 
     fg = img_s > thr
     coords = peak_local_max(img_s, min_distance=int(min_distance),
-                            labels=fg, threshold_abs=thr)
+                            labels=fg, threshold_abs=thr, exclude_border=False)
     if coords.shape[0] == 0:
         logger.warning("segment_watershed: no maxima above threshold "
                        "(thr=%.4g) — returning empty labels", thr)
@@ -493,4 +493,84 @@ def segment_watershed(projection: np.ndarray,
 
     logger.info("segment_watershed: %d cells (min_distance=%d, thr=%.4g)",
                 int(labels.max()), int(min_distance), thr)
+    return labels.astype(np.int32)
+
+
+def segment_peaks(projection: np.ndarray,
+                  min_distance: int = 5,
+                  radius: int = 4,
+                  threshold_rel: float = 0.2,
+                  threshold_abs: Optional[float] = None,
+                  use_otsu: bool = False,
+                  smooth_sigma: float = 1.0,
+                  min_pixels: int = 8) -> np.ndarray:
+    """Seed compact disks at local maxima — clean per-cell seeds for CNMF.
+
+    Unlike :func:`segment_watershed`, which floods *all* bright foreground and
+    so carves the bright neuropil between somata into spurious basins, this
+    only seeds a small ``radius``-px neighbourhood around each detected peak.
+    Bright background that is not a local maximum is never partitioned, so the
+    seed set is close to one-disk-per-soma; CNMF then refines each footprint's
+    true shape in ``update_spatial``. This keeps the active/inactive census
+    honest — spurious neuropil tiles would otherwise inflate the inactive count.
+
+    Parameters
+    ----------
+    min_distance
+        Minimum separation (px) between soma centres.
+    radius
+        Seed-disk radius (px); set near ``gSig`` (the expected soma half-size).
+        Overlapping disks from nearby peaks are split along the intensity ridge.
+    threshold_rel / threshold_abs / use_otsu
+        Peak-admission floor, as in :func:`segment_watershed`.
+    smooth_sigma
+        Gaussian pre-smoothing (px) before peak finding.
+    min_pixels
+        Drop seeds smaller than this after splitting.
+    """
+    from scipy import ndimage as ndi
+    from skimage.feature import peak_local_max
+    from skimage.segmentation import watershed
+    from skimage.morphology import disk
+
+    img = np.asarray(projection, dtype=np.float32)
+    img_s = ndi.gaussian_filter(img, smooth_sigma) if smooth_sigma else img
+
+    if use_otsu:
+        from skimage.filters import threshold_otsu
+        thr = float(threshold_otsu(img_s))
+    elif threshold_abs is not None:
+        thr = float(threshold_abs)
+    else:
+        lo = float(np.percentile(img_s, 5))
+        thr = lo + float(threshold_rel) * (float(img_s.max()) - lo)
+
+    coords = peak_local_max(img_s, min_distance=int(min_distance),
+                            threshold_abs=thr, exclude_border=False)
+    if coords.shape[0] == 0:
+        logger.warning("segment_peaks: no maxima above threshold (thr=%.4g) "
+                       "— returning empty labels", thr)
+        return np.zeros(img.shape, dtype=np.int32)
+
+    markers = np.zeros(img_s.shape, dtype=np.int32)
+    markers[tuple(coords.T)] = np.arange(1, coords.shape[0] + 1)
+    # Foreground = union of radius-px disks around peaks ONLY (not all bright
+    # pixels), so neuropil between somata is excluded from the seed regions.
+    peak_mask = np.zeros(img_s.shape, dtype=bool)
+    peak_mask[tuple(coords.T)] = True
+    fg = ndi.binary_dilation(peak_mask, structure=disk(int(radius)))
+    labels = watershed(-img_s, markers, mask=fg)
+
+    counts = np.bincount(labels.ravel())
+    small = np.where(counts < min_pixels)[0]
+    small = small[small != 0]
+    if small.size:
+        labels[np.isin(labels, small)] = 0
+    uniq = np.unique(labels); uniq = uniq[uniq != 0]
+    remap = np.zeros(int(labels.max()) + 1, dtype=np.int32)
+    remap[uniq] = np.arange(1, uniq.size + 1)
+    labels = remap[labels]
+
+    logger.info("segment_peaks: %d cells (min_distance=%d, radius=%d, thr=%.4g)",
+                int(labels.max()), int(min_distance), int(radius), thr)
     return labels.astype(np.int32)
