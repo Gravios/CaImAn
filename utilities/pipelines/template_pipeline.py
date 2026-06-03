@@ -501,6 +501,17 @@ if __name__ == "__main__":
                         smooth_sigma=float(getattr(_seed_cfg,
                                                    "smooth_sigma", 1.0)),
                         min_pixels=int(getattr(_seed_cfg, "min_pixels", 8)))
+                elif _segmenter == "peaks":
+                    _lbl = _sd.segment_peaks(
+                        _proj,
+                        min_distance=int(getattr(_seed_cfg, "min_distance", 5)),
+                        radius=int(getattr(_seed_cfg, "radius", 4)),
+                        threshold_rel=float(getattr(_seed_cfg,
+                                                    "threshold_rel", 0.2)),
+                        use_otsu=bool(getattr(_seed_cfg, "use_otsu", False)),
+                        smooth_sigma=float(getattr(_seed_cfg,
+                                                   "smooth_sigma", 1.0)),
+                        min_pixels=int(getattr(_seed_cfg, "min_pixels", 8)))
                 else:
                     _lbl = _sd.segment_anatomical(
                         _proj,
