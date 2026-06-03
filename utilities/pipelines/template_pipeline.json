@@ -117,7 +117,7 @@
     "diagnostic_sampling_mode": "contiguous"
   },
   "support": {
-    "_comment": "SUPPORT self-supervised denoising (utilities/support, vendored from NICALab/SUPPORT). Runs AFTER noise_correction + xcorr_correction and BEFORE motion correction. Loads the full TIFF into RAM as float32 (~4 bytes per pixel-frame). Requires a pre-trained checkpoint; train via `python -m utilities.support train ...` once per scope+gain configuration, then point all pipelines at that checkpoint. Writes <session>_SUPPORTdenoised.tif. Subsequent stages 4b (temporal_detrend) and 5 (anatomical seeding) were designed assuming this stage runs \u2014 Cn saturates without temporal detrend, and corr_pnr-based seeding is degenerate on denoised data.",
+    "_comment": "SUPPORT self-supervised denoising (utilities/support, vendored from NICALab/SUPPORT). Operates on the C-order mmap produced by stage 3 (F\u2192C conversion), so this stage works uniformly for both MSR-source and TIFF-source pipelines \u2014 the mmap is the canonical internal format past stage 3. Writes a new C-order mmap with '_SUPPORTdenoised' in the name; Yr/images are rebound to it for every downstream stage (4b detrend, 4c SHM, 5 seeding, 6 CNMF, 7 oscillation). Stages 4b and 5 were specifically designed assuming this step ran: SUPPORT preserves the photobleach ramp (4b detrends it) and saturates the Cn image (5 falls back to anatomical seeding). Requires a pre-trained checkpoint; train via 'python -m utilities.support train ...' once per scope+gain configuration, then point all sessions at the same checkpoint. Memory: copies the mmap into a contiguous RAM buffer of ~4\u00b7n_px\u00b7T bytes (~19 GB for 18540\u00d7512\u00d7512 float32) for efficient patch sampling.",
     "enabled": false,
     "checkpoint": "utilities/support/trained_models/bs3.pth",
     "exp_name": null,
@@ -134,9 +134,10 @@
       32
     ],
     "batch_size": 8,
-    "include_edges": "none",
-    "_comment_paths": "Two ways to specify the model. Either set `checkpoint` to a .pth path (sidecar JSON next to it gives the architecture automatically; for shipped pretrained models without a sidecar, the architecture defaults match the shipped bs3.pth). Or set `exp_name` + `results_dir` to look up the latest checkpoint from a training run; set `epoch` to pin a specific epoch.",
-    "_comment_edges": "include_edges='none' drops (input_frames-1)//2 frames at each end of the stack (60 frames at the default in_channels=61). Use 'mirror' to preserve original stack length via mirror-padded extrapolation; use 'repeat' for edge-frame replication. 'mirror' requires the stack to be at least pad+1 frames long."
+    "include_edges": "mirror",
+    "_comment_paths": "Model lookup: either set `checkpoint` to a .pth path (sidecar JSON next to it gives the architecture automatically; shipped pretrained models without a sidecar fall back to the default architecture matching bs3.pth), OR set `exp_name` + `results_dir` to auto-find the latest checkpoint of a training run (pin a specific epoch with `epoch`).",
+    "_comment_edges": "include_edges='mirror' (default): the (input_frames-1)//2 frames at each stack end are extrapolated via mirror padding so the output mmap preserves the input T (drop-in compatible with the rest of the pipeline). 'repeat' uses edge-frame replication. 'none' drops the boundary frames and writes a shorter mmap (T - 2\u00b7pad); downstream stages adapt to the new T but tracking frame-time alignment becomes the user's problem.",
+    "_comment_cache": "The pipeline writes <stem>_SUPPORTdenoised_cnmf_*.mmap.support.json next to the output mmap. If a later run finds the mmap with mtime newer than the input cnmf mmap AND the sidecar recipe matches the current checkpoint + patch_size + patch_interval + batch_size + include_edges + dims + T, the cached mmap is reused (no GPU work). To force rebuild, delete the _SUPPORTdenoised mmap from CAIMAN_TEMP."
   },
   "xcorr_correction": {
     "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",

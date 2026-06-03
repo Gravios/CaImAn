@@ -276,90 +276,6 @@ if __name__ == "__main__":
 
         qc_xcorr()
 
-    # ── 1d. SUPPORT denoising ─────────────────────────────────────────────────
-    # Self-supervised spatio-temporal denoising via utilities/support
-    # (vendored from NICALab/SUPPORT, restructured CLI + ModelConfig sidecar).
-    # Runs AFTER noise_correction + xcorr but BEFORE motion correction so
-    # that MC sees denoised frames (better registration on low-SNR data).
-    #
-    # Stages 4b (temporal_detrend) and 5 (anatomical seeding) downstream
-    # were designed assuming this step ran: SUPPORT preserves the slow
-    # photobleach ramp (4b removes it), and saturates the local-
-    # correlation image so that corr_pnr-based seeding is degenerate
-    # (5 falls back to Cellpose anatomical seeding).
-    #
-    # Memory: SUPPORT loads the whole TIFF into RAM as float32 (~4× the
-    # uint16 file size). For 18540×512×512 that is 18.5 GB. Fine on
-    # g294-z21 (755 GB) but a real constraint for larger 3D recordings.
-    #
-    # Skipped entirely (no file rewrite) when disabled; safe to leave
-    # enabled across sessions that share a scope+gain configuration if a
-    # checkpoint is available for that configuration.
-    _sp_cfg = getattr(_P, "support", None)
-    _sp_enable = bool(getattr(_sp_cfg, "enabled", False)) if _sp_cfg else False
-
-    if _sp_enable:
-        @timer.step("SUPPORT denoise")
-        def run_support_denoise():
-            global fnames
-            from utilities.support import (denoise_stack, load_model,
-                                            ModelConfig, resolve_checkpoint,
-                                            default_output_path)
-            import torch as _torch
-
-            _sp_cp = resolve_checkpoint(
-                checkpoint=getattr(_sp_cfg, "checkpoint", None),
-                results_dir=getattr(_sp_cfg, "results_dir", None),
-                exp_name=getattr(_sp_cfg, "exp_name", None),
-                epoch=getattr(_sp_cfg, "epoch", None),
-            )
-            logger.info(f"SUPPORT checkpoint: {_sp_cp}")
-
-            _sp_arch = ModelConfig.load_for_checkpoint(_sp_cp)
-            if _sp_arch is None:
-                logger.info(
-                    "SUPPORT: no sidecar JSON; using default architecture "
-                    "(matches shipped bs3.pth)")
-                _sp_arch = ModelConfig()
-            else:
-                logger.info(
-                    f"SUPPORT: loaded sidecar — exp_name={_sp_arch.exp_name} "
-                    f"epoch={_sp_arch.epoch}")
-
-            _sp_cuda = _torch.cuda.is_available()
-            _sp_model = load_model(_sp_cp, _sp_arch, use_cuda=_sp_cuda)
-
-            _sp_patch_size = list(getattr(_sp_cfg, "patch_size", None)
-                                    or _sp_arch.patch_size)
-            _sp_patch_interval = list(getattr(_sp_cfg, "patch_interval",
-                                               [1, 32, 32]))
-            _sp_batch = int(getattr(_sp_cfg, "batch_size", 8))
-            _sp_edges = str(getattr(_sp_cfg, "include_edges", "none"))
-
-            _sp_out = default_output_path(Path(fnames),
-                                           suffix="SUPPORTdenoised")
-            denoise_stack(
-                Path(fnames), _sp_out, _sp_model,
-                patch_size=_sp_patch_size,
-                patch_interval=_sp_patch_interval,
-                batch_size=_sp_batch,
-                include_edges=_sp_edges,
-            )
-            fnames = str(_sp_out)
-            logger.info(f"SUPPORT denoise done: {Path(fnames).name}")
-
-            # Release CUDA memory before motion correction (which uses
-            # CuPy, not PyTorch — they must not contend simultaneously
-            # for the same VRAM in the next stage).
-            del _sp_model
-            _torch.cuda.empty_cache()
-            try:
-                cupy_flush()
-            except Exception as _e:
-                logger.debug(f"cupy_flush after SUPPORT: {_e}")
-
-        run_support_denoise()
-
     # mc_stem: stem of the TIFF actually fed into motion correction.
     # When xcorr correction is enabled this is e.g. "session_Xcorrected";
     # otherwise it is the bare session name.  All downstream glob patterns
@@ -429,6 +345,141 @@ if __name__ == "__main__":
     images = np.reshape(Yr.T, [T] + list(dims), order="F")
     images.filename = Yr.filename
     logger.info(f"Data: {images.shape}  dtype={images.dtype}")
+
+    # ── 4a. SUPPORT denoising (on mmap) ───────────────────────────────────────
+    # Self-supervised spatio-temporal denoising via utilities/support
+    # (vendored from NICALab/SUPPORT, restructured CLI + ModelConfig sidecar).
+    #
+    # Operates on the C-order mmap (output of stage 3 F→C conversion), so
+    # this stage works uniformly whether the original input was MSR or
+    # TIFF — the mmap is the canonical internal format past stage 3.
+    # Writes a NEW C-order mmap with `_SUPPORTdenoised` in the name;
+    # `Yr` / `images` / `fname_cnmf` are rebound to it so every
+    # downstream stage (4b detrend, 4c SHM, 5 seeding, 6 CNMF,
+    # 7 oscillation) reads denoised data transparently.
+    #
+    # Stage 4b (temporal_detrend) and stage 5 (anatomical seeding)
+    # downstream were designed assuming this step ran: SUPPORT preserves
+    # the slow photobleach ramp (4b removes it), and saturates the
+    # local-correlation image so that corr_pnr-based seeding is
+    # degenerate (5 falls back to Cellpose anatomical seeding).
+    #
+    # Memory: SUPPORT copies the mmap into a contiguous (T, d1, d2)
+    # float32 RAM buffer for efficient patch sampling — that is
+    # 4·n_px·T bytes (~19 GB for 18540×512×512). Fine on g294-z21
+    # (755 GB) but a real constraint for larger 3D recordings.
+    #
+    # Skip-if-exists: if `<stem>_SUPPORTdenoised_cnmf_*.mmap` exists with
+    # mtime newer than fname_cnmf AND the sidecar `<stem>.support.json`
+    # records a matching recipe (checkpoint + patch params + dims + T),
+    # the existing mmap is reused. Bust the cache by deleting the file.
+    _sp_cfg = getattr(_P, "support", None)
+    _sp_enable = bool(getattr(_sp_cfg, "enabled", False)) if _sp_cfg else False
+
+    if _sp_enable:
+        @timer.step("SUPPORT denoise")
+        def run_support_denoise():
+            global Yr, images, fname_cnmf
+            from utilities.support import (denoise_mmap, load_model,
+                                            ModelConfig, resolve_checkpoint)
+            import torch as _torch
+            import json as _json
+
+            _sp_cp = resolve_checkpoint(
+                checkpoint=getattr(_sp_cfg, "checkpoint", None),
+                results_dir=getattr(_sp_cfg, "results_dir", None),
+                exp_name=getattr(_sp_cfg, "exp_name", None),
+                epoch=getattr(_sp_cfg, "epoch", None),
+            )
+            logger.info(f"SUPPORT checkpoint: {_sp_cp}")
+
+            _sp_arch = ModelConfig.load_for_checkpoint(_sp_cp)
+            if _sp_arch is None:
+                logger.info(
+                    "SUPPORT: no sidecar JSON; using default architecture "
+                    "(matches shipped bs3.pth)")
+                _sp_arch = ModelConfig()
+            else:
+                logger.info(
+                    f"SUPPORT: loaded sidecar — exp_name={_sp_arch.exp_name} "
+                    f"epoch={_sp_arch.epoch}")
+
+            # Output mmap path. Reuse CaImAn's filename helper so the
+            # name carries the canonical d1_/d2_/order_C_/T_ tags.
+            _sp_out_mmap = cm.paths.fn_relocated(
+                cm.paths.memmap_frames_filename(
+                    mc_stem + "_SUPPORTdenoised_cnmf", dims, T, "C"),
+                force_temp=True,
+            )
+            _sp_sidecar = Path(str(_sp_out_mmap) + ".support.json")
+
+            # Recipe for cache invalidation: ALL keys must match for
+            # the cached mmap to be reused.
+            _sp_recipe = {
+                "checkpoint": str(_sp_cp),
+                "patch_size": list(getattr(_sp_cfg, "patch_size", None)
+                                     or _sp_arch.patch_size),
+                "patch_interval": list(getattr(_sp_cfg, "patch_interval",
+                                                 [1, 32, 32])),
+                "batch_size": int(getattr(_sp_cfg, "batch_size", 8)),
+                "include_edges": str(getattr(_sp_cfg, "include_edges",
+                                              "mirror")),
+                "T_in": T,
+                "dims": list(dims),
+            }
+            _sp_reusable = False
+            if (Path(_sp_out_mmap).exists()
+                    and Path(_sp_out_mmap).stat().st_mtime
+                        >= Path(fname_cnmf).stat().st_mtime
+                    and _sp_sidecar.exists()):
+                try:
+                    with _sp_sidecar.open() as _f:
+                        _cached_recipe = _json.load(_f)
+                    if _cached_recipe == _sp_recipe:
+                        _sp_reusable = True
+                        logger.info(
+                            f"Reusing SUPPORT-denoised mmap: {_sp_out_mmap}")
+                except Exception as _e:
+                    logger.warning(f"sidecar read failed, rebuilding: {_e}")
+
+            if not _sp_reusable:
+                # Free the input mmap view before allocating the output buf
+                del Yr, images
+
+                _sp_cuda = _torch.cuda.is_available()
+                _sp_model = load_model(_sp_cp, _sp_arch, use_cuda=_sp_cuda)
+
+                denoise_mmap(
+                    Path(fname_cnmf), Path(_sp_out_mmap),
+                    _sp_model, dims=tuple(dims), T=T,
+                    patch_size=_sp_recipe["patch_size"],
+                    patch_interval=_sp_recipe["patch_interval"],
+                    batch_size=_sp_recipe["batch_size"],
+                    include_edges=_sp_recipe["include_edges"],
+                )
+
+                with _sp_sidecar.open("w") as _f:
+                    _json.dump(_sp_recipe, _f, indent=2)
+
+                # Release torch GPU before MC/CuPy gets the VRAM
+                del _sp_model
+                _torch.cuda.empty_cache()
+                try:
+                    cupy_flush(logger, label="after SUPPORT denoise")
+                except Exception as _e:
+                    logger.debug(f"cupy_flush after SUPPORT: {_e}")
+
+            # Rebind Yr/images/fname_cnmf to the denoised mmap. All
+            # downstream stages now read from it transparently.
+            fname_cnmf = str(_sp_out_mmap)
+            Yr, _dims_sp, _T_sp = cm.mmapping.load_memmap(fname_cnmf)
+            images = np.reshape(Yr.T, [_T_sp] + list(_dims_sp), order="F")
+            images.filename = Yr.filename
+            logger.info(f"SUPPORT denoise done; downstream reads "
+                         f"{Path(fname_cnmf).name} "
+                         f"shape=({_T_sp}, {_dims_sp[0]}, {_dims_sp[1]})")
+
+        run_support_denoise()
 
     # ── 4b. Temporal detrend ───────────────────────────────────────────────
     # Remove a slow per-pixel polynomial trend (default linear) before Cn /
