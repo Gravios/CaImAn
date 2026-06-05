@@ -237,13 +237,22 @@ def denoise_array(stack: np.ndarray, model: SUPPORT,
 def denoise_stack(input_path: Path, output_path: Path, model: SUPPORT,
                    patch_size: list[int], patch_interval: list[int],
                    batch_size: int, include_edges: str = "none") -> Path:
-    """TIFF wrapper around :func:`denoise_array` — read input from disk,
-    run inference, write output TIFF. Returns the output path.
+    """File wrapper around :func:`denoise_array` — read input stack from
+    disk, run inference, write output TIFF. Returns the output path.
+
+    Input format is auto-detected by extension: ``.tif``/``.tiff``
+    (via tifffile) and ``.msr`` (via Leica IMSpectorReader) are both
+    supported. Output is always TIFF (the pipeline's mmap path uses
+    :func:`denoise_mmap` instead — see that function for the mmap-to-mmap
+    workflow).
 
     Length semantics: see :func:`denoise_array`.
     """
+    from ..io import read_stack_to_array
+
     log.info(f"loading {input_path}")
-    stack = skio.imread(str(input_path)).astype(np.float32)
+    stack = read_stack_to_array(input_path, dtype=np.float32,
+                                  desc=f"load {input_path.name}")
     log.info(f"  shape={stack.shape} dtype={stack.dtype} "
               f"range={stack.min():.1f}-{stack.max():.1f}")
 

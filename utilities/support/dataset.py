@@ -1,5 +1,6 @@
 import math
-import skimage.io as skio
+from pathlib import Path
+
 import numpy as np
 import torch
 import zarr
@@ -413,7 +414,11 @@ def gen_train_dataloader(patch_size, patch_interval, batch_size, noisy_data_list
 
     for noisy_data in noisy_data_list:
         if not is_zarr:
-            noisy_image = torch.from_numpy(skio.imread(noisy_data).astype(np.float32)).type(torch.FloatTensor)
+            from .io import read_stack_to_array
+            noisy_image = torch.from_numpy(
+                read_stack_to_array(noisy_data, dtype=np.float32,
+                                     desc=f"load {Path(noisy_data).name}")
+            ).type(torch.FloatTensor)
             print(f"Loaded {noisy_data} Shape : {noisy_image.shape}")
             if len(noisy_image.shape) == 2:
                 noisy_image = noisy_image.unsqueeze(0)
