@@ -23,6 +23,7 @@ utilities/support/
 ├── network.py              # SUPPORT 3D-UNet architecture
 ├── conv_layers.py          # partial-conv blind-spot layers
 ├── dataset.py              # train + stitched-inference Dataset classes
+├── io.py                   # format-agnostic stack reader (TIFF + MSR)
 ├── cli/
 │   ├── __init__.py
 │   ├── __main__.py
@@ -37,6 +38,25 @@ utilities/support/
     ├── L1_generalization.pth
     └── zebrafish_voltage.pth
 ```
+
+## Input format support
+
+Both training (`support train`) and TIFF-mode inference (`support test`)
+accept `.tif`, `.tiff`, and `.msr`. Format is auto-detected by file
+extension. The dispatch happens in `utilities/support/io.py` which
+wraps `caiman.utils.stack_io.StackReader`:
+
+- `.tif`/`.tiff` → `tifffile`
+- `.msr` → `caiman.utils.imspectorreader.IMSpectorReader` (Leica
+  Imspector, AG Stroh Lab's native acquisition format)
+
+The pipeline integration (stage 4a in `template_pipeline.py`) doesn't
+see the input format at all — it consumes the C-order mmap that
+stage 3 (F→C conversion) produces, which is uniform across input
+formats.
+
+`test-batch` mode (`support test-batch --input-dir ...`) defaults to
+discovering `*.tif,*.tiff,*.msr` files in the input directory.
 
 ## Modifications from upstream
 

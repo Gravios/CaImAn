@@ -1,10 +1,10 @@
 """
-``support test-batch`` — denoise a directory of TIFF stacks with a
-single trained model.
+``support test-batch`` — denoise a directory of TIFF or MSR stacks with
+a single trained model.
 
-Discovers ``*.tif*`` (by default) in ``--input-dir`` and writes
-denoised versions to ``--output-dir`` with ``_denoised`` appended to
-each stem. The model + sidecar are loaded once and reused.
+Discovers ``*.tif``/``*.tiff``/``*.msr`` (by default) in ``--input-dir``
+and writes denoised TIFFs to ``--output-dir`` with ``_denoised`` appended
+to each stem. The model + sidecar are loaded once and reused.
 """
 
 import argparse
@@ -27,11 +27,13 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     """Populate an argparse subparser with batch-inference flags."""
     g = p.add_argument_group("batch IO")
     g.add_argument("--input-dir", type=Path, required=True,
-                    help="directory of TIFFs to denoise (each one separately)")
+                    help="directory of stacks (TIFF/MSR) to denoise")
     g.add_argument("--output-dir", type=Path, required=True,
                     help="directory for denoised outputs")
-    g.add_argument("--pattern", type=str, default="*.tif*",
-                    help="glob pattern for input discovery (default *.tif*)")
+    g.add_argument("--pattern", type=str,
+                    default="*.tif,*.tiff,*.msr",
+                    help="comma-separated glob patterns for input "
+                         "discovery (default '*.tif,*.tiff,*.msr')")
     add_model_selection_arguments(p)
     add_architecture_arguments(p, group_title=(
         "architecture overrides (only needed for checkpoints without "
@@ -40,15 +42,17 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
 
 
 def _discover(input_dir: Path, pattern: str) -> list[Path]:
-    """Files matching ``pattern`` in ``input_dir`` (non-recursive),
-    sorted, deduplicated, files only."""
+    """Files matching any of the comma-separated ``pattern`` parts in
+    ``input_dir`` (non-recursive), sorted, deduplicated, files only."""
     seen: set[Path] = set()
     out: list[Path] = []
-    for p in sorted(input_dir.glob(pattern)):
-        if p.is_file() and p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+    parts = [p.strip() for p in pattern.split(",") if p.strip()]
+    for pat in parts:
+        for f in sorted(input_dir.glob(pat)):
+            if f.is_file() and f not in seen:
+                seen.add(f)
+                out.append(f)
+    return sorted(out)
 
 
 def run(args: argparse.Namespace) -> int:

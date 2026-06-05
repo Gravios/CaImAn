@@ -46,6 +46,7 @@ from .cli.paths import (
     resolve_input_paths,
 )
 from .cli.test import denoise_array, denoise_mmap, denoise_stack, load_model
+from .io import read_stack_to_array
 from .network import SUPPORT as SUPPORTNet
 
 __all__ = [
@@ -61,6 +62,7 @@ __all__ = [
     "find_checkpoints",
     "latest_checkpoint",
     "load_model",
+    "read_stack_to_array",
     "resolve_checkpoint",
     "resolve_input_paths",
 ]
