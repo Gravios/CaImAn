@@ -223,6 +223,7 @@ def detect_fpn_peaks(M: np.ndarray,
                      cell_scale_px: float = 12.0,
                      prominence_db: float = 15.0,
                      max_peaks: int = 32,
+                     magnitude_in: bool = False,
                      ) -> Tuple[np.ndarray, np.ndarray]:
     """Locate isolated 2D FFT peaks in the temporal-mean image that
     correspond to fixed periodic spatial structure (FPN).
@@ -233,9 +234,12 @@ def detect_fpn_peaks(M: np.ndarray,
         Bins to zero in the fftshift'd 2D FFT of M. Includes a 1-bin
         radius around each detected peak and its conjugate-symmetric
         counterpart (required to keep ``ifft2`` real-valued).
-    F_shifted : (H, W) complex
-        The fftshift'd 2D FFT of ``M - M.mean()`` — returned so callers
-        that already paid the FFT cost don't have to repeat it.
+    F_shifted : (H, W) complex or float
+        When ``magnitude_in=False`` (default), the fftshift'd 2D FFT of
+        ``M - M.mean()`` — returned so callers that already paid the FFT
+        cost don't have to repeat it. When ``magnitude_in=True``, the
+        input ``M`` itself (treated as a precomputed magnitude
+        spectrum), returned unchanged for API symmetry.
 
     Parameters
     ----------
@@ -258,10 +262,23 @@ def detect_fpn_peaks(M: np.ndarray,
         FPN. Default 32 — generous enough for a 2D lattice with several
         harmonics and their 4-fold conjugate mirrors, restrictive enough
         to prevent catastrophic over-notching of cellular content.
+    magnitude_in : bool
+        When False (default), ``M`` is interpreted as a real image and
+        the detector computes its FFT internally. When True, ``M`` is
+        interpreted as an already-shifted magnitude spectrum (i.e.
+        ``|fftshift(fft2(image))|``, possibly averaged over many frames
+        as in ``subtract_per_frame_pattern``). The peak-detection logic
+        is otherwise identical: same disk mask, same prominence test,
+        same conjugate-symmetric notch construction. Use the True path
+        when peaks need detecting in a pooled-magnitude spectrum that
+        captures frame-varying contamination invisible to the temporal
+        mean.
 
     Algorithm
     ---------
     1. 2D FFT of mean-subtracted M, fftshift so DC sits at the centre.
+       (Skipped when ``magnitude_in=True`` — the input is already the
+       magnitude.)
     2. Mask out a central disk of radius ``1/(2·cell_scale_px)`` cyc/px
        so cell-scale and slower spatial structure is preserved (the
        broad spectral lobes from cells, vignetting, blood vessels never
@@ -290,9 +307,17 @@ def detect_fpn_peaks(M: np.ndarray,
     M = np.asarray(M, dtype=np.float32)
     H, W = M.shape
 
-    # FFT of mean-subtracted M, shifted so DC is at center
-    F_shifted = np.fft.fftshift(np.fft.fft2(M - M.mean()))
-    P = np.abs(F_shifted) ** 2
+    if magnitude_in:
+        # ``M`` is already a magnitude spectrum (shifted, DC at centre).
+        # Convert to power for the dB-prominence test; F_shifted is the
+        # input itself, returned for API symmetry (callers that already
+        # have it).
+        P = M.astype(np.float32) ** 2
+        F_shifted = M
+    else:
+        # FFT of mean-subtracted M, shifted so DC is at center
+        F_shifted = np.fft.fftshift(np.fft.fft2(M - M.mean()))
+        P = np.abs(F_shifted) ** 2
     P_db = 10.0 * np.log10(P + 1e-12)
     cy, cx = H // 2, W // 2
 
@@ -415,6 +440,250 @@ def subtract_fixed_pattern(stack: np.ndarray,
 
     out = stack - fpn[None, :, :]
     return (out, fpn) if return_fpn else out
+
+
+# ============================================================================
+# 3b. Per-frame spectral notch (frame-varying lattice contamination)
+# ============================================================================
+
+def subtract_per_frame_pattern(stack: np.ndarray,
+                                cell_scale_px: float = 12.0,
+                                prominence_db: float = 15.0,
+                                max_peaks: int = 32,
+                                batch_size: int = 512,
+                                return_pattern: bool = False,
+                                use_gpu: bool = False
+                                ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    """Remove a frame-varying periodic spatial pattern by spectral notching.
+
+    Targets scanner-synchronous or other periodic contamination whose
+    *spatial* lattice is stable across frames but whose *phase* drifts
+    frame-to-frame. The Dec-6 strohA cross-hatch at (fy=±0.109, fx=±0.031)
+    cyc/px is the motivating example: pooled-magnitude coherence
+    ratio ≈ 0.04 in fc046200 (almost entirely frame-varying), so the
+    temporal-mean approach of :func:`subtract_fixed_pattern` recovers
+    only ~4% of the contamination amplitude. This routine recovers the
+    rest.
+
+    Unlike :func:`subtract_fixed_pattern`, which subtracts one stationary
+    pattern from every frame, this routine:
+
+    1. **Pass 1 — pool magnitude spectra.** Compute ``|FFT(frame_i)|``
+       for every frame and average across the time axis. This captures
+       any spatially-stable spectral content regardless of per-frame
+       phase, because magnitude is phase-invariant.
+    2. **Peak detection.** Identify peak bins in the pooled magnitude
+       using the same local-max + prominence + conjugate-symmetric
+       logic as :func:`detect_fpn_peaks`. The pooled magnitude has
+       T-times more SNR than any individual frame's spectrum, so peaks
+       that are dim in each frame still stand out clearly here.
+    3. **Pass 2 — per-frame notch.** Apply the same notch mask to each
+       frame's individual FFT, zeroing the offending bins, then IFFT
+       back. Each frame loses *its own* phase contribution at those
+       bins — different per frame, but at fixed spatial coordinates.
+
+    Compose with :func:`subtract_fixed_pattern` for mixed-stationarity
+    cases (e.g. Apr-22 strohA with coherence ratio 0.28 at the lattice):
+    run :func:`subtract_fixed_pattern` first to remove the stationary
+    fraction, then this routine on the residual to clean up the
+    frame-varying remainder. The two filters target orthogonal
+    components of the same spectral peaks.
+
+    Parameters
+    ----------
+    stack : (T, H, W) ndarray
+        Input movie, host RAM. Float32 is fastest; other dtypes are cast.
+    cell_scale_px : float
+        Central-disk radius for cell-content protection in
+        :func:`detect_fpn_peaks`. Default 12.0 — same as
+        :func:`subtract_fixed_pattern`. The pooled-magnitude geometry
+        is identical to the temporal-mean geometry: cells produce
+        broad smooth content centred on DC, lattice peaks sit cleanly
+        off-axis, the same disk size protects the same content.
+    prominence_db : float
+        Minimum dB above the spectral floor for a candidate peak.
+        Default 15.0 — same as :func:`subtract_fixed_pattern`. An
+        a-priori argument that the pooled spectrum has T-times higher
+        SNR than the temporal mean (so the threshold could be tighter)
+        is wrong: pooling magnitudes averages |signal + noise| ≈
+        |signal| at each bin, so the absolute prominence of a real
+        peak is comparable to a single-frame value, not T-times
+        higher. The gain over per-frame analysis is in floor
+        *stability* (variance drops as 1/√T), not floor *level*. The
+        same 15 dB threshold therefore catches genuine lattice peaks
+        in both cases. Calibrated against sa-000093 (T=110880):
+        lattice peaks at (±52, ±12) cyc/px register at +15-20 dB
+        prominence, well-separated from cell-content baseline at +2-5 dB.
+    max_peaks : int
+        Hard cap on detected peaks. Default 32, matching
+        :func:`subtract_fixed_pattern`. Larger than naively necessary
+        because a 2D lattice with multiple harmonics produces 4-fold
+        conjugate quartets — sa-000093 fills 9 of the 32 slots
+        (1 Nyquist + 4 fundamental lattice + 4 first-harmonic
+        lattice), other sessions may fill more.
+    batch_size : int
+        Frames per GPU/CPU batch in both pass 1 and pass 2. Default 512.
+        With H=W=512 float32, one batch is ``batch_size`` MB on host
+        and roughly 2-4× that on GPU (input + FFT workspace + output).
+        For a 96 GB GPU, ``batch_size=1024`` is comfortable; for 16 GB
+        cards, stay at 256-512.
+    return_pattern : bool
+        If True, return ``(cleaned, pattern)`` where ``pattern`` is the
+        per-frame ``(T, H, W)`` contamination that was subtracted.
+        Memory cost: doubles peak host RAM. Useful for QC plots.
+    use_gpu : bool
+        When True, the per-frame FFTs run on CuPy if available, falling
+        back to NumPy if not. Falsy default for safety; for sessions
+        with T > ~10⁴ frames at 512×512, enabling GPU drops wall time
+        from minutes to seconds.
+
+    Returns
+    -------
+    cleaned : (T, H, W) ndarray, float32
+        Stack with the detected lattice removed per-frame.
+    pattern : (T, H, W) ndarray, optional
+        Only when ``return_pattern=True``. The per-frame contamination
+        that was subtracted (i.e. ``stack - cleaned``).
+
+    Memory
+    ------
+    Pass 1 streams batches and accumulates a single (H, W) magnitude
+    buffer — peak host RAM is ``batch_size × H × W × 4 bytes``.
+
+    Pass 2 streams batches but writes into a (T, H, W) output array —
+    peak host RAM is ``T × H × W × 4 bytes`` for the output plus one
+    batch in flight. For T=110880, H=W=512, that's 110 GB. Comfortable
+    on lab workstations with ≥256 GB RAM; for memory-tight environments,
+    use ``return_pattern=False`` (avoids the second large allocation)
+    and consider raising the input dtype-check to require float32 input
+    (avoiding a host-side astype copy).
+
+    No-op gate
+    ----------
+    If the top peak in the pooled magnitude is less than
+    ``prominence_db`` above the spectral floor, the routine concludes
+    no real lattice is present, logs an info message, and returns the
+    input stack unchanged (no Pass 2, no allocation). This makes the
+    routine safe to enable session-wide: sessions without a frame-
+    varying lattice incur only the Pass 1 cost (~20 s on GPU for
+    T=10⁵).
+
+    Diagnostics
+    -----------
+    Logs at INFO:
+      - pass 1: time, top peak prominence in pooled magnitude
+      - peak count, notch mask coverage as % of spectrum
+      - pass 2: time, mean and max |pattern| amplitude
+      - no-op: peak prominence below threshold, returning unchanged
+    """
+    xp = _detrend_xp(use_gpu)  # reuse the existing GPU dispatcher
+
+    stack = np.asarray(stack)
+    T, H, W = stack.shape
+    log.info("subtract_per_frame_pattern: T=%d, H=%d, W=%d, batch=%d, backend=%s",
+              T, H, W, batch_size, "cupy" if xp is not np else "numpy")
+
+    # ---- PASS 1: pool magnitude spectra across all frames ----
+    import time as _time
+    t0 = _time.perf_counter()
+    A_pooled = xp.zeros((H, W), dtype=xp.float32)
+    n_done = 0
+    for s in range(0, T, batch_size):
+        e = min(s + batch_size, T)
+        batch = stack[s:e].astype(np.float32, copy=False)
+        # Move batch onto whichever backend we're using
+        batch_xp = xp.asarray(batch) if xp is not np else batch
+        # Per-frame demean → batched fft2 over the time axis →
+        # accumulate magnitudes. fftshift is folded in after the sum
+        # to save one shift per batch (fftshift is a permutation, so
+        # sum-then-shift = shift-then-sum).
+        batch_xp = batch_xp - batch_xp.mean(axis=(1, 2), keepdims=True)
+        F = xp.fft.fft2(batch_xp)
+        A_pooled += xp.abs(F).sum(axis=0)
+        n_done = e
+        if (e // batch_size) % 20 == 0 or e == T:
+            log.debug("subtract_per_frame_pattern pass 1: %d/%d frames",
+                       n_done, T)
+    A_pooled = xp.fft.fftshift(A_pooled / T)
+
+    # Bring pooled magnitude to host for peak detection (small, (H,W))
+    A_pooled_host = (np.asarray(A_pooled) if xp is np
+                      else xp.asnumpy(A_pooled))
+    t_pass1 = _time.perf_counter() - t0
+
+    # ---- Peak detection on the pooled magnitude ----
+    notch_mask, _ = detect_fpn_peaks(
+        A_pooled_host,
+        cell_scale_px=cell_scale_px,
+        prominence_db=prominence_db,
+        max_peaks=max_peaks,
+        magnitude_in=True,
+    )
+    n_notched = int(notch_mask.sum())
+
+    # Probe the top peak's prominence above floor for the no-op gate.
+    # If we couldn't find any peak above the threshold, detect_fpn_peaks
+    # returned an empty notch_mask and we should return early.
+    if n_notched == 0:
+        log.info("subtract_per_frame_pattern: pass 1 done in %.1fs, "
+                  "no peaks above %.1f dB prominence; returning unchanged",
+                  t_pass1, prominence_db)
+        if return_pattern:
+            return stack.astype(np.float32, copy=True), \
+                   np.zeros_like(stack, dtype=np.float32)
+        return stack.astype(np.float32, copy=False)
+
+    log.info("subtract_per_frame_pattern: pass 1 done in %.1fs, "
+              "%d FFT bins notched (%.3f%% of spectrum)",
+              t_pass1, n_notched, 100.0 * n_notched / (H * W))
+
+    # The notch mask was built in fftshifted coordinates (DC at centre).
+    # For pass-2 application we need un-shifted coordinates to match
+    # what cp.fft.fft2 produces directly. ifftshift inverts fftshift.
+    notch_mask_unshifted = np.fft.ifftshift(notch_mask)
+    notch_mask_xp = (xp.asarray(notch_mask_unshifted) if xp is not np
+                      else notch_mask_unshifted)
+
+    # ---- PASS 2: apply per-frame notch ----
+    t0 = _time.perf_counter()
+    cleaned = np.empty_like(stack, dtype=np.float32)
+    pattern_acc = np.empty_like(stack, dtype=np.float32) if return_pattern else None
+    for s in range(0, T, batch_size):
+        e = min(s + batch_size, T)
+        batch = stack[s:e].astype(np.float32, copy=False)
+        batch_xp = xp.asarray(batch) if xp is not np else batch
+        means = batch_xp.mean(axis=(1, 2), keepdims=True)
+        F = xp.fft.fft2(batch_xp - means)
+        # Compute the contamination contribution (notched bins only)
+        # by zeroing the *complement* of the mask, then ifft. The
+        # cleaned output is then the input minus this contamination.
+        if return_pattern:
+            F_pattern = F * notch_mask_xp[None, :, :]
+            pat = xp.real(xp.fft.ifft2(F_pattern))
+            cleaned_batch = batch_xp - pat
+            cleaned[s:e] = (np.asarray(cleaned_batch) if xp is np
+                            else xp.asnumpy(cleaned_batch))
+            pattern_acc[s:e] = (np.asarray(pat) if xp is np
+                                else xp.asnumpy(pat))
+        else:
+            # Zero notched bins, ifft. Faster than the return_pattern
+            # path because we don't materialise pattern.
+            F = F * (~notch_mask_xp)[None, :, :]
+            cleaned_batch = xp.real(xp.fft.ifft2(F)) + means
+            cleaned[s:e] = (np.asarray(cleaned_batch) if xp is np
+                            else xp.asnumpy(cleaned_batch))
+    t_pass2 = _time.perf_counter() - t0
+
+    if return_pattern:
+        pat_max = float(np.abs(pattern_acc).max())
+        pat_std = float(pattern_acc.std())
+        log.info("subtract_per_frame_pattern: pass 2 done in %.1fs, "
+                  "pattern std=%.3f max|pattern|=%.2f DN",
+                  t_pass2, pat_std, pat_max)
+        return cleaned, pattern_acc
+
+    log.info("subtract_per_frame_pattern: pass 2 done in %.1fs", t_pass2)
+    return cleaned
 
 
 # ============================================================================
@@ -807,6 +1076,24 @@ def recommend_corrections(report: Dict[str, Any],
     # the user's chosen ``min_level``.
     if _flagged("fixed_pattern_noise"):
         ops.append((subtract_fixed_pattern, {}))
+
+    # Frame-varying lattice contamination — same family of scanner-
+    # synchronous noise as fixed_pattern_noise but with phase that walks
+    # between frames. The temporal mean averages it down (typical
+    # coherence ratio 0.04-0.3), so subtract_fixed_pattern misses most
+    # of it. The per-frame method pools magnitude spectra to find the
+    # peak coordinates with high SNR, then notches them in each frame
+    # independently. Composes correctly with fixed_pattern_noise: run
+    # the stationary subtraction first to remove the small coherent
+    # fraction, then this routine for the rest. Gated by the
+    # ``frame_varying_pattern`` flag in the JSON; runs on GPU via
+    # CuPy when available (gracefully falls back to NumPy otherwise).
+    # Other thresholds (cell_scale_px, prominence_db, max_peaks,
+    # batch_size) use the function defaults; tune by editing the
+    # function signature or pass kwargs from the calling pipeline if
+    # session-specific tuning is needed.
+    if _flagged("frame_varying_pattern"):
+        ops.append((subtract_per_frame_pattern, {"use_gpu": True}))
 
     if _flagged("periodic_temporal_global"):
         # Default: common-mode regression. It removes whatever is globally
@@ -1224,6 +1511,7 @@ __all__ = [
     "subtract_column_pedestal",
     "detect_fpn_peaks",
     "subtract_fixed_pattern",
+    "subtract_per_frame_pattern",
     "regress_common_mode",
     "notch_temporal",
     "detect_hot_pixels",
