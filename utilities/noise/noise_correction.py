@@ -219,11 +219,108 @@ def subtract_column_pedestal(stack: np.ndarray,
 # 3. Fixed-pattern noise — 2D FFT notch on the temporal mean
 # ============================================================================
 
+
+def _radial_floor_db(P_db: np.ndarray,
+                      r_norm: np.ndarray,
+                      n_bins: int = 128,
+                      smooth_window: int = 5,
+                      percentile: float = 50.0,
+                      ) -> np.ndarray:
+    """Per-bin spectral-floor estimate from a radial percentile profile.
+
+    Replaces the global ``median(P_db[~central_disk])`` floor used in the
+    original :func:`detect_fpn_peaks`. The global median is biased high
+    in the cell-content radius range (~r=20-60 bins for a 512x512 FOV
+    with typical cell sizes), because the broad smooth cell-content
+    spectral lobe lifts the median across most of the spectrum's
+    bin count.
+
+    A radius-binned percentile profile gives a floor that tracks the
+    actual local noise level. Outside the cell-content lobe (r > ~60),
+    the local floor drops to the genuine noise level (often 15-30 dB
+    below the global median). Lattice peaks at those radii then show
+    their true local prominence (40-50 dB above noise) rather than the
+    artificially compressed prominence (10-15 dB above the global
+    median) the old detector computed.
+
+    Algorithm
+    ---------
+    1. Bin pixels by normalised radius into ``n_bins`` rings up to
+       ``r_norm.max()``.
+    2. Compute the ``percentile``-th percentile of ``P_db`` within each
+       ring (default 50 = median). Median is robust to a small number of
+       peaks in the ring but can be biased if many peaks share a radius
+       (e.g. dense axis stripes); lower percentile (e.g. 25) is more
+       robust at the cost of slightly biasing the floor low in noisy
+       regions.
+    3. Fill any empty rings (rare; happens at very high radii in
+       corners) by interpolation from adjacent valid rings.
+    4. Smooth the radial profile with a running mean of width
+       ``smooth_window`` bins to avoid spurious local fluctuations
+       creating per-ring threshold jitter.
+    5. Map each pixel back to its ring index → 2D floor map.
+
+    Parameters
+    ----------
+    P_db : (H, W) ndarray
+        Power spectrum in dB (i.e. ``10 * log10(|FFT|^2 + eps)``).
+    r_norm : (H, W) ndarray
+        Normalised radius at each bin (output of the ``np.ogrid`` +
+        ``sqrt`` pattern used in :func:`detect_fpn_peaks`).
+    n_bins : int
+        Number of radial rings. 128 gives ring width ~ 0.005 of
+        normalised radius for a 512x512 FFT, corresponding to ~2.5 bins
+        per ring. Enough pixels per ring (~1000+ at moderate radii) for
+        a robust median.
+    smooth_window : int
+        Running-mean width in rings. 5 corresponds to ~12 raw bins of
+        smoothing — enough to suppress per-ring fluctuations without
+        smearing the cell-content lobe edge.
+    percentile : float
+        Percentile to use as the floor estimate. 50 (median) is the
+        default. Lower values are more robust to peak contamination of
+        the floor estimate but bias the floor low; 25 is a sensible
+        alternative when there are very many peaks at similar radii.
+
+    Returns
+    -------
+    (H, W) ndarray, float32
+        Per-bin floor in dB.
+    """
+    H, W = P_db.shape
+    r_max = float(r_norm.max())
+    ring_idx = np.minimum(
+        (r_norm / r_max * n_bins).astype(np.int32), n_bins - 1)
+
+    profile = np.full(n_bins, np.nan, dtype=np.float64)
+    for i in range(n_bins):
+        mask = (ring_idx == i)
+        if mask.any():
+            profile[i] = np.percentile(P_db[mask], percentile)
+
+    # Fill any empty rings by linear interpolation between valid rings.
+    # In practice all rings have pixels for n_bins <= 128 on a 512x512
+    # grid, but the check protects against pathological aspect ratios.
+    valid = ~np.isnan(profile)
+    if not valid.all():
+        profile = np.interp(np.arange(n_bins),
+                             np.where(valid)[0],
+                             profile[valid])
+
+    # Smooth the radial profile to avoid threshold jitter
+    if smooth_window > 1:
+        k = np.ones(smooth_window) / smooth_window
+        profile = np.convolve(profile, k, mode='same')
+
+    return profile[ring_idx].astype(np.float32)
+
+
 def detect_fpn_peaks(M: np.ndarray,
                      cell_scale_px: float = 12.0,
                      prominence_db: float = 15.0,
                      max_peaks: int = 32,
                      magnitude_in: bool = False,
+                     annular_floor: bool = True,
                      ) -> Tuple[np.ndarray, np.ndarray]:
     """Locate isolated 2D FFT peaks in the temporal-mean image that
     correspond to fixed periodic spatial structure (FPN).
@@ -303,6 +400,43 @@ def detect_fpn_peaks(M: np.ndarray,
     rejects them. This is what makes the routine safe to fire on the
     ``fixed_pattern_noise`` flag even when that flag has a known
     false-positive tendency on cellular FOVs.
+
+    Annular floor (default since the radial-floor refactor)
+    -------------------------------------------------------
+    When ``annular_floor=True`` (the default), the noise floor is
+    estimated radius-dependently via :func:`_radial_floor_db` rather
+    than as a single scalar over the entire non-central spectrum. This
+    fixes a sensitivity loss the global-median floor had at intermediate
+    radii: in pooled-magnitude spectra (the input to
+    :func:`subtract_per_frame_pattern`) the cell-content lobe survives
+    at full amplitude and inflates the global median enough that
+    genuine FPN peaks at r=50-200 bins fail the +15 dB test by 5-10 dB
+    relative to their actual local prominence. Annular floor compares
+    each peak to the local radius-binned floor instead, giving the
+    correct sensitivity at all radii. Set ``False`` for bit-exact
+    backward compatibility with the pre-refactor behaviour.
+
+    Parameters
+    ----------
+    cell_scale_px : float
+        Spatial scale (radius, in pixels) below which Fourier content is
+        protected by the central-disk mask. Defaults to 12 (covering
+        cells up to ~24 px diameter).
+    prominence_db : float
+        Minimum height in dB above the (local or global) spectral floor
+        for a bin to qualify as a candidate peak. Default 15.
+    max_peaks : int
+        Hard cap on the number of peaks detected, after sorting all
+        candidates by prominence (highest first). Default 32.
+    magnitude_in : bool
+        When False (default), ``M`` is interpreted as a real image and
+        the detector computes its FFT internally. When True, ``M`` is
+        interpreted as an already-shifted magnitude spectrum.
+    annular_floor : bool
+        When True (default since this refactor), use a radial
+        annular-binned percentile profile as the floor estimate. When
+        False, use the original behaviour of a single scalar floor
+        equal to the median of all non-central bins.
     """
     M = np.asarray(M, dtype=np.float32)
     H, W = M.shape
@@ -327,23 +461,41 @@ def detect_fpn_peaks(M: np.ndarray,
     cell_freq = 1.0 / (2.0 * max(cell_scale_px, 1.0))
     central_mask = r_norm < cell_freq
 
-    # Noise floor estimate (median of non-central bins)
-    floor_db = float(np.median(P_db[~central_mask]))
-    threshold_db = floor_db + prominence_db
+    # Noise floor estimate — either annular (radius-dependent) or
+    # global-median (scalar). When annular, `floor_db_field` is a 2D
+    # array of per-bin floors; when global, it's broadcast from a
+    # scalar to satisfy the same vectorised threshold test below.
+    if annular_floor:
+        floor_db_field = _radial_floor_db(P_db, r_norm)
+        threshold_db_field = floor_db_field + prominence_db
+        # For logging: report the floor inside the lattice-peak band
+        # (radii 0.1-0.4 cyc/px), which is where the difference matters
+        band = (r_norm > 0.1) & (r_norm < 0.4)
+        floor_repr_db = float(np.median(floor_db_field[band])) if band.any() \
+                          else float(np.median(floor_db_field))
+        floor_summary = f"annular (radii 0.1-0.4 median={floor_repr_db:.1f} dB)"
+    else:
+        floor_db_field = np.full_like(P_db, np.median(P_db[~central_mask]),
+                                       dtype=np.float32)
+        threshold_db_field = floor_db_field + prominence_db
+        floor_repr_db = float(floor_db_field.ravel()[0])
+        floor_summary = f"global median {floor_repr_db:.1f} dB"
 
     # Local maxima above threshold (3x3 neighbourhood)
     is_lmax = (P_db == ndimage.maximum_filter(P_db, size=3))
-    candidates = is_lmax & (P_db > threshold_db) & (~central_mask)
+    candidates = is_lmax & (P_db > threshold_db_field) & (~central_mask)
 
-    # Cap at top-K by prominence (sorted highest first). Essential for
-    # full-FOV temporal means where cell-induced spectral noise produces
-    # many small candidates that all pass a fixed dB threshold; the real
-    # FPN peaks consistently rise much higher above the floor, so taking
-    # the top-K reliably selects them. See max_peaks docstring.
+    # Cap at top-K by LOCAL prominence (sorted highest first). With
+    # annular floor this is the per-bin prominence above its local
+    # floor; with global floor it's the same scalar offset for every
+    # candidate, so ranking is equivalent to ranking by absolute P_db.
     candidate_coords = np.argwhere(candidates)
     if len(candidate_coords) > max_peaks:
-        candidate_proms = P_db[candidate_coords[:, 0], candidate_coords[:, 1]]
-        keep_idx = np.argsort(candidate_proms)[::-1][:max_peaks]
+        prom_at_candidates = (P_db[candidate_coords[:, 0],
+                                     candidate_coords[:, 1]]
+                                - floor_db_field[candidate_coords[:, 0],
+                                                  candidate_coords[:, 1]])
+        keep_idx = np.argsort(prom_at_candidates)[::-1][:max_peaks]
         candidate_coords = candidate_coords[keep_idx]
         log.debug("detect_fpn_peaks: %d candidates → capped at top %d by prominence",
                    int(candidates.sum()), max_peaks)
@@ -356,8 +508,8 @@ def detect_fpn_peaks(M: np.ndarray,
             x0, x1 = max(0, sx - 1), min(W, sx + 2)
             notch_mask[y0:y1, x0:x1] = True
 
-    log.debug("detect_fpn_peaks: floor=%.1f dB, %d candidates, %d notched bins",
-              floor_db, int(candidates.sum()), int(notch_mask.sum()))
+    log.debug("detect_fpn_peaks: floor=%s, %d candidates, %d notched bins",
+              floor_summary, int(candidates.sum()), int(notch_mask.sum()))
     return notch_mask, F_shifted
 
 
