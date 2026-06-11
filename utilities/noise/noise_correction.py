@@ -598,13 +598,77 @@ def subtract_fixed_pattern(stack: np.ndarray,
 # 3b. Per-frame spectral notch (frame-varying lattice contamination)
 # ============================================================================
 
+def _pool_magnitude_xp(stack: np.ndarray,
+                        start: int, stop: int,
+                        xp,
+                        batch_size: int = 512,
+                        ) -> np.ndarray:
+    """Pool ``|FFT(frame)|`` over a slice of ``stack[start:stop]`` and
+    return the fftshifted average as a host-side (H, W) float32 array.
+    Used by both the single-chunk and per-chunk paths of
+    :func:`subtract_per_frame_pattern` to share the magnitude-pooling
+    loop. Batched fft2 on GPU (when ``xp`` is CuPy) or CPU fallback."""
+    T_slice = stop - start
+    _, H, W = stack.shape
+    A = xp.zeros((H, W), dtype=xp.float32)
+    for s in range(start, stop, batch_size):
+        e = min(s + batch_size, stop)
+        batch = stack[s:e].astype(np.float32, copy=False)
+        batch_xp = xp.asarray(batch) if xp is not np else batch
+        # Per-frame demean before FFT so DC doesn't dominate magnitude.
+        # fftshift folded in after the sum (sum-then-shift = shift-then-sum
+        # since fftshift is a permutation).
+        batch_xp = batch_xp - batch_xp.mean(axis=(1, 2), keepdims=True)
+        F = xp.fft.fft2(batch_xp)
+        A += xp.abs(F).sum(axis=0)
+    A = xp.fft.fftshift(A / T_slice)
+    return np.asarray(A) if xp is np else xp.asnumpy(A)
+
+
+def _apply_notch_xp(stack: np.ndarray,
+                     start: int, stop: int,
+                     mask_xp_unshifted,
+                     cleaned_out: np.ndarray,
+                     pattern_out: Optional[np.ndarray],
+                     xp,
+                     batch_size: int = 512) -> None:
+    """Apply a fftshift'd notch mask (passed as un-shifted for direct use
+    with raw ``fft2`` output) to frames ``stack[start:stop]``, writing
+    cleaned results into ``cleaned_out[start:stop]`` and (if requested)
+    the subtracted pattern into ``pattern_out[start:stop]``. In-place on
+    the output arrays; no allocation. Shared by single-chunk and
+    per-chunk paths."""
+    return_pattern = pattern_out is not None
+    for s in range(start, stop, batch_size):
+        e = min(s + batch_size, stop)
+        batch = stack[s:e].astype(np.float32, copy=False)
+        batch_xp = xp.asarray(batch) if xp is not np else batch
+        means = batch_xp.mean(axis=(1, 2), keepdims=True)
+        F = xp.fft.fft2(batch_xp - means)
+        if return_pattern:
+            F_pattern = F * mask_xp_unshifted[None, :, :]
+            pat = xp.real(xp.fft.ifft2(F_pattern))
+            cleaned_batch = batch_xp - pat
+            cleaned_out[s:e] = (np.asarray(cleaned_batch) if xp is np
+                                  else xp.asnumpy(cleaned_batch))
+            pattern_out[s:e] = (np.asarray(pat) if xp is np
+                                  else xp.asnumpy(pat))
+        else:
+            F = F * (~mask_xp_unshifted)[None, :, :]
+            cleaned_batch = xp.real(xp.fft.ifft2(F)) + means
+            cleaned_out[s:e] = (np.asarray(cleaned_batch) if xp is np
+                                  else xp.asnumpy(cleaned_batch))
+
+
 def subtract_per_frame_pattern(stack: np.ndarray,
                                 cell_scale_px: float = 12.0,
                                 prominence_db: float = 15.0,
                                 max_peaks: int = 32,
                                 batch_size: int = 512,
                                 return_pattern: bool = False,
-                                use_gpu: bool = False
+                                use_gpu: bool = False,
+                                n_chunks: int = 1,
+                                min_frames_per_chunk: int = 500,
                                 ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
     """Remove a frame-varying periodic spatial pattern by spectral notching.
 
@@ -625,14 +689,60 @@ def subtract_per_frame_pattern(stack: np.ndarray,
        any spatially-stable spectral content regardless of per-frame
        phase, because magnitude is phase-invariant.
     2. **Peak detection.** Identify peak bins in the pooled magnitude
-       using the same local-max + prominence + conjugate-symmetric
-       logic as :func:`detect_fpn_peaks`. The pooled magnitude has
-       T-times more SNR than any individual frame's spectrum, so peaks
-       that are dim in each frame still stand out clearly here.
-    3. **Pass 2 — per-frame notch.** Apply the same notch mask to each
-       frame's individual FFT, zeroing the offending bins, then IFFT
-       back. Each frame loses *its own* phase contribution at those
+       using :func:`detect_fpn_peaks` (with annular floor by default,
+       see that function's docstring for the rationale).
+    3. **Pass 2 — per-frame notch.** Apply the detected notch mask to
+       each frame's individual FFT, zeroing the offending bins, then
+       IFFT back. Each frame loses *its own* phase contribution at those
        bins — different per frame, but at fixed spatial coordinates.
+
+    Per-chunk adaptive notching (when n_chunks > 1)
+    -----------------------------------------------
+    When ``n_chunks > 1``, the routine splits the recording into
+    ``n_chunks`` temporal segments and detects peaks INDEPENDENTLY in
+    each segment, applying segment-specific notch masks to the frames
+    in that segment. This is essential for sessions where the
+    contamination's spectral character evolves over time (warm-up
+    transients, thermal drift, episodic bursts) — phenomena the
+    chunked diagnostic ``diagnose_chunked_perframe.py`` makes visible.
+
+    The motivating case is strohA sa-000093: the contamination
+    amplitude at lattice fundamental (52, 12) cyc/px ramps from
+    ~23k in chunks 0-7 (baseline, first ~22 minutes) to ~493k in
+    chunks 16-17 (~7 minutes near the end, 21x baseline). A single
+    global pooled-magnitude analysis averages across this and
+    detects (52, 12) at moderate prominence, under-notching the
+    late-session contamination by ~5x while over-notching the early-
+    session baseline. Per-chunk detection sizes the notch correctly
+    in each segment.
+
+    Algorithm with n_chunks > 1
+    ---------------------------
+    PASS 1 (per chunk):
+      - Compute pooled magnitude over chunk_k frames only
+      - Run detect_fpn_peaks on chunk_k's pooled magnitude
+      - Store chunk_k's notch mask
+    PASS 2 (per chunk):
+      - For each chunk k, apply chunk_k's notch mask to its frames
+      - Frames at chunk boundaries see step transitions in the notch
+        mask (no smoothing) — acceptable for typical lattice
+        contamination that varies smoothly anyway, would matter for
+        contamination with sharp temporal edges (rare in 2P).
+
+    Chunks always end with one chunk catching any remainder when T is
+    not evenly divisible by n_chunks (no frames are dropped).
+
+    Edge cases
+    ----------
+    - n_chunks > T // min_frames_per_chunk: actual chunks capped to
+      avoid statistical instability of pooled-magnitude estimates with
+      too few frames per chunk. The function logs the adjustment.
+    - n_chunks = 1: single-chunk path (backward compatible with the
+      original implementation).
+    - A chunk with no peaks detected: its notch mask is empty, frames
+      in that chunk pass through unchanged.
+    - All chunks empty: routine returns input stack unchanged (no
+      allocation of cleaned/pattern outputs).
 
     Compose with :func:`subtract_fixed_pattern` for mixed-stationarity
     cases (e.g. Apr-22 strohA with coherence ratio 0.28 at the lattice):
@@ -654,40 +764,34 @@ def subtract_per_frame_pattern(stack: np.ndarray,
         off-axis, the same disk size protects the same content.
     prominence_db : float
         Minimum dB above the spectral floor for a candidate peak.
-        Default 15.0 — same as :func:`subtract_fixed_pattern`. An
-        a-priori argument that the pooled spectrum has T-times higher
-        SNR than the temporal mean (so the threshold could be tighter)
-        is wrong: pooling magnitudes averages |signal + noise| ≈
-        |signal| at each bin, so the absolute prominence of a real
-        peak is comparable to a single-frame value, not T-times
-        higher. The gain over per-frame analysis is in floor
-        *stability* (variance drops as 1/√T), not floor *level*. The
-        same 15 dB threshold therefore catches genuine lattice peaks
-        in both cases. Calibrated against sa-000093 (T=110880):
-        lattice peaks at (±52, ±12) cyc/px register at +15-20 dB
-        prominence, well-separated from cell-content baseline at +2-5 dB.
+        Default 15.0 — same as :func:`subtract_fixed_pattern`. With
+        ``detect_fpn_peaks``'s default ``annular_floor=True``, this
+        is measured against the local radial floor (not the global
+        median), giving correct sensitivity at all radii. See
+        :func:`detect_fpn_peaks` for details.
     max_peaks : int
-        Hard cap on detected peaks. Default 32, matching
-        :func:`subtract_fixed_pattern`. Larger than naively necessary
-        because a 2D lattice with multiple harmonics produces 4-fold
-        conjugate quartets — sa-000093 fills 9 of the 32 slots
-        (1 Nyquist + 4 fundamental lattice + 4 first-harmonic
-        lattice), other sessions may fill more.
+        Hard cap on detected peaks per chunk. Default 32, matching
+        :func:`subtract_fixed_pattern`. Each chunk gets its own cap;
+        the union across chunks may be larger.
     batch_size : int
         Frames per GPU/CPU batch in both pass 1 and pass 2. Default 512.
-        With H=W=512 float32, one batch is ``batch_size`` MB on host
-        and roughly 2-4× that on GPU (input + FFT workspace + output).
-        For a 96 GB GPU, ``batch_size=1024`` is comfortable; for 16 GB
-        cards, stay at 256-512.
     return_pattern : bool
-        If True, return ``(cleaned, pattern)`` where ``pattern`` is the
-        per-frame ``(T, H, W)`` contamination that was subtracted.
-        Memory cost: doubles peak host RAM. Useful for QC plots.
+        If True, return ``(cleaned, pattern)``.
     use_gpu : bool
-        When True, the per-frame FFTs run on CuPy if available, falling
-        back to NumPy if not. Falsy default for safety; for sessions
-        with T > ~10⁴ frames at 512×512, enabling GPU drops wall time
-        from minutes to seconds.
+        When True, FFTs run on CuPy if available, NumPy fallback otherwise.
+    n_chunks : int
+        Number of temporal chunks for per-chunk peak detection. Default
+        1 (single-chunk, equivalent to the pre-refactor behaviour). Set
+        to 20 for typical multi-minute sessions where contamination
+        evolves; the chunked diagnostic
+        :file:`utilities/diagnose_chunked_perframe.py` helps tune this
+        for a given dataset.
+    min_frames_per_chunk : int
+        Floor on chunk size in frames. If
+        ``T // n_chunks < min_frames_per_chunk``, the effective chunk
+        count is reduced so each chunk has at least this many frames.
+        Default 500 — well above the few-hundred-frame regime where
+        pooled-magnitude peak detection becomes statistically unstable.
 
     Returns
     -------
@@ -696,134 +800,98 @@ def subtract_per_frame_pattern(stack: np.ndarray,
     pattern : (T, H, W) ndarray, optional
         Only when ``return_pattern=True``. The per-frame contamination
         that was subtracted (i.e. ``stack - cleaned``).
-
-    Memory
-    ------
-    Pass 1 streams batches and accumulates a single (H, W) magnitude
-    buffer — peak host RAM is ``batch_size × H × W × 4 bytes``.
-
-    Pass 2 streams batches but writes into a (T, H, W) output array —
-    peak host RAM is ``T × H × W × 4 bytes`` for the output plus one
-    batch in flight. For T=110880, H=W=512, that's 110 GB. Comfortable
-    on lab workstations with ≥256 GB RAM; for memory-tight environments,
-    use ``return_pattern=False`` (avoids the second large allocation)
-    and consider raising the input dtype-check to require float32 input
-    (avoiding a host-side astype copy).
-
-    No-op gate
-    ----------
-    If the top peak in the pooled magnitude is less than
-    ``prominence_db`` above the spectral floor, the routine concludes
-    no real lattice is present, logs an info message, and returns the
-    input stack unchanged (no Pass 2, no allocation). This makes the
-    routine safe to enable session-wide: sessions without a frame-
-    varying lattice incur only the Pass 1 cost (~20 s on GPU for
-    T=10⁵).
-
-    Diagnostics
-    -----------
-    Logs at INFO:
-      - pass 1: time, top peak prominence in pooled magnitude
-      - peak count, notch mask coverage as % of spectrum
-      - pass 2: time, mean and max |pattern| amplitude
-      - no-op: peak prominence below threshold, returning unchanged
     """
-    xp = _detrend_xp(use_gpu)  # reuse the existing GPU dispatcher
+    import time as _time
 
+    xp = _detrend_xp(use_gpu)  # reuse the existing GPU dispatcher
     stack = np.asarray(stack)
     T, H, W = stack.shape
-    log.info("subtract_per_frame_pattern: T=%d, H=%d, W=%d, batch=%d, backend=%s",
-              T, H, W, batch_size, "cupy" if xp is not np else "numpy")
 
-    # ---- PASS 1: pool magnitude spectra across all frames ----
-    import time as _time
+    # ---- Determine effective chunk count ----
+    requested_chunks = max(1, int(n_chunks))
+    max_chunks_for_t = max(1, T // max(1, min_frames_per_chunk))
+    actual_chunks = min(requested_chunks, max_chunks_for_t)
+    if actual_chunks != requested_chunks:
+        log.info("subtract_per_frame_pattern: requested n_chunks=%d but only "
+                  "T=%d frames; using %d chunks of ~%d frames each",
+                  requested_chunks, T, actual_chunks, T // actual_chunks)
+
+    log.info("subtract_per_frame_pattern: T=%d, H=%d, W=%d, batch=%d, "
+              "n_chunks=%d, backend=%s",
+              T, H, W, batch_size, actual_chunks,
+              "cupy" if xp is not np else "numpy")
+
+    # Chunk boundaries — last chunk catches any remainder
+    chunk_size = T // actual_chunks
+    chunk_bounds = [(k * chunk_size,
+                      (k + 1) * chunk_size if k < actual_chunks - 1 else T)
+                     for k in range(actual_chunks)]
+
+    # ---- PASS 1: per-chunk pooled magnitude + peak detection ----
     t0 = _time.perf_counter()
-    A_pooled = xp.zeros((H, W), dtype=xp.float32)
-    n_done = 0
-    for s in range(0, T, batch_size):
-        e = min(s + batch_size, T)
-        batch = stack[s:e].astype(np.float32, copy=False)
-        # Move batch onto whichever backend we're using
-        batch_xp = xp.asarray(batch) if xp is not np else batch
-        # Per-frame demean → batched fft2 over the time axis →
-        # accumulate magnitudes. fftshift is folded in after the sum
-        # to save one shift per batch (fftshift is a permutation, so
-        # sum-then-shift = shift-then-sum).
-        batch_xp = batch_xp - batch_xp.mean(axis=(1, 2), keepdims=True)
-        F = xp.fft.fft2(batch_xp)
-        A_pooled += xp.abs(F).sum(axis=0)
-        n_done = e
-        if (e // batch_size) % 20 == 0 or e == T:
-            log.debug("subtract_per_frame_pattern pass 1: %d/%d frames",
-                       n_done, T)
-    A_pooled = xp.fft.fftshift(A_pooled / T)
-
-    # Bring pooled magnitude to host for peak detection (small, (H,W))
-    A_pooled_host = (np.asarray(A_pooled) if xp is np
-                      else xp.asnumpy(A_pooled))
+    chunk_masks = []   # list of (H, W) bool, in fftshifted coords
+    chunk_peak_counts = []
+    for k, (cs, ce) in enumerate(chunk_bounds):
+        A_chunk = _pool_magnitude_xp(stack, cs, ce, xp, batch_size)
+        notch_mask_k, _ = detect_fpn_peaks(
+            A_chunk,
+            cell_scale_px=cell_scale_px,
+            prominence_db=prominence_db,
+            max_peaks=max_peaks,
+            magnitude_in=True,
+        )
+        chunk_masks.append(notch_mask_k)
+        n_bins = int(notch_mask_k.sum())
+        chunk_peak_counts.append(n_bins)
+        if actual_chunks > 1:
+            log.debug("  chunk %d/%d (frames %d-%d): %d bins notched",
+                       k + 1, actual_chunks, cs, ce, n_bins)
     t_pass1 = _time.perf_counter() - t0
 
-    # ---- Peak detection on the pooled magnitude ----
-    notch_mask, _ = detect_fpn_peaks(
-        A_pooled_host,
-        cell_scale_px=cell_scale_px,
-        prominence_db=prominence_db,
-        max_peaks=max_peaks,
-        magnitude_in=True,
-    )
-    n_notched = int(notch_mask.sum())
+    total_bins = sum(chunk_peak_counts)
+    union_mask = np.any(np.stack(chunk_masks), axis=0)
+    union_bins = int(union_mask.sum())
 
-    # Probe the top peak's prominence above floor for the no-op gate.
-    # If we couldn't find any peak above the threshold, detect_fpn_peaks
-    # returned an empty notch_mask and we should return early.
-    if n_notched == 0:
+    # ---- No-op gate: if EVERY chunk has empty mask, return unchanged ----
+    if total_bins == 0:
         log.info("subtract_per_frame_pattern: pass 1 done in %.1fs, "
-                  "no peaks above %.1f dB prominence; returning unchanged",
-                  t_pass1, prominence_db)
+                  "no peaks above %.1f dB prominence in any chunk; "
+                  "returning unchanged", t_pass1, prominence_db)
         if return_pattern:
-            return stack.astype(np.float32, copy=True), \
-                   np.zeros_like(stack, dtype=np.float32)
+            return (stack.astype(np.float32, copy=True),
+                    np.zeros_like(stack, dtype=np.float32))
         return stack.astype(np.float32, copy=False)
 
     log.info("subtract_per_frame_pattern: pass 1 done in %.1fs, "
-              "%d FFT bins notched (%.3f%% of spectrum)",
-              t_pass1, n_notched, 100.0 * n_notched / (H * W))
+              "%d bins notched cumulatively across %d chunks "
+              "(union: %d unique bins, %.3f%% of spectrum)",
+              t_pass1, total_bins, actual_chunks, union_bins,
+              100.0 * union_bins / (H * W))
 
-    # The notch mask was built in fftshifted coordinates (DC at centre).
-    # For pass-2 application we need un-shifted coordinates to match
-    # what cp.fft.fft2 produces directly. ifftshift inverts fftshift.
-    notch_mask_unshifted = np.fft.ifftshift(notch_mask)
-    notch_mask_xp = (xp.asarray(notch_mask_unshifted) if xp is not np
-                      else notch_mask_unshifted)
+    # Convert masks to unshifted GPU/CPU coords for pass 2
+    chunk_masks_xp = [
+        xp.asarray(np.fft.ifftshift(m)) if xp is not np
+        else np.fft.ifftshift(m)
+        for m in chunk_masks
+    ]
 
-    # ---- PASS 2: apply per-frame notch ----
+    # ---- PASS 2: per-chunk notch application ----
     t0 = _time.perf_counter()
     cleaned = np.empty_like(stack, dtype=np.float32)
-    pattern_acc = np.empty_like(stack, dtype=np.float32) if return_pattern else None
-    for s in range(0, T, batch_size):
-        e = min(s + batch_size, T)
-        batch = stack[s:e].astype(np.float32, copy=False)
-        batch_xp = xp.asarray(batch) if xp is not np else batch
-        means = batch_xp.mean(axis=(1, 2), keepdims=True)
-        F = xp.fft.fft2(batch_xp - means)
-        # Compute the contamination contribution (notched bins only)
-        # by zeroing the *complement* of the mask, then ifft. The
-        # cleaned output is then the input minus this contamination.
-        if return_pattern:
-            F_pattern = F * notch_mask_xp[None, :, :]
-            pat = xp.real(xp.fft.ifft2(F_pattern))
-            cleaned_batch = batch_xp - pat
-            cleaned[s:e] = (np.asarray(cleaned_batch) if xp is np
-                            else xp.asnumpy(cleaned_batch))
-            pattern_acc[s:e] = (np.asarray(pat) if xp is np
-                                else xp.asnumpy(pat))
-        else:
-            # Zero notched bins, ifft. Faster than the return_pattern
-            # path because we don't materialise pattern.
-            F = F * (~notch_mask_xp)[None, :, :]
-            cleaned_batch = xp.real(xp.fft.ifft2(F)) + means
-            cleaned[s:e] = (np.asarray(cleaned_batch) if xp is np
-                            else xp.asnumpy(cleaned_batch))
+    pattern_acc = (np.empty_like(stack, dtype=np.float32)
+                    if return_pattern else None)
+
+    for k, (cs, ce) in enumerate(chunk_bounds):
+        if chunk_peak_counts[k] == 0:
+            # No peaks in this chunk; copy through (still cast to float32)
+            for s in range(cs, ce, batch_size):
+                e = min(s + batch_size, ce)
+                cleaned[s:e] = stack[s:e].astype(np.float32, copy=False)
+                if return_pattern:
+                    pattern_acc[s:e] = 0.0
+            continue
+        _apply_notch_xp(stack, cs, ce, chunk_masks_xp[k],
+                          cleaned, pattern_acc, xp, batch_size)
     t_pass2 = _time.perf_counter() - t0
 
     if return_pattern:
@@ -1240,12 +1308,17 @@ def recommend_corrections(report: Dict[str, Any],
     # fraction, then this routine for the rest. Gated by the
     # ``frame_varying_pattern`` flag in the JSON; runs on GPU via
     # CuPy when available (gracefully falls back to NumPy otherwise).
-    # Other thresholds (cell_scale_px, prominence_db, max_peaks,
-    # batch_size) use the function defaults; tune by editing the
-    # function signature or pass kwargs from the calling pipeline if
-    # session-specific tuning is needed.
+    # n_chunks=20 enables per-chunk adaptive notching, which is
+    # essential for sessions where contamination amplitude evolves
+    # over time (e.g. strohA sa-000093 shows 21x amplitude swing at
+    # the lattice fundamental from session start to end). For
+    # sessions with T < 10000 frames, the function automatically
+    # reduces n_chunks via the min_frames_per_chunk floor. Other
+    # thresholds (cell_scale_px, prominence_db, max_peaks,
+    # batch_size) use the function defaults.
     if _flagged("frame_varying_pattern"):
-        ops.append((subtract_per_frame_pattern, {"use_gpu": True}))
+        ops.append((subtract_per_frame_pattern,
+                     {"use_gpu": True, "n_chunks": 20}))
 
     if _flagged("periodic_temporal_global"):
         # Default: common-mode regression. It removes whatever is globally
