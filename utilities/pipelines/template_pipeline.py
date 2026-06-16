@@ -737,6 +737,15 @@ if __name__ == "__main__":
         _osc_gpu      = bool(getattr(_osc_cfg, "use_gpu",   True))
         _osc_adaptive = bool(getattr(_osc_cfg, "adaptive",  True))
 
+        # Skip cleanly when there is nothing to analyse: no neural traces AND
+        # no background. OscillationAnalyzer raises RuntimeError("No usable
+        # signal") in that case, which would otherwise abort before the report
+        # is written (results are already saved by this point).
+        _C = getattr(cnm2.estimates, "C", None)
+        _f = getattr(cnm2.estimates, "f", None)
+        _has_neural = _C is not None and getattr(_C, "shape", (0,))[0] > 0
+        _has_bg     = _f is not None and getattr(_f, "shape", (0,))[0] > 0
+
         @timer.step("Oscillation analysis")
         def run_oscillation():
             global _osc_npz
@@ -762,8 +771,17 @@ if __name__ == "__main__":
             if _osc_npz:
                 qc.oscillation(_osc_npz)
 
-        run_oscillation()
-        qc_oscillation_step()
+        if not (_has_neural or _has_bg):
+            logger.warning("Oscillation analysis skipped: no neural traces and "
+                           "no background in estimates (nothing to analyse).")
+        else:
+            # A failure here must not suppress the report — results are saved.
+            try:
+                run_oscillation()
+                qc_oscillation_step()
+            except Exception as _osc_err:
+                logger.warning(f"Oscillation analysis failed ({_osc_err!r}); "
+                               "continuing to report.")
 
     # ── 8. Report ─────────────────────────────────────────────────────────
     if _osc_enable and _osc_npz:
