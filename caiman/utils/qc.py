@@ -456,6 +456,18 @@ def _qc_footprints(
     K      = A.shape[1]
     d1, d2 = cnm.dims
 
+    # No components: A_dense.max(axis=1) on a zero-width array raises
+    # "zero-size array to reduction". Render an empty panel instead of
+    # dumping a traceback into every empty run.
+    if A is None or K == 0:
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+        ax.imshow(Cn if Cn is not None else np.zeros((d1, d2)), cmap="gray")
+        ax.set_title(f"{title} — 0 components")
+        ax.axis("off")
+        fig.savefig(str(out_path), dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return str(out_path)
+
     A_dense = np.asarray(A.todense())                   # (d1*d2, K)
     A_max   = A_dense.max(axis=1).reshape(d1, d2, order="F")
 
