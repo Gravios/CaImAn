@@ -34,6 +34,10 @@ def main():
     p.add_argument("--input", "-i", type=Path, required=True)
     p.add_argument("--output", "-o", type=Path, default=Path("./diag_pll"))
     p.add_argument("--smooth-window-frames", type=int, default=1000)
+    p.add_argument("--omega-track-window-frames", type=int, default=None,
+                    help="enable time-varying omega tracking with the given "
+                         "window (default: scalar omega per bin). Recommended: "
+                         "smooth_window_frames // 5.")
     p.add_argument("--max-bins-to-plot", type=int, default=6)
     p.add_argument("--use-gpu", action="store_true")
     p.add_argument("--max-frames", type=int, default=None,
@@ -61,6 +65,7 @@ def main():
     cleaned, diag, pattern = subtract_scanner_pll(
         stack,
         smooth_window_frames=args.smooth_window_frames,
+        omega_track_window_frames=args.omega_track_window_frames,
         use_gpu=args.use_gpu,
         return_diagnostics=True,
     )
@@ -69,6 +74,9 @@ def main():
     np.save(args.output / "trajectories.npy", diag["trajectories"])
     np.save(args.output / "corrections.npy", diag["corrections"])
     np.save(args.output / "omega_per_bin.npy", diag["omega_per_bin"])
+    np.save(args.output / "demod_phase.npy", diag["demod_phase"])
+    if diag.get("omega_t") is not None:
+        np.save(args.output / "omega_t.npy", diag["omega_t"])
 
     # Per-bin summary text
     cy, cx = H // 2, W // 2
@@ -77,6 +85,7 @@ def main():
         f.write(f"input: {args.input}\n")
         f.write(f"T={T}, H={H}, W={W}\n")
         f.write(f"smooth_window_frames={args.smooth_window_frames}\n")
+        f.write(f"omega_track_window_frames={args.omega_track_window_frames}\n")
         f.write(f"n_bins: {diag['n_bins']}\n")
         f.write(f"median_coherence_lag1:  {diag['median_coherence_lag1']:.4f}\n")
         f.write(f"median_coherence_lag10: {diag['median_coherence_lag10']:.4f}\n")
@@ -152,23 +161,40 @@ def main():
         ax.set_xlabel("frame")
         ax.legend(fontsize=7)
 
-        # Panel 3: phase over time (unwrapped, with linear drift)
+        # Panel 3: phase over time (unwrapped), with the PLL's actual
+        # model phase overlaid. For scalar omega this is a straight
+        # line; for time-varying omega this curves with the drift.
         ax = axes[i, 2]
         phase_raw = np.unwrap(np.angle(traj))
-        # Show the linear drift line for visual reference
-        drift_line = omegas[k] * t_axis + phase_raw[0]
+        model_phase = diag["demod_phase"][:, k]
+        # Offset model so it starts at phase_raw[0] (the model has
+        # arbitrary integration constant; we anchor to the raw)
+        model_phase_anchored = model_phase + (phase_raw[0] - model_phase[0])
         ax.plot(t_axis, phase_raw, color='gray', alpha=0.3, linewidth=0.4,
                  label='phase(F)')
-        ax.plot(t_axis, drift_line, color='C3', linewidth=1.2,
-                 linestyle='--', label=f'linear drift fit')
-        ax.set_title("phase (unwrapped)", fontsize=9)
+        ax.plot(t_axis, model_phase_anchored, color='C3', linewidth=1.2,
+                 linestyle='--', label='PLL model phase')
+        # If time-varying omega, also indicate the omega(t) trajectory
+        # as a secondary y-axis to show frequency drift visually.
+        if diag.get("omega_t") is not None:
+            ax2 = ax.twinx()
+            ax2.plot(t_axis[1:], diag["omega_t"][:, k], color='C4',
+                      alpha=0.6, linewidth=0.6, label='ω(t) [rad/fr]')
+            ax2.set_ylabel("ω(t)", color='C4', fontsize=8)
+            ax2.tick_params(axis='y', labelcolor='C4', labelsize=7)
+        ax.set_title("phase (unwrapped) + PLL model", fontsize=9)
         ax.set_xlabel("frame")
         ax.set_ylabel("radians")
-        ax.legend(fontsize=7)
+        ax.legend(fontsize=7, loc='upper left')
 
+    omega_track_note = (
+        f"  |  ω-track window={args.omega_track_window_frames}"
+        if args.omega_track_window_frames is not None
+        else "  |  scalar ω")
     title = (f"PLL trajectory diagnostic — {args.input.name}\n"
-             f"T={T}, K={diag['n_bins']}, smooth window={args.smooth_window_frames} "
-             f"|  median coh-lag1 = {diag['median_coherence_lag1']:.3f}")
+             f"T={T}, K={diag['n_bins']}, smooth window={args.smooth_window_frames}"
+             f"{omega_track_note}"
+             f"  |  median coh-lag1 = {diag['median_coherence_lag1']:.3f}")
     fig.suptitle(title, fontsize=10)
     fig.tight_layout()
     out_png = args.output / "pll_trajectories.png"

@@ -323,6 +323,7 @@ def _diagnose_phase_dynamics(trajectories: np.ndarray,
 def subtract_scanner_pll(stack: np.ndarray,
                           lattice_bins: Optional[List[Tuple[int, int]]] = None,
                           smooth_window_frames: int = 1000,
+                          omega_track_window_frames: Optional[int] = None,
                           detect_n_chunks: int = 20,
                           detect_min_frames_per_chunk: int = 500,
                           detect_cell_scale_px: float = 12.0,
@@ -388,6 +389,19 @@ def subtract_scanner_pll(stack: np.ndarray,
         this corresponds to ~33 seconds of smoothing — well above cell
         transient timescales (1-3 s) and well below session-evolution
         timescales (5-60 min).
+    omega_track_window_frames : int or None
+        If None (default), the carrier rate ω_k at each lattice bin is
+        estimated once as a scalar (constant across the session). This
+        is appropriate when the scanner's resonance frequency is
+        thermally stable over the session. If set, ω_k(t) is tracked
+        with a sliding-window circular mean of complex ratios, and the
+        cumulative phase is used for demodulation. This handles slow
+        frequency drift (e.g. mirror warming up by 1 spectral bin per
+        ~5500 frames as observed on sa-000093). Recommended setting:
+        omega_track_window_frames = smooth_window_frames // 5 (factor-
+        of-5 separation from the loop filter bandwidth). Setting this
+        larger than smooth_window_frames defeats the purpose and emits
+        a warning.
     detect_n_chunks, detect_min_frames_per_chunk, detect_cell_scale_px,
     detect_prominence_db, detect_max_peaks :
         Forwarded to the lattice-bin detection step. Defaults match
@@ -500,32 +514,105 @@ def subtract_scanner_pll(stack: np.ndarray,
     F_mean = trajectories.mean(axis=0, keepdims=True)  # (1, K) complex
     deviations = (trajectories - F_mean).astype(np.complex64)
 
-    # Per-bin rate estimate: circular mean of consecutive phase differences,
-    # measured on the deviations. With the static baseline removed, the
-    # dominant term in `deviations` is the rotating contamination, so its
-    # mean per-frame phase shift IS ω_k.
-    # Implementation: ratio of consecutive complex values, then circular
-    # mean. Robust to phase wrapping (no unwrap needed).
-    with np.errstate(invalid='ignore'):
-        ratios = deviations[1:] * np.conj(deviations[:-1])      # (T-1, K)
-        # Weight by amplitude to suppress noise-dominated samples
-        rate_vector = ratios.mean(axis=0)                       # (K,) complex
-        omega_per_bin = np.angle(rate_vector).astype(np.float32) # (K,) rad/frame
+    # Compute `demod_phase` of shape (T, K), the cumulative phase that
+    # describes the carrier rotation at each frame. The demod/smooth/
+    # remod cycle below uses this uniformly regardless of how it was
+    # estimated. Two estimators are available:
+    #
+    # 1. Scalar omega per bin (default; omega_track_window_frames=None):
+    #    a single rate ω_k for the whole session, estimated as the
+    #    circular mean of consecutive complex ratios. Gives
+    #    demod_phase[t, k] = t · ω_k. Works when the scanner is
+    #    thermally stable; fails when the resonance frequency drifts
+    #    over the session (chunked diagnostic shows ~1 spectral bin
+    #    per 5500 frames on sa-000093).
+    #
+    # 2. Time-varying omega(t) per bin (when omega_track_window_frames
+    #    is set): sliding-window circular mean of consecutive complex
+    #    ratios, giving an omega_t(t, k) trajectory. Cumulative sum
+    #    of omega_t gives demod_phase. Tracks thermal drift and other
+    #    slow scanner-rate changes. Tracking window must be SHORTER
+    #    than smooth_window_frames (otherwise the omega tracker would
+    #    smooth away the same scanner drift the loop filter is meant
+    #    to preserve) but LONGER than per-frame noise correlation
+    #    (so the rate estimate isn't dominated by jitter). The default
+    #    omega_track_window_frames = smooth_window_frames / 5 gives a
+    #    factor-of-5 separation, which works in practice.
+    #
+    # Both estimators benefit from the F_mean subtraction above: with
+    # the static cell baseline removed, the dominant term in
+    # `deviations` is the rotating contamination, so the angle of
+    # successive complex ratios IS the contamination's per-frame phase
+    # increment.
 
-    log.info("subtract_scanner_pll: estimated per-bin phase rates: "
-              "min=%+.4f, median=%+.4f, max=%+.4f rad/frame",
-              float(omega_per_bin.min()),
-              float(np.median(omega_per_bin)),
-              float(omega_per_bin.max()))
+    with np.errstate(invalid='ignore'):
+        ratios = deviations[1:] * np.conj(deviations[:-1])  # (T-1, K) complex
+
+    if omega_track_window_frames is not None and omega_track_window_frames > 0:
+        # --- Time-varying omega(t) tracking ---
+        if omega_track_window_frames >= smooth_window_frames:
+            log.warning(
+                "subtract_scanner_pll: omega_track_window_frames=%d >= "
+                "smooth_window_frames=%d; the omega tracker will smooth "
+                "away the same drift the loop filter tries to preserve. "
+                "Recommend omega_track_window_frames < smooth_window_frames / 3.",
+                omega_track_window_frames, smooth_window_frames)
+        omega_track_sigma = max(1.0, omega_track_window_frames / 6.0)
+        # Sliding-window mean of complex ratios, then angle: this is
+        # the local circular mean, weighted naturally by ratio magnitude
+        # (which is proportional to |deviation|^2, so noise-dominated
+        # frames contribute less to the estimate).
+        rr = ndimage.gaussian_filter1d(
+            ratios.real.astype(np.float32),
+            sigma=omega_track_sigma, axis=0, mode='nearest')
+        ri = ndimage.gaussian_filter1d(
+            ratios.imag.astype(np.float32),
+            sigma=omega_track_sigma, axis=0, mode='nearest')
+        omega_t = np.arctan2(ri, rr).astype(np.float32)  # (T-1, K) rad/frame
+        # Build cumulative phase of length T. The initial phase is
+        # arbitrary (the bin's absolute phase is folded into the
+        # static baseline F_mean, which we already removed); set
+        # demod_phase[0, :] = 0 so cumsum integrates from there.
+        omega_init = np.zeros((1, K), dtype=np.float32)
+        demod_phase = np.cumsum(
+            np.vstack([omega_init, omega_t]), axis=0
+        ).astype(np.float32)  # (T, K)
+        # For logging / diagnostics, also compute a scalar summary
+        omega_per_bin = np.median(omega_t, axis=0).astype(np.float32)
+        log.info("subtract_scanner_pll: time-varying omega tracking; "
+                  "window=%d frames, sigma=%.1f; per-bin median "
+                  "rate: min=%+.4f, median=%+.4f, max=%+.4f rad/frame; "
+                  "per-bin omega(t) std (drift indicator): "
+                  "min=%.5f, median=%.5f, max=%.5f rad/frame",
+                  omega_track_window_frames, omega_track_sigma,
+                  float(omega_per_bin.min()),
+                  float(np.median(omega_per_bin)),
+                  float(omega_per_bin.max()),
+                  float(omega_t.std(axis=0).min()),
+                  float(np.median(omega_t.std(axis=0))),
+                  float(omega_t.std(axis=0).max()))
+    else:
+        # --- Scalar omega per bin (original behavior) ---
+        with np.errstate(invalid='ignore'):
+            rate_vector = ratios.mean(axis=0)             # (K,) complex
+            omega_per_bin = np.angle(rate_vector).astype(np.float32)
+        t_axis = np.arange(T, dtype=np.float32)[:, None]  # (T, 1)
+        demod_phase = (t_axis * omega_per_bin[None, :]).astype(np.float32)  # (T, K)
+        omega_t = None
+        log.info("subtract_scanner_pll: scalar omega estimation; "
+                  "per-bin rates: min=%+.4f, median=%+.4f, max=%+.4f rad/frame",
+                  float(omega_per_bin.min()),
+                  float(np.median(omega_per_bin)),
+                  float(omega_per_bin.max()))
 
     sigma = max(1.0, smooth_window_frames / 6.0)
     t_smooth = _time.perf_counter()
 
-    # Demodulate: multiply trajectory by exp(-i·ω_k·t) so the rotating
-    # contamination becomes static (in the rotating-frame coordinates).
-    t_axis = np.arange(T, dtype=np.float32)[:, None]            # (T, 1)
-    demod_phases = -t_axis * omega_per_bin[None, :]             # (T, K)
-    demod_factor = np.exp(1j * demod_phases).astype(np.complex64)
+    # Demodulate: multiply trajectory by exp(-i · demod_phase) so the
+    # rotating contamination becomes (approximately) static. For the
+    # scalar-omega path this is exp(-i · ω_k · t); for the time-varying
+    # path it's exp(-i · ∫ω_k(s) ds).
+    demod_factor = np.exp(-1j * demod_phase).astype(np.complex64)
     deviations_demod = deviations * demod_factor
 
     # Smooth in the rotating frame: now the slowly-varying amplitude is
@@ -538,10 +625,10 @@ def subtract_scanner_pll(stack: np.ndarray,
         sigma=sigma, axis=0, mode='nearest')
     deviations_demod_smooth = (real_smooth + 1j * imag_smooth).astype(np.complex64)
 
-    # Re-modulate: multiply by exp(+i·ω_k·t) to restore the carrier
-    # rotation. The result is the estimated contamination in the original
-    # (non-rotating) frame.
-    remod_factor = np.exp(-1j * demod_phases).astype(np.complex64)  # = exp(+i·ω_k·t)
+    # Re-modulate: multiply by exp(+i · demod_phase) to restore the
+    # carrier rotation. The result is the estimated contamination in
+    # the original (non-rotating) frame.
+    remod_factor = np.exp(+1j * demod_phase).astype(np.complex64)
     corrections = (deviations_demod_smooth * remod_factor).astype(np.complex64)
 
     log.info("subtract_scanner_pll: smoothed trajectories in %.1fs "
@@ -565,9 +652,12 @@ def subtract_scanner_pll(stack: np.ndarray,
         diag["trajectories"] = trajectories
         diag["deviations_demod_smooth"] = deviations_demod_smooth
         diag["omega_per_bin"] = omega_per_bin
+        diag["omega_t"] = omega_t  # (T-1, K) or None for scalar-omega path
+        diag["demod_phase"] = demod_phase  # (T, K)
         diag["corrections"] = corrections
         diag["bin_coords_shifted"] = bin_coords_shifted
         diag["smooth_window_frames"] = smooth_window_frames
+        diag["omega_track_window_frames"] = omega_track_window_frames
         return cleaned, diag, pattern
     return cleaned
 
