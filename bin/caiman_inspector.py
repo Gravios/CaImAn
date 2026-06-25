@@ -39,7 +39,7 @@ import pyqtgraph as pg
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QTableWidget,
-    QTableWidgetItem, QLabel, QFileDialog,
+    QTableWidgetItem, QLabel, QFileDialog, QComboBox,
     QMessageBox, QSizePolicy, QAbstractItemView, QHeaderView,
 )
 from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
@@ -154,8 +154,25 @@ class ComponentStore:
                  cnm_obj=None, fpath=None):
         self._A = _to_dense(A)
         self.C  = np.asarray(C, dtype=np.float32)
-        self.Cn = np.asarray(Cn, dtype=np.float32)
         self.dims = dims
+
+        # ── Background images ────────────────────────────────────────────────
+        # `Cn` is the *active* greyscale shown behind the footprints.  A named
+        # registry holds every available image so the user can switch live
+        # (correlation image, footprint max-projection, a loaded data
+        # projection, etc).  self.Cn always mirrors the active entry so the
+        # rest of the code can keep reading store.Cn unchanged.
+        self.backgrounds: dict = {}
+        self.bg_key = None
+        self.add_background("correlation",
+                            np.asarray(Cn, dtype=np.float32), make_active=True)
+        fp_max = self._A.max(axis=1).reshape(dims, order="F")
+        self.add_background("footprint max", fp_max)
+        # If the correlation image is (near-)flat — e.g. SUPPORT-denoised data
+        # saturates Cn to ~1.0 — fall back to the footprint projection, which
+        # at least reveals where the components sit.
+        if not _has_contrast(self.Cn):
+            self.set_background("footprint max")
 
         self.SNR_comp  = _opt_arr(SNR_comp)
         self.r_values  = _opt_arr(r_values)
@@ -169,6 +186,44 @@ class ComponentStore:
         # History stacks — each entry is (op_label: str, snapshot: dict)
         self._undo_stack: deque = deque(maxlen=HISTORY_MAXLEN)
         self._redo_stack: deque = deque(maxlen=HISTORY_MAXLEN)
+
+    # ── Background images ──────────────────────────────────────────────────────
+
+    def _coerce_bg(self, img) -> np.ndarray:
+        """Coerce an arbitrary image to a 2-D float32 array matching dims.
+
+        A 3-D stack (frames, h, w) is collapsed to a max-projection, so a raw
+        movie file can be dropped in directly as an 'actual cells' background.
+        A transposed image is auto-corrected.
+        """
+        a = np.asarray(img, dtype=np.float32).squeeze()
+        if a.ndim == 3:
+            a = a.max(axis=0)
+        if a.ndim != 2:
+            raise ValueError(f"background must be 2-D (got shape {a.shape})")
+        if a.shape == tuple(self.dims):
+            return np.ascontiguousarray(a)
+        if a.shape == tuple(self.dims)[::-1]:
+            return np.ascontiguousarray(a.T)
+        raise ValueError(
+            f"background shape {a.shape} does not match dims {tuple(self.dims)}")
+
+    def add_background(self, name: str, img, make_active: bool = False) -> str:
+        """Register a named background image (overwriting any same-named one)."""
+        self.backgrounds[name] = self._coerce_bg(img)
+        if make_active or self.bg_key is None:
+            self.set_background(name)
+        return name
+
+    def set_background(self, name: str):
+        if name not in self.backgrounds:
+            raise KeyError(name)
+        self.bg_key = name
+        self.Cn = self.backgrounds[name]
+
+    def background_names(self) -> list:
+        return list(self.backgrounds.keys())
+
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -407,6 +462,44 @@ def _opt_arr(x):
     return arr if arr.size > 0 else None   # treat empty arrays as absent
 
 
+def _has_contrast(img, eps: float = 1e-6) -> bool:
+    """True if an image has usable greyscale contrast.
+
+    Denoised data can saturate the correlation image to a near-constant
+    value (Cn ~ 1.0); such an image makes a useless background.
+    """
+    a = np.asarray(img, dtype=np.float32)
+    if a.size == 0 or not np.isfinite(a).any():
+        return False
+    finite = a[np.isfinite(a)]
+    ptp = float(finite.max() - finite.min())
+    return ptp > eps and float(finite.std()) > eps
+
+
+def _load_image_file(path: str) -> np.ndarray:
+    """Load a background image from .npy/.npz/.tif/.tiff/.png/.jpg.
+
+    Returns the raw array (2-D, or 3-D stack to be collapsed by the store).
+    Stacks are returned as-is so the caller can max-project them.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        return np.load(path)
+    if ext == ".npz":
+        with np.load(path) as z:
+            for key in ("projection", "img", "image", "Cn", "arr_0"):
+                if key in z:
+                    return z[key]
+            return z[z.files[0]]
+    if ext in (".tif", ".tiff"):
+        import tifffile
+        return tifffile.imread(path)
+    if ext in (".png", ".jpg", ".jpeg"):
+        from PIL import Image
+        return np.asarray(Image.open(path).convert("F"))
+    raise ValueError(f"unsupported background format: {ext}")
+
+
 # ── Correlation helper ───────────────────────────────────────────────────────
 
 def _active_pearson_corr(C: np.ndarray,
@@ -510,9 +603,53 @@ def load_from_hdf5(path: str) -> ComponentStore:
 
     _Cn = getattr(est, "Cn", None)
     Cn  = _Cn if _Cn is not None else A.max(axis=1).reshape(dims, order="F")
-    return ComponentStore(A, C, Cn, dims,
-                          SNR_comp=snr, r_values=rval, cnn_preds=cnn,
-                          cnm_obj=cnm, fpath=path)
+    store = ComponentStore(A, C, Cn, dims,
+                           SNR_comp=snr, r_values=rval, cnn_preds=cnn,
+                           cnm_obj=cnm, fpath=path)
+    _attach_sibling_backgrounds(store, path)
+    return store
+
+
+def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
+    """Register any data-projection image sitting next to the results file.
+
+    Looks for files whose name contains a projection-like token and whose
+    dimensions match the FOV.  If the active background (the correlation
+    image) is flat, a matched projection is auto-activated so the viewer
+    shows the actual cells instead of a blank field.
+    """
+    import glob
+    folder = _os_dirname(path)
+    stem   = os.path.splitext(os.path.basename(path))[0]
+    tokens = ("projection", "percentile", "mean", "median",
+              "max", "pnr", "summary", "anat", "template")
+    exts   = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
+
+    found = []
+    for f in sorted(glob.glob(os.path.join(folder, "*"))):
+        low = os.path.basename(f).lower()
+        if not low.endswith(exts):
+            continue
+        if not any(tok in low for tok in tokens):
+            continue
+        try:
+            img = _load_image_file(f)
+            if np.asarray(img).ndim != 2:   # skip stacks at auto-load
+                continue
+            name = os.path.splitext(os.path.basename(f))[0]
+            if name.startswith(stem):
+                name = name[len(stem):].lstrip("_-. ") or name
+            store.add_background(name, img)
+            found.append(name)
+        except Exception:
+            continue
+
+    if found and not _has_contrast(store.backgrounds.get("correlation")):
+        store.set_background(found[0])
+
+
+def _os_dirname(path: str) -> str:
+    return os.path.abspath(os.path.dirname(path)) or "."
 
 
 # ── RGBA overlay builder ──────────────────────────────────────────────────────
@@ -674,6 +811,11 @@ class CellViewer(pg.GraphicsLayoutWidget):
     def set_show_all(self, flag: bool):
         self._show_all = bool(flag)
         self.refresh_rois()
+
+    def refresh_background(self):
+        """Redraw after the store's active background image has changed."""
+        self._redraw()
+
 
     def toggle_bg(self):
         self._invert_bg = not self._invert_bg
@@ -1241,6 +1383,12 @@ class InspectorWindow(QMainWindow):
         a.setShortcut(QKeySequence("F5"))
         a.triggered.connect(self._full_refresh)
         vm.addAction(a)
+        vm.addSeparator()
+        a = QAction("Load &background image…", self)
+        a.setToolTip("Load a data projection / anatomical image (.npy/.tif/.png) "
+                     "to show behind the footprints.")
+        a.triggered.connect(self._load_background)
+        vm.addAction(a)
 
         em = mb.addMenu("&Edit")
         self.act_undo = QAction("↩  Undo", self)
@@ -1317,6 +1465,17 @@ class InspectorWindow(QMainWindow):
         self.act_show_rois.triggered.connect(
             lambda checked: self.cell_view.set_show_all(checked))
         tb.addAction(self.act_show_rois)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel("  BG: "))
+        self.bg_combo = QComboBox(self)
+        self.bg_combo.setToolTip(
+            "Background image shown behind the footprints.\n"
+            "Use View ▸ Load background image… to add a data projection.")
+        self.bg_combo.setMinimumWidth(140)
+        self.bg_combo.currentTextChanged.connect(self._on_bg_changed)
+        tb.addWidget(self.bg_combo)
+        self._refresh_bg_combo()
 
         self.act_dist_log = QAction("log₁₀  Dist", self)
         self.act_dist_log.setToolTip(
@@ -1603,12 +1762,52 @@ class InspectorWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Save error", str(exc))
 
+    # ── Background image ──────────────────────────────────────────────────────
+
+    def _refresh_bg_combo(self):
+        """Repopulate the background selector to match the current store."""
+        self.bg_combo.blockSignals(True)
+        self.bg_combo.clear()
+        self.bg_combo.addItems(self.store.background_names())
+        if self.store.bg_key is not None:
+            self.bg_combo.setCurrentText(self.store.bg_key)
+        self.bg_combo.blockSignals(False)
+
+    def _on_bg_changed(self, name: str):
+        if not name or name == self.store.bg_key:
+            return
+        try:
+            self.store.set_background(name)
+        except KeyError:
+            return
+        self.cell_view.refresh_background()
+        self.statusBar().showMessage(f"Background → {name}")
+
+    def _load_background(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load background image", "",
+            "Images (*.npy *.npz *.tif *.tiff *.png *.jpg *.jpeg);;All files (*)")
+        if not path:
+            return
+        try:
+            img  = _load_image_file(path)
+            name = os.path.splitext(os.path.basename(path))[0]
+            self.store.add_background(name, img, make_active=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Background error", str(exc))
+            return
+        self._refresh_bg_combo()
+        self.cell_view.refresh_background()
+        self.statusBar().showMessage(f"Loaded background ‘{name}’")
+
     def _swap_store(self, new_store: ComponentStore):
         self.store = new_store
         for w in (self.table, self.cell_view,
                   self.trace_view, self.corr_view,
                   self.dist_view):
             w.store = new_store
+        self._refresh_bg_combo()
+        self.cell_view.refresh_background()
         self._full_refresh()
 
     # ── Refresh ───────────────────────────────────────────────────────────────
@@ -1693,6 +1892,9 @@ def main():
         description="CaImAn Component Inspector (Qt6 / PyQt6)")
     parser.add_argument("results", nargs="?",
                         help="Path to a CaImAn .hdf5 results file")
+    parser.add_argument("--background", "--bg", dest="background", default=None,
+                        help="Image to show behind the footprints "
+                             "(.npy/.npz/.tif/.png; a 3-D stack is max-projected)")
     args = parser.parse_args()
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -1707,6 +1909,16 @@ def main():
             sys.exit(1)
     else:
         store = _make_demo_store()
+
+    if args.background:
+        try:
+            img  = _load_image_file(args.background)
+            name = os.path.splitext(os.path.basename(args.background))[0]
+            store.add_background(name, img, make_active=True)
+            print(f"Background image: {args.background}")
+        except Exception as exc:
+            print(f"Warning: could not load background "
+                  f"'{args.background}': {exc}", file=sys.stderr)
 
     win = InspectorWindow(store)
     win.show()
