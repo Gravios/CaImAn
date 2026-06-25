@@ -551,6 +551,36 @@ def _build_overlay(store: ComponentStore,
     return np.clip(out, 0, 1)
 
 
+def _build_roi_overlay(store: ComponentStore) -> np.ndarray:
+    """
+    Return (d1, d2, 4) RGBA composite of *every* footprint in dim cyan.
+
+    This is the persistent "all ROIs" base layer.  It is rebuilt from the
+    store on each mutation (merge / delete / undo / redo), so deleted or
+    merged components visibly disappear / appear in the cell viewer.
+    """
+    d1, d2 = store.dims
+    out    = np.zeros((d1, d2, 4), dtype=np.float32)
+
+    _h = CYAN.lstrip('#')
+    r = int(_h[0:2], 16) / 255.0
+    g = int(_h[2:4], 16) / 255.0
+    b = int(_h[4:6], 16) / 255.0
+
+    for i in range(store.n):
+        fp   = store.footprint(i)
+        peak = fp.max()
+        if peak < 1e-9:
+            continue
+        a_mask = (fp / peak) * ALPHA_DEF
+        out[..., 0] = np.maximum(out[..., 0], r * a_mask)
+        out[..., 1] = np.maximum(out[..., 1], g * a_mask)
+        out[..., 2] = np.maximum(out[..., 2], b * a_mask)
+        out[..., 3] = np.maximum(out[..., 3], a_mask)
+
+    return np.clip(out, 0, 1)
+
+
 
 
 # ── Cell viewer ───────────────────────────────────────────────────────────────
@@ -592,7 +622,13 @@ class CellViewer(pg.GraphicsLayoutWidget):
         self._img_bg.setZValue(0)
         self.vb.addItem(self._img_bg)
 
-        # Footprint overlay (RGBA)
+        # Persistent "all ROIs" layer (dim cyan, every footprint)
+        self._show_all = True
+        self._img_all  = pg.ImageItem()
+        self._img_all.setZValue(0.5)
+        self.vb.addItem(self._img_all)
+
+        # Footprint overlay (RGBA) — selected / pair only, on top
         self._img_ov = pg.ImageItem()
         self._img_ov.setZValue(1)
         self.vb.addItem(self._img_ov)
@@ -603,6 +639,7 @@ class CellViewer(pg.GraphicsLayoutWidget):
         # Click detection via scene
         self.vb.scene().sigMouseClicked.connect(self._on_scene_click)
 
+        self.refresh_rois()
         self._redraw()
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -615,6 +652,28 @@ class CellViewer(pg.GraphicsLayoutWidget):
     def set_pair(self, pair):
         self._pair = pair
         self._redraw()
+
+    def refresh_rois(self):
+        """
+        Rebuild the persistent "all ROIs" base layer from the current store.
+
+        Must be called after any component mutation (merge / delete / undo /
+        redo / store swap) so the cell viewer reflects the new component set.
+        Also drops the centroid / cross-arm caches, which are keyed on
+        component count and would otherwise go stale when undo / redo restores
+        a state with a coincidentally equal count.
+        """
+        self._centroids          = None
+        self._cross_params_cache = None
+        if self._show_all:
+            self._img_all.setImage(_build_roi_overlay(self.store))
+            self._img_all.setVisible(True)
+        else:
+            self._img_all.setVisible(False)
+
+    def set_show_all(self, flag: bool):
+        self._show_all = bool(flag)
+        self.refresh_rois()
 
     def toggle_bg(self):
         self._invert_bg = not self._invert_bg
@@ -1249,6 +1308,16 @@ class InspectorWindow(QMainWindow):
             lambda: self.cell_view.toggle_bg())
         tb.addAction(self.act_invert_bg)
 
+        self.act_show_rois = QAction("◎  All ROIs", self)
+        self.act_show_rois.setToolTip(
+            "Show every component footprint as a dim cyan overlay.\n"
+            "Updates live as components are merged or deleted.")
+        self.act_show_rois.setCheckable(True)
+        self.act_show_rois.setChecked(True)
+        self.act_show_rois.triggered.connect(
+            lambda checked: self.cell_view.set_show_all(checked))
+        tb.addAction(self.act_show_rois)
+
         self.act_dist_log = QAction("log₁₀  Dist", self)
         self.act_dist_log.setToolTip(
             "Toggle distance matrix between linear and log\u2081\u2080 scale.\n"
@@ -1550,6 +1619,7 @@ class InspectorWindow(QMainWindow):
         self.table.clearSelection()
         self.table.blockSignals(False)
         self.cell_view.set_selection([])
+        self.cell_view.refresh_rois()
         self.trace_view.set_selection([])
         self.corr_view.refresh()
         self.dist_view.refresh()
