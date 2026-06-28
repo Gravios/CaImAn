@@ -35,6 +35,8 @@ import scipy.sparse
 
 HISTORY_MAXLEN = 5   # maximum undo / redo steps retained
 
+TRACE_DENOISED = "C (denoised)"   # canonical trace key; this one is saved back
+
 import pyqtgraph as pg
 
 from PyQt6.QtWidgets import (
@@ -151,10 +153,23 @@ class ComponentStore:
 
     def __init__(self, A, C, Cn, dims,
                  SNR_comp=None, r_values=None, cnn_preds=None,
-                 cnm_obj=None, fpath=None):
+                 cnm_obj=None, fpath=None, traces=None):
         self._A = _to_dense(A)
-        self.C  = np.asarray(C, dtype=np.float32)
         self.dims = dims
+
+        # ── Temporal traces (display registry) ───────────────────────────────
+        # Every entry is a (K, T) array.  TRACE_DENOISED is the canonical
+        # trace written back on save; the others (ΔF/F, raw, deconvolved) are
+        # for display only and are selected via the trace dropdown.  self.C
+        # always mirrors the denoised entry so save / correlation / merge math
+        # are unaffected by the display choice.
+        if traces is None:
+            traces = {TRACE_DENOISED: np.asarray(C, dtype=np.float32)}
+        self.traces = {k: np.asarray(v, dtype=np.float32) for k, v in traces.items()}
+        if TRACE_DENOISED not in self.traces:
+            self.traces[TRACE_DENOISED] = np.asarray(C, dtype=np.float32)
+        self.disp_key = TRACE_DENOISED
+        self.C = self.traces[TRACE_DENOISED]
 
         # ── Background images ────────────────────────────────────────────────
         # `Cn` is the *active* greyscale shown behind the footprints.  A named
@@ -224,6 +239,24 @@ class ComponentStore:
     def background_names(self) -> list:
         return list(self.backgrounds.keys())
 
+    # ── Temporal trace selection (display only) ────────────────────────────────
+
+    def trace_names(self) -> list:
+        return list(self.traces.keys())
+
+    def set_trace(self, name: str):
+        if name not in self.traces:
+            raise KeyError(name)
+        self.disp_key = name
+
+    def disp_trace(self, i):
+        """The currently displayed trace for component i."""
+        return self.traces[self.disp_key][i]
+
+    @property
+    def disp_T(self) -> int:
+        return self.traces[self.disp_key].shape[1]
+
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -246,7 +279,7 @@ class ComponentStore:
         """Return a deep copy of all mutable component state."""
         return {
             "A":         self._A.copy(),
-            "C":         self.C.copy(),
+            "traces":    {k: v.copy() for k, v in self.traces.items()},
             "labels":    list(self.labels),
             "SNR_comp":  self.SNR_comp.copy()  if self.SNR_comp  is not None else None,
             "r_values":  self.r_values.copy()  if self.r_values  is not None else None,
@@ -256,7 +289,8 @@ class ComponentStore:
     def _restore(self, snap: dict):
         """Replace mutable state from a snapshot."""
         self._A        = snap["A"]
-        self.C         = snap["C"]
+        self.traces    = snap["traces"]
+        self.C         = self.traces[TRACE_DENOISED]
         self.labels    = snap["labels"]
         self.SNR_comp  = snap["SNR_comp"]
         self.r_values  = snap["r_values"]
@@ -350,12 +384,14 @@ class ComponentStore:
         new_a = np.zeros(self._A.shape[0], dtype=np.float32)
         for i in idx:
             np.maximum(new_a, self._A[:, i], out=new_a)
-        new_c     = self.C[idx].mean(axis=0)
         new_label = "+".join(self.labels[i] for i in idx)
 
         keep = [j for j in range(self.n) if j not in set(idx)]
         self._A     = np.column_stack([self._A[:, keep], new_a[:, None]])
-        self.C      = np.vstack([self.C[keep], new_c[None, :]])
+        for name, arr in self.traces.items():
+            new_row = arr[idx].mean(axis=0)
+            self.traces[name] = np.vstack([arr[keep], new_row[None, :]])
+        self.C      = self.traces[TRACE_DENOISED]
         self.labels = [self.labels[j] for j in keep] + [new_label]
 
         for attr in ("SNR_comp", "r_values", "cnn_preds"):
@@ -370,7 +406,9 @@ class ComponentStore:
         self._push_undo("delete")
         keep = [j for j in range(self.n) if j not in set(indices)]
         self._A     = self._A[:, keep]
-        self.C      = self.C[keep]
+        for name, arr in self.traces.items():
+            self.traces[name] = arr[keep]
+        self.C      = self.traces[TRACE_DENOISED]
         self.labels = [self.labels[j] for j in keep]
         for attr in ("SNR_comp", "r_values", "cnn_preds"):
             arr = getattr(self, attr)
@@ -591,6 +629,16 @@ def load_from_hdf5(path: str) -> ComponentStore:
     C = est.C
 
     idx = getattr(est, "idx_components", None)
+
+    def _sel_rows(arr):
+        """Slice an optional (K, T) trace array by idx_components."""
+        if arr is None:
+            return None
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.size == 0:
+            return None
+        return arr[idx] if (idx is not None and len(idx) > 0) else arr
+
     if idx is not None and len(idx) > 0:
         A = A[:, idx];  C = C[idx]
         snr  = est.SNR_comp[idx]  if est.SNR_comp  is not None else None
@@ -601,51 +649,83 @@ def load_from_hdf5(path: str) -> ComponentStore:
         rval = getattr(est, "r_values",  None)
         cnn  = getattr(est, "cnn_preds", None)
 
+    # Build the trace registry: denoised C is canonical; add ΔF/F, the
+    # residual-added raw trace, and deconvolved spikes when available and
+    # shape-compatible.  Display-only — the dropdown switches between them.
+    Cd     = np.asarray(C, dtype=np.float32)
+    traces = {TRACE_DENOISED: Cd}
+    F_dff  = _sel_rows(getattr(est, "F_dff", None))
+    YrA    = _sel_rows(getattr(est, "YrA",   None))
+    S      = _sel_rows(getattr(est, "S",     None))
+    if F_dff is not None and F_dff.shape == Cd.shape:
+        traces["ΔF/F"] = F_dff
+    if YrA is not None and YrA.shape == Cd.shape:
+        traces["C + residual (raw)"] = Cd + YrA
+    if S is not None and S.shape == Cd.shape and np.any(S):
+        traces["S (deconvolved)"] = S
+
     _Cn = getattr(est, "Cn", None)
     Cn  = _Cn if _Cn is not None else A.max(axis=1).reshape(dims, order="F")
     store = ComponentStore(A, C, Cn, dims,
                            SNR_comp=snr, r_values=rval, cnn_preds=cnn,
-                           cnm_obj=cnm, fpath=path)
+                           cnm_obj=cnm, fpath=path, traces=traces)
     _attach_sibling_backgrounds(store, path)
     return store
 
 
 def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
-    """Register any data-projection image sitting next to the results file.
+    """Register data-projection images sitting next to the results file.
 
-    Looks for files whose name contains a projection-like token and whose
-    dimensions match the FOV.  If the active background (the correlation
-    image) is flat, a matched projection is auto-activated so the viewer
-    shows the actual cells instead of a blank field.
+    Companion images share the *session prefix* with the results file
+    (e.g. ``<session>_mean.npy`` next to ``<session>_results.hdf5``); a small
+    token vocabulary is also accepted.  Candidates must be 2-D and match the
+    FOV (enforced by the store's coercion).  If the correlation image is flat
+    — e.g. denoised data saturates Cn — the best-ranked projection is
+    auto-activated so the viewer shows the actual cells.
     """
     import glob
+    import re as _re
     folder = _os_dirname(path)
-    stem   = os.path.splitext(os.path.basename(path))[0]
+    stem   = os.path.splitext(os.path.basename(path))[0]          # <session>_results
+    # Strip a trailing results/cnmf/curated tail to recover the session prefix.
+    prefix = _re.sub(r'[._-]?(results?|cnmf?|cnm|estimates?|curated)$', '',
+                     stem, flags=_re.I)
     tokens = ("projection", "percentile", "mean", "median",
-              "max", "pnr", "summary", "anat", "template")
+              "max", "pnr", "summary", "anat", "template", "_cn")
     exts   = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
 
-    found = []
+    found = []   # (label, lowername)
     for f in sorted(glob.glob(os.path.join(folder, "*"))):
-        low = os.path.basename(f).lower()
+        if os.path.abspath(f) == os.path.abspath(path):
+            continue
+        low       = os.path.basename(f).lower()
+        name_stem = os.path.splitext(os.path.basename(f))[0]
         if not low.endswith(exts):
             continue
-        if not any(tok in low for tok in tokens):
+        shares_prefix = bool(prefix) and name_stem.lower().startswith(prefix.lower())
+        has_token     = any(tok in low for tok in tokens)
+        if not (shares_prefix or has_token):
             continue
         try:
             img = _load_image_file(f)
-            if np.asarray(img).ndim != 2:   # skip stacks at auto-load
+            if np.asarray(img).squeeze().ndim != 2:   # skip stacks at auto-load
                 continue
-            name = os.path.splitext(os.path.basename(f))[0]
-            if name.startswith(stem):
-                name = name[len(stem):].lstrip("_-. ") or name
-            store.add_background(name, img)
-            found.append(name)
+            label = name_stem
+            if shares_prefix:
+                label = name_stem[len(prefix):].lstrip("._- ") or name_stem
+            store.add_background(label, img)           # coercion dim-checks
+            found.append((label, low))
         except Exception:
             continue
 
     if found and not _has_contrast(store.backgrounds.get("correlation")):
-        store.set_background(found[0])
+        def _rank(item):
+            low = item[1]
+            for r, tok in enumerate(tokens):
+                if tok in low:
+                    return r
+            return len(tokens)
+        store.set_background(sorted(found, key=_rank)[0][0])
 
 
 def _os_dirname(path: str) -> str:
@@ -993,6 +1073,10 @@ class TraceViewer(pg.PlotWidget):
         self._sel = list(sel)
         self._redraw()
 
+    def refresh(self):
+        """Redraw after the active display trace has changed."""
+        self._redraw()
+
     def _redraw(self):
         self.clear()
         self._legend = self.addLegend(labelTextColor='white',
@@ -1007,12 +1091,12 @@ class TraceViewer(pg.PlotWidget):
             return
 
         try:
-            T      = s.C.shape[1]
+            T      = s.disp_T
             t      = np.arange(T, dtype=np.float32)
             offset = 0.0
             for k, i in enumerate(self._sel):
                 color = PALETTE_HEX[k % len(PALETTE_HEX)]
-                trace = s.C[i]
+                trace = s.disp_trace(i)
                 span  = trace.max() - trace.min()
                 tr    = (trace - trace.min()) / (span + 1e-9)
                 self.plot(t, (tr + offset).astype(np.float32),
@@ -1477,6 +1561,16 @@ class InspectorWindow(QMainWindow):
         tb.addWidget(self.bg_combo)
         self._refresh_bg_combo()
 
+        tb.addWidget(QLabel("  Trace: "))
+        self.trace_combo = QComboBox(self)
+        self.trace_combo.setToolTip(
+            "Temporal trace shown in the trace viewer.\n"
+            "Display-only; the denoised C is always what gets saved.")
+        self.trace_combo.setMinimumWidth(150)
+        self.trace_combo.currentTextChanged.connect(self._on_trace_changed)
+        tb.addWidget(self.trace_combo)
+        self._refresh_trace_combo()
+
         self.act_dist_log = QAction("log₁₀  Dist", self)
         self.act_dist_log.setToolTip(
             "Toggle distance matrix between linear and log\u2081\u2080 scale.\n"
@@ -1783,6 +1877,29 @@ class InspectorWindow(QMainWindow):
         self.cell_view.refresh_background()
         self.statusBar().showMessage(f"Background → {name}")
 
+    # ── Trace selection ───────────────────────────────────────────────────────
+
+    def _refresh_trace_combo(self):
+        """Repopulate the trace selector to match the current store."""
+        self.trace_combo.blockSignals(True)
+        self.trace_combo.clear()
+        self.trace_combo.addItems(self.store.trace_names())
+        if self.store.disp_key is not None:
+            self.trace_combo.setCurrentText(self.store.disp_key)
+        # A single available trace gives the user nothing to pick.
+        self.trace_combo.setEnabled(self.trace_combo.count() > 1)
+        self.trace_combo.blockSignals(False)
+
+    def _on_trace_changed(self, name: str):
+        if not name or name == self.store.disp_key:
+            return
+        try:
+            self.store.set_trace(name)
+        except KeyError:
+            return
+        self.trace_view.refresh()
+        self.statusBar().showMessage(f"Trace → {name}")
+
     def _load_background(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load background image", "",
@@ -1807,6 +1924,7 @@ class InspectorWindow(QMainWindow):
                   self.dist_view):
             w.store = new_store
         self._refresh_bg_combo()
+        self._refresh_trace_combo()
         self.cell_view.refresh_background()
         self._full_refresh()
 
