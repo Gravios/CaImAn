@@ -196,6 +196,7 @@ class ComponentStore:
         self.cnm_obj = cnm_obj
         self.fpath   = fpath
         self.labels  = [f"C{i:03d}" for i in range(self._A.shape[1])]
+        self.hidden  = np.zeros(self._A.shape[1], dtype=bool)  # per-component visibility
         self._corr   = None
 
         # History stacks — each entry is (op_label: str, snapshot: dict)
@@ -257,6 +258,27 @@ class ComponentStore:
     def disp_T(self) -> int:
         return self.traces[self.disp_key].shape[1]
 
+    # ── Per-component visibility (view only, not saved) ────────────────────────
+
+    def is_hidden(self, i) -> bool:
+        return bool(self.hidden[i])
+
+    def toggle_hidden(self, indices):
+        for i in indices:
+            self.hidden[i] = not self.hidden[i]
+
+    def set_hidden(self, indices, flag: bool):
+        for i in indices:
+            self.hidden[i] = bool(flag)
+
+    def show_all(self):
+        """Make every component visible again."""
+        self.hidden[:] = False
+
+    @property
+    def n_hidden(self) -> int:
+        return int(self.hidden.sum())
+
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -281,6 +303,7 @@ class ComponentStore:
             "A":         self._A.copy(),
             "traces":    {k: v.copy() for k, v in self.traces.items()},
             "labels":    list(self.labels),
+            "hidden":    self.hidden.copy(),
             "SNR_comp":  self.SNR_comp.copy()  if self.SNR_comp  is not None else None,
             "r_values":  self.r_values.copy()  if self.r_values  is not None else None,
             "cnn_preds": self.cnn_preds.copy() if self.cnn_preds is not None else None,
@@ -292,6 +315,8 @@ class ComponentStore:
         self.traces    = snap["traces"]
         self.C         = self.traces[TRACE_DENOISED]
         self.labels    = snap["labels"]
+        self.hidden    = snap.get("hidden",
+                                  np.zeros(self._A.shape[1], dtype=bool))
         self.SNR_comp  = snap["SNR_comp"]
         self.r_values  = snap["r_values"]
         self.cnn_preds = snap["cnn_preds"]
@@ -393,6 +418,8 @@ class ComponentStore:
             self.traces[name] = np.vstack([arr[keep], new_row[None, :]])
         self.C      = self.traces[TRACE_DENOISED]
         self.labels = [self.labels[j] for j in keep] + [new_label]
+        # Merged component is hidden only if every constituent was hidden.
+        self.hidden = np.append(self.hidden[keep], bool(self.hidden[idx].all()))
 
         for attr in ("SNR_comp", "r_values", "cnn_preds"):
             arr = getattr(self, attr)
@@ -410,6 +437,7 @@ class ComponentStore:
             self.traces[name] = arr[keep]
         self.C      = self.traces[TRACE_DENOISED]
         self.labels = [self.labels[j] for j in keep]
+        self.hidden = self.hidden[keep]
         for attr in ("SNR_comp", "r_values", "cnn_preds"):
             arr = getattr(self, attr)
             if arr is not None:
@@ -743,6 +771,8 @@ def _build_overlay(store: ComponentStore,
     pair_set = set(pair) if pair else set()
 
     for i in range(store.n):
+        if store.hidden[i]:
+            continue
         fp   = store.footprint(i)
         peak = fp.max()
         if peak < 1e-9:
@@ -785,6 +815,8 @@ def _build_roi_overlay(store: ComponentStore) -> np.ndarray:
     b = int(_h[4:6], 16) / 255.0
 
     for i in range(store.n):
+        if store.hidden[i]:
+            continue
         fp   = store.footprint(i)
         peak = fp.max()
         if peak < 1e-9:
@@ -894,6 +926,11 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
     def refresh_background(self):
         """Redraw after the store's active background image has changed."""
+        self._redraw()
+
+    def refresh_visibility(self):
+        """Redraw after per-component visibility (hidden flags) has changed."""
+        self.refresh_rois()
         self._redraw()
 
 
@@ -1026,7 +1063,8 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
         sel_set  = set(self._sel)
         pair_set = set(self._pair) if self._pair else set()
-        active   = sel_set | pair_set
+        active   = {i for i in (sel_set | pair_set)
+                    if not self.store.hidden[i]}
         if not active:
             return
 
@@ -1415,6 +1453,18 @@ class ComponentTable(QTableWidget):
                 item.setBackground(QBrush(dark))
                 self.setItem(i, c, item)
         self.blockSignals(False)
+        self.mark_hidden()
+
+    def mark_hidden(self):
+        """Dim the text of hidden rows so it is clear which are not shown."""
+        grey   = QColor(105, 105, 105)
+        normal = QColor(220, 220, 220)
+        for row in range(self.store.n):
+            fg = grey if self.store.is_hidden(row) else normal
+            for col in range(self.columnCount()):
+                it = self.item(row, col)
+                if it:
+                    it.setForeground(QBrush(fg))
 
     def _set_row_bg(self, row: int, color: QColor):
         for col in range(self.columnCount()):
@@ -1473,6 +1523,11 @@ class InspectorWindow(QMainWindow):
                      "to show behind the footprints.")
         a.triggered.connect(self._load_background)
         vm.addAction(a)
+        vm.addSeparator()
+        a = QAction("&Show all hidden ROIs", self)
+        a.setToolTip("Make every hidden component visible again.")
+        a.triggered.connect(self._show_all_hidden)
+        vm.addAction(a)
 
         em = mb.addMenu("&Edit")
         self.act_undo = QAction("↩  Undo", self)
@@ -1507,6 +1562,16 @@ class InspectorWindow(QMainWindow):
         self.act_delete.setEnabled(False)
         self.act_delete.triggered.connect(self._do_delete)
         tb.addAction(self.act_delete)
+
+        self.act_toggle_vis = QAction("◌  Hide / show", self)
+        self.act_toggle_vis.setToolTip(
+            "Toggle visibility of the selected component(s) in the cell view "
+            "(V).\nHidden components stay in the data — this is not a delete.")
+        self.act_toggle_vis.setShortcut(QKeySequence("V"))
+        self.act_toggle_vis.setEnabled(False)
+        self.act_toggle_vis.triggered.connect(self._toggle_visibility)
+        tb.addAction(self.act_toggle_vis)
+        self.addAction(self.act_toggle_vis)   # keep shortcut active app-wide
 
         tb.addSeparator()
 
@@ -1658,6 +1723,7 @@ class InspectorWindow(QMainWindow):
             n = len(sel)
             self.act_merge.setEnabled(n >= 2)
             self.act_delete.setEnabled(n >= 1)
+            self.act_toggle_vis.setEnabled(n >= 1)
             self._sel_lbl.setText(f"  {n} selected  |  {self.store.n} total")
             # Update matrix highlights from table selection:
             # exactly 2 selected → highlight that pair; anything else → clear.
@@ -1899,6 +1965,28 @@ class InspectorWindow(QMainWindow):
             return
         self.trace_view.refresh()
         self.statusBar().showMessage(f"Trace → {name}")
+
+    # ── Visibility ────────────────────────────────────────────────────────────
+
+    def _toggle_visibility(self):
+        sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        if not sel:
+            self.statusBar().showMessage("Select component(s) to hide / show")
+            return
+        self.store.toggle_hidden(sel)
+        self.cell_view.refresh_visibility()
+        self.table.mark_hidden()
+        self.statusBar().showMessage(
+            f"{self.store.n_hidden} hidden  |  {self.store.n} total")
+
+    def _show_all_hidden(self):
+        if self.store.n_hidden == 0:
+            self.statusBar().showMessage("No hidden components")
+            return
+        self.store.show_all()
+        self.cell_view.refresh_visibility()
+        self.table.mark_hidden()
+        self.statusBar().showMessage(f"All {self.store.n} components visible")
 
     def _load_background(self):
         path, _ = QFileDialog.getOpenFileName(
