@@ -32,7 +32,9 @@ deterministic expectation.
 
 Usage
 -----
-    python spikes_to_binary.py results.hdf5 -o spikes_binary.npz
+    # output name auto-derived: <base>_results.hdf5 -> <base>_spikes.npz
+    python spikes_to_binary.py results.hdf5
+    python spikes_to_binary.py results.hdf5 -o custom.npz   # explicit override
     python spikes_to_binary.py results.hdf5 --min-snr 1.5 --upsample 33
     python spikes_to_binary.py results.hdf5 --all --global-scale 1e-3
     python spikes_to_binary.py results.hdf5 --fr 30.0    # if fr not in params
@@ -49,11 +51,27 @@ Output .npz
 """
 
 import argparse
+import os
+import re
 import numpy as np
 import h5py
 
 
 # ── I/O ─────────────────────────────────────────────────────────────────────
+
+def default_out_path(hdf5_path):
+    """Derive '<base>_spikes.npz' from the input, alongside it.
+
+    A trailing results/cnmf/cnm/estimates/curated tag is stripped so the
+    output shares the session base with the input, e.g.
+        .../sess_results.hdf5  ->  .../sess_spikes.npz
+    """
+    folder = os.path.dirname(os.path.abspath(hdf5_path))
+    stem   = os.path.splitext(os.path.basename(hdf5_path))[0]
+    base   = re.sub(r'[._-]?(results?|cnmf?|cnm|estimates?|curated)$', '',
+                    stem, flags=re.I)
+    return os.path.join(folder, f"{base}_spikes.npz")
+
 
 def load_S(path, fr_fallback=None):
     """Read only S, SNR_comp, idx_components and fr from a results .hdf5.
@@ -120,8 +138,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Up-sample CaImAn deconvolved S into a binary spike .npz")
     ap.add_argument("hdf5", help="CaImAn results .hdf5 file")
-    ap.add_argument("-o", "--out", default="spikes_binary.npz",
-                    help="output .npz path (default: spikes_binary.npz)")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output .npz path (default: <input-base>_spikes.npz "
+                         "next to the input, with any _results tag stripped)")
     ap.add_argument("--upsample", type=int, default=33,
                     help="fine bins per frame (33 ~ 1 ms at 30 Hz)")
     ap.add_argument("--unit-amp", type=float, default=50.0,
@@ -139,6 +158,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0,
                     help="RNG seed for the Poisson draw")
     a = ap.parse_args()
+
+    out = a.out if a.out is not None else default_out_path(a.hdf5)
 
     S, good, snr, fr = load_S(a.hdf5, fr_fallback=a.fr)
 
@@ -159,7 +180,7 @@ def main():
     rate  = spikes.sum(1) / dur
 
     np.savez_compressed(
-        a.out,
+        out,
         spikes=spikes, comp_idx=idx.astype(int),
         lambda_frame=lam.astype(np.float32), unit_amp=unit.astype(np.float32),
         n_spikes=spikes.sum(1).astype(int), mean_rate_hz=rate.astype(np.float32),
@@ -171,7 +192,7 @@ def main():
           f"({100 * clipped / max(total, 1):.2f}%)")
     print(f"firing rate Hz: median={np.median(rate):.2f} "
           f"range={rate.min():.2f}-{rate.max():.2f}")
-    print(f"saved -> {a.out}")
+    print(f"saved -> {out}")
 
 
 if __name__ == "__main__":
