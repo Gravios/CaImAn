@@ -58,12 +58,12 @@
     "stride": 10,
     "K": 15,
     "gSig": [
-      4,
-      4
+      5,
+      5
     ],
     "gSiz": [
-      17,
-      17
+      21,
+      21
     ],
     "ring_size_factor": 0.9,
     "min_corr": 0.4,
@@ -141,14 +141,14 @@
   },
   "xcorr_correction": {
     "_comment": "Bidirectional line-scan phase correction (resonant/galvo-resonant scanners). Set enabled=true when even/odd row misalignment is visible.",
-    "enabled": false,
+    "enabled": true,
     "max_shift": 16,
     "n_frames": 500,
     "use_gpu": true
   },
   "oscillation": {
     "_comment": "Multitaper (DPSS) oscillation analysis run after CNMF on the accepted component traces and neuropil background. enabled=true runs OscillationAnalyzer.run_all and saves a QC figure. NW: DPSS time-bandwidth product (2=fine resolution, 4=low variance). win_s: spectrogram window length in seconds (Delta_f ~ 2*NW/win_s). overlap_s: window overlap in seconds; null = win_s/2 (50%). adaptive: use adaptive taper weighting (recommended). use_gpu: accelerate via CuPy when available.",
-    "enabled": true,
+    "enabled": false,
     "NW": 4.0,
     "win_s": 4.0,
     "overlap_s": null,
@@ -164,7 +164,7 @@
   },
   "seeding": {
     "_comment": "Anatomical seeding for census-complete extraction. Detection runs AFTER motion correction (registered frames \u2014 unregistered movies smear somata and ruin the projection). segmenter: 'watershed' (deterministic, model-free skimage; no GPU/weights; tune via min_distance/threshold_rel/smooth_sigma) or 'cellpose' (Cellpose-SAM, needs cellpose>=4). projection: 'percentile' (recommended for low-baseline GCaMP; set percentile=90 or a list like [80,90,95] averaged), or 'std'/'max'/'mean'/'max_div_mean' (mean has little soma contrast here). nb = global full-FOV background for the seeded single-FOV fit (1-2). Seeding BYPASSES corr_pnr/min_corr. Truly-silent cells are invisible to any functional projection \u2014 a complete inactive-cell census needs a structural channel. Inspect *_seed_projection.npy / *_seed_labels.npy.",
-    "enabled": false,
+    "enabled": true,
     "source": "projection",
     "segmenter": "peaks",
     "projection": "percentile",
