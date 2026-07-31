@@ -43,6 +43,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor, QBrush, QFont
 
 _UROLE = Qt.ItemDataRole.UserRole
+_ORIG_ROLE = Qt.ItemDataRole.UserRole + 1   # stores a leaf's original JSON value
 
 # highlight colours (spec)
 COL_RUNNING = QColor(179, 217, 255)   # light blue — current trial
@@ -245,7 +246,6 @@ class JsonEditor(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._orig: dict = {}          # item -> original python value
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Parameter", "Value"])
         self.tree.setColumnWidth(0, 320)
@@ -257,7 +257,6 @@ class JsonEditor(QWidget):
 
     def load(self, data: dict):
         self.tree.clear()
-        self._orig.clear()
         for k, v in data.items():
             self.tree.addTopLevelItem(self._make_item(k, v))
         self.tree.collapseAll()               # start collapsed (collapsible)
@@ -269,7 +268,9 @@ class JsonEditor(QWidget):
                 it.addChild(self._make_item(k, v))
         else:
             it.setText(1, _value_to_text(value))
-            self._orig[it] = value
+            # Store the original value on the item itself — QTreeWidgetItem is
+            # unhashable, so it cannot be used as a dict key.
+            it.setData(1, _ORIG_ROLE, value)
             editable = not str(key).startswith("_comment")
             if editable:
                 it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
@@ -287,7 +288,7 @@ class JsonEditor(QWidget):
             return {item.child(i).text(0): self._read(item.child(i))
                     for i in range(item.childCount())}
         key = item.text(0)
-        orig = self._orig.get(item)
+        orig = item.data(1, _ORIG_ROLE)
         if key.startswith("_comment"):
             return orig
         return _coerce(item.text(1), orig)
