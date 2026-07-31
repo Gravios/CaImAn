@@ -96,6 +96,7 @@ setup(
         'batch-subject       = utilities.batch_subject:main',
         'batch-subject-list  = utilities.batch_subject_list:main',
         'sync-pipeline-templates = utilities.sync_pipeline_templates:main',
+        'caiman-batch-gui    = utilities.batch_gui_launcher:main',
         'stack-sessions      = utilities.stack_sessions:main',
         'stack-bigtiff       = caiman.utils.stack_to_bigtiff:main',
         'rename-stem         = utilities.rename_stem:main',
