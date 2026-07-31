@@ -51,6 +51,8 @@ from typing import Optional
 import numpy as np
 import tifffile
 
+from caiman.utils.stack_io import StackReader, stack_size
+
 _log = logging.getLogger(__name__)
 
 
@@ -97,11 +99,11 @@ def _try_import_cupy():
         return None
 
 
-def _mean_projection_gpu(tif, idx_est, rows, cols, cp) -> np.ndarray:
+def _mean_projection_gpu(reader, idx_est, rows, cols, cp) -> np.ndarray:
     """Compute a float32 mean projection on the GPU.
 
-    Pages are read from *tif* (already open TiffFile) in chunks of
-    ~256 MB, transferred to the GPU as a batch, and accumulated.
+    Frames are read from *reader* (an open StackReader — .tif or .msr) in
+    chunks of ~256 MB, transferred to the GPU as a batch, and accumulated.
     A single D2H transfer returns the final mean.
     """
     n = len(idx_est)
@@ -111,7 +113,7 @@ def _mean_projection_gpu(tif, idx_est, rows, cols, cp) -> np.ndarray:
     for start in range(0, n, chunk):
         batch_idx = idx_est[start:start + chunk]
         cpu_block = np.stack(
-            [tif.pages[int(i)].asarray() for i in batch_idx],
+            [reader.read_frame(int(i)) for i in batch_idx],
             axis=0,
         ).astype(np.float32)            # (B, rows, cols)
         gpu_block  = cp.asarray(cpu_block)
@@ -122,7 +124,7 @@ def _mean_projection_gpu(tif, idx_est, rows, cols, cp) -> np.ndarray:
 
 
 def _apply_correction_gpu(
-    tif_in,
+    reader,
     writer,
     n_pages: int,
     rows: int,
@@ -139,7 +141,7 @@ def _apply_correction_gpu(
     for start in range(0, n_pages, chunk):
         end       = min(start + chunk, n_pages)
         cpu_block = np.stack(
-            [tif_in.pages[i].asarray() for i in range(start, end)],
+            [reader.read_frame(i) for i in range(start, end)],
             axis=0,
         ).astype(np.float32)                        # (B, rows, cols)
 
@@ -161,24 +163,24 @@ def _apply_correction_gpu(
 # CPU fallback helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _mean_projection_cpu(tif, idx_est, rows, cols) -> np.ndarray:
+def _mean_projection_cpu(reader, idx_est, rows, cols) -> np.ndarray:
     accum = np.zeros((rows, cols), dtype=np.float64)
     for i in idx_est:
-        pg = tif.pages[int(i)].asarray()
+        pg = reader.read_frame(int(i))
         if pg.ndim > 2:
             pg = pg.mean(axis=tuple(range(pg.ndim - 2)))
         accum += pg.astype(np.float64)
     return (accum / len(idx_est)).astype(np.float32)
 
 
-def _apply_correction_cpu(tif_in, writer, n_pages, rows, cols, dtype, shift, log):
+def _apply_correction_cpu(reader, writer, n_pages, rows, cols, dtype, shift, log):
     bytes_per_frame = rows * cols * np.dtype(dtype).itemsize
     chunk = max(1, min(n_pages, (256 * 2**20) // max(1, bytes_per_frame)))
 
     for start in range(0, n_pages, chunk):
         end   = min(start + chunk, n_pages)
         block = np.stack(
-            [tif_in.pages[i].asarray() for i in range(start, end)],
+            [reader.read_frame(i) for i in range(start, end)],
             axis=0,
         )
         for fi in range(block.shape[0]):
@@ -216,7 +218,8 @@ def correct_line_scan(
 
     Parameters
     ----------
-    src_tif   : str or Path   Input TIFF (single- or multi-page).
+    src_tif   : str or Path   Input stack — TIFF (single/multi-page) or raw
+                              Leica ``.msr`` (read via StackReader).
     max_shift : int           Maximum column shift to search (±). Default 16.
     n_frames  : int           Frames used for shift estimation.
                               0 = use all frames.  Default 500.
@@ -248,11 +251,12 @@ def correct_line_scan(
     log.info(f"xcorr_correction: reading {src.name}")
 
     # ── Metadata ──────────────────────────────────────────────────────────────
-    with tifffile.TiffFile(str(src)) as tif:
-        n_pages = len(tif.pages)
+    # StackReader dispatches on extension, so both .tif and raw .msr work here.
+    (_dims, n_pages) = stack_size(str(src))
+    with StackReader(str(src)) as reader:
         if n_pages == 0:
-            raise ValueError(f"{src}: no pages found")
-        first = tif.pages[0].asarray()
+            raise ValueError(f"{src}: no frames found")
+        first = reader.read_frame(0)
         if first.ndim == 2:
             rows, cols = first.shape
         elif first.ndim == 3:
@@ -282,19 +286,19 @@ def correct_line_scan(
                     f"xcorr_correction: building mean projection on GPU "
                     f"({len(idx_est)} frames)"
                 )
-                mean_proj = _mean_projection_gpu(tif, idx_est, rows, cols, cp)
+                mean_proj = _mean_projection_gpu(reader, idx_est, rows, cols, cp)
             except Exception as exc:
                 log.warning(
                     f"xcorr_correction: GPU mean failed ({exc}); falling back to CPU"
                 )
                 cp = None
-                mean_proj = _mean_projection_cpu(tif, idx_est, rows, cols)
+                mean_proj = _mean_projection_cpu(reader, idx_est, rows, cols)
         else:
             log.info(
                 f"xcorr_correction: building mean projection on CPU "
                 f"({len(idx_est)} frames)"
             )
-            mean_proj = _mean_projection_cpu(tif, idx_est, rows, cols)
+            mean_proj = _mean_projection_cpu(reader, idx_est, rows, cols)
 
     # ── Shift estimation (always CPU — tiny computation on (rows, cols) array) ─
     shift = _estimate_row_shift(mean_proj, max_shift)
@@ -326,13 +330,13 @@ def correct_line_scan(
     def _open_writer():
         return tifffile.TiffWriter(str(out_tmp), bigtiff=bigtiff)
 
-    with tifffile.TiffFile(str(src)) as tif_in:
+    with StackReader(str(src)) as reader_in:
         writer = _open_writer()
         try:
             if cp is not None:
                 try:
                     _apply_correction_gpu(
-                        tif_in, writer, n_pages, rows, cols, dtype, shift, cp, log
+                        reader_in, writer, n_pages, rows, cols, dtype, shift, cp, log
                     )
                 except Exception as exc:
                     log.warning(
@@ -350,11 +354,11 @@ def correct_line_scan(
                         out_tmp.unlink()
                     writer = _open_writer()
                     _apply_correction_cpu(
-                        tif_in, writer, n_pages, rows, cols, dtype, shift, log
+                        reader_in, writer, n_pages, rows, cols, dtype, shift, log
                     )
             else:
                 _apply_correction_cpu(
-                    tif_in, writer, n_pages, rows, cols, dtype, shift, log
+                    reader_in, writer, n_pages, rows, cols, dtype, shift, log
                 )
         finally:
             writer.close()
