@@ -27,6 +27,7 @@ Tab 3 · Run
 from __future__ import annotations
 
 import sys
+import os
 import json
 import shutil
 import subprocess
@@ -341,11 +342,17 @@ class BatchRunner(QThread):
         if not tr.pipeline_py.exists():
             return False, "pipeline .py missing (run Apply first)"
         try:
+            # -u + PYTHONUNBUFFERED so the child streams stdout line-by-line
+            # into the log instead of block-buffering it onto the pipe (which
+            # makes a running job look frozen). Does not affect the child's own
+            # multiprocessing / GPU parallelism.
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
             proc = subprocess.Popen(
-                [sys.executable, str(tr.pipeline_py)],
+                [sys.executable, "-u", str(tr.pipeline_py)],
                 cwd=str(tr.directory),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1)
+                text=True, bufsize=1, env=env)
             for line in proc.stdout:                # stream output live
                 self.log.emit(line.rstrip())
             rc = proc.wait()
