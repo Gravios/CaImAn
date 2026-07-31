@@ -8,7 +8,7 @@ Point it at the *subjects* level of a data tree:
 
 Tab 1 · Select
     Foldable tree of subjects -> trials. A "trial" is any directory D that
-    holds its own stack ``<D.name>.tif`` (i.e. session == D.name == tif stem,
+    holds its own raw stack ``<D.name>.tif`` (converted) or ``<D.name>.msr`` (raw;
     matching batch_sessions' channel-subdir convention). Drag a trial leaf to
     the batch list to queue it; drag a subject node to queue all of its
     trials. (Double-click or the Add button do the same.) Confirm to continue.
@@ -16,7 +16,7 @@ Tab 1 · Select
 Tab 2 · Parameters
     The pipeline JSON template shown as collapsible lists; edit any value.
     "Apply" writes the (edited) JSON template and copies the Python template
-    next to each queued trial's tif, named ``<session>_pipeline.{py,json}``.
+    next to each queued trial's stack, named ``<session>_pipeline.{py,json}``.
 
 Tab 3 · Run
     The list of trials to process. "Run" launches them sequentially. The
@@ -57,9 +57,13 @@ COL_CLEAR   = QColor(0, 0, 0, 0)      # transparent — pending
 @dataclass(frozen=True)
 class Trial:
     subject: str
-    name: str            # session stem == directory name == tif stem
-    directory: Path      # dir holding the tif + where pipeline files go
-    tif: Path
+    name: str            # session stem == directory name == stack stem
+    directory: Path      # dir holding the stack + where pipeline files go
+    stack: Path          # raw stack: <name>.tif (converted) or <name>.msr (raw)
+
+    @property
+    def kind(self) -> str:
+        return self.stack.suffix.lstrip(".").lower()      # "tif" | "msr"
 
     @property
     def pipeline_py(self) -> Path:
@@ -73,19 +77,31 @@ class Trial:
 def discover_subjects(root: Path) -> list[tuple[str, list[Trial]]]:
     """Return [(subject_name, [Trial, ...]), ...] for a subjects-level dir.
 
-    Subjects are the immediate subdirectories of *root*. A trial is any
-    directory D anywhere below a subject that contains ``<D.name>.tif`` (the
-    raw stack — derived tifs like ``*_Xcorrected.tif`` have stem != dir name
-    and are ignored).
+    Subjects are the immediate subdirectories of *root*. A trial is a
+    directory D that holds its own raw stack — ``<D.name>.tif`` (converted;
+    the channel subdir) or ``<D.name>.msr`` (raw Leica; the TL_dir) — matching
+    batch_sessions' two layouts. Derived tifs (``*_Xcorrected.tif`` etc.) have
+    stem != dir name and are ignored. When a TL_dir holds a ``.msr`` but has
+    already been converted (a ``.tif`` trial sits beneath it), the converted
+    ``.tif`` trial supersedes the ``.msr`` one.
     """
     root = Path(root)
     out: list[tuple[str, list[Trial]]] = []
     for subject_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        trials: list[Trial] = []
-        for tif in sorted(subject_dir.rglob("*.tif")):
-            d = tif.parent
-            if tif.stem == d.name:                       # raw session stack
-                trials.append(Trial(subject_dir.name, d.name, d, tif))
+        tif_dirs = {t.parent for t in subject_dir.rglob("*.tif")
+                    if t.stem == t.parent.name}
+        msr_dirs = {m.parent for m in subject_dir.rglob("*.msr")
+                    if m.stem == m.parent.name}
+        # drop a .msr TL_dir once a converted .tif trial sits beneath it
+        msr_dirs = {d for d in msr_dirs
+                    if d not in tif_dirs
+                    and not any(d in t.parents for t in tif_dirs)}
+
+        trials = [Trial(subject_dir.name, d.name, d, d / f"{d.name}.tif")
+                  for d in tif_dirs]
+        trials += [Trial(subject_dir.name, d.name, d, d / f"{d.name}.msr")
+                   for d in msr_dirs]
+        trials.sort(key=lambda tr: tr.name)
         if trials:
             out.append((subject_dir.name, trials))
     return out
@@ -109,7 +125,8 @@ class SubjectTree(QTreeWidget):
             s_item = QTreeWidgetItem([f"{subject}  ({len(trials)})"])
             self.addTopLevelItem(s_item)
             for tr in trials:
-                leaf = QTreeWidgetItem([tr.name])
+                label = tr.name if tr.kind == "tif" else f"{tr.name}   · msr (raw)"
+                leaf = QTreeWidgetItem([label])
                 leaf.setData(0, _UROLE, str(tr.directory))
                 s_item.addChild(leaf)
         self.expandToDepth(0)
@@ -366,7 +383,7 @@ class BatchGUI(QMainWindow):
             f"{len(discovered)} subjects, {n} trials found under {root}")
         if n == 0:
             QMessageBox.warning(self, "No trials",
-                                f"No <name>.tif stacks found under:\n{root}")
+                                f"No .tif/.msr stacks found under:\n{root}")
 
     # -- Tab 1 --------------------------------------------------------------
     def _build_select_tab(self, discovered):
