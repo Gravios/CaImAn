@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QListWidget, QListWidgetItem, QSplitter, QPushButton,
     QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QFileDialog, QMessageBox,
-    QStyledItemDelegate, QAbstractItemView,
+    QCheckBox, QStyledItemDelegate, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor, QBrush, QFont
@@ -464,6 +464,18 @@ class BatchGUI(QMainWindow):
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(self._apply_templates)
 
+        self.clean_temp_chk = QCheckBox("Clean CAIMAN_TEMP after each successful run")
+        self.clean_temp_chk.setToolTip(
+            "After a session finishes successfully, delete its intermediate "
+            "mmap files (<session>*) from CAIMAN_TEMP to free disk. Results, QC, "
+            "report and any corrected .tif are kept. Sets cleanup.clean_temp.")
+        try:
+            _tpl = json.loads(self._tpl_json.read_text(encoding="utf-8"))
+            self.clean_temp_chk.setChecked(
+                bool(_tpl.get("cleanup", {}).get("clean_temp", False)))
+        except Exception:                            # noqa: BLE001
+            pass
+
         self.tpl_label = QLabel(str(self._tpl_json))
         w = QWidget(); v = QVBoxLayout(w)
         top = QHBoxLayout()
@@ -471,7 +483,9 @@ class BatchGUI(QMainWindow):
         top.addWidget(load_btn)
         v.addLayout(top)
         v.addWidget(self.editor)
-        row = QHBoxLayout(); row.addStretch(); row.addWidget(apply_btn)
+        row = QHBoxLayout()
+        row.addWidget(self.clean_temp_chk)
+        row.addStretch(); row.addWidget(apply_btn)
         v.addLayout(row)
         return w
 
@@ -495,6 +509,9 @@ class BatchGUI(QMainWindow):
     def _apply_templates(self):
         try:
             data = self.editor.to_dict()
+            # The checkbox is authoritative for cleanup.clean_temp.
+            data.setdefault("cleanup", {})["clean_temp"] = \
+                bool(self.clean_temp_chk.isChecked())
             json_text = json.dumps(data, indent=2, ensure_ascii=False)
             py_text = self._tpl_py.read_text(encoding="utf-8")
         except Exception as exc:                    # noqa: BLE001

@@ -788,3 +788,24 @@ if __name__ == "__main__":
         _extra["Oscillation NPZ"] = Path(_osc_npz).name
 
     write_report(timer, session, outdir, logger, extra=_extra)
+
+    # ── 9. Cleanup ────────────────────────────────────────────────────────────
+    # Only reached on success (an earlier failure exits before here), so a
+    # failed run keeps its mmaps for debugging / resume. Removes this session's
+    # intermediate mmap files from CAIMAN_TEMP; results, QC, report and any
+    # _Xcorrected/_Ncorrected .tif in the session dir are NOT touched.
+    _cleanup_cfg = getattr(_P, "cleanup", None)
+    if bool(getattr(_cleanup_cfg, "clean_temp", False)):
+        import glob as _glob
+        _removed, _freed = 0, 0
+        for _f in _glob.glob(os.path.join(CAIMAN_TEMP, f"{session}*")):
+            try:
+                _sz = os.path.getsize(_f)
+                os.remove(_f)
+                _removed += 1
+                _freed += _sz
+            except OSError as _e:
+                logger.warning(f"cleanup: could not remove {_f}: {_e}")
+        logger.info(
+            f"cleanup: removed {_removed} temp file(s) for {session} "
+            f"({_freed / 2**30:.2f} GB) from {CAIMAN_TEMP}")

@@ -181,5 +181,9 @@
     "min_pixels": 8,
     "nb": 2,
     "use_gpu": true
+  },
+  "cleanup": {
+    "_comment": "Post-run housekeeping, applied only after a SUCCESSFUL run (a failed run keeps its mmaps for debugging/resume). clean_temp: delete this session's intermediate mmap files (<session>*) from CAIMAN_TEMP to free disk. Results (.hdf5), QC images, the report, and any _Xcorrected/_Ncorrected .tif in the session directory are NOT touched.",
+    "clean_temp": false
   }
 }
