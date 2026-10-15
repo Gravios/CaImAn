@@ -11,8 +11,9 @@ Requires
 
 Usage
 -----
-    python bin/cnmf_inspector.py /path/to/results.hdf5
-    python bin/cnmf_inspector.py                        # synthetic demo
+    python bin/caiman_inspector.py /path/to/results.hdf5
+    python bin/caiman_inspector.py /path/to/<session>.tif   # stack + its results
+    python bin/caiman_inspector.py                          # synthetic demo
 
 Controls
 --------
@@ -558,12 +559,109 @@ def _load_image_file(path: str) -> np.ndarray:
                     return z[key]
             return z[z.files[0]]
     if ext in (".tif", ".tiff"):
-        import tifffile
-        return tifffile.imread(path)
+        if len(_tif_shape(path)) <= 2:
+            import tifffile
+            return tifffile.imread(path)
+        return _stack_projections(path)["stack max"]   # streamed, not imread
     if ext in (".png", ".jpg", ".jpeg"):
         from PIL import Image
         return np.asarray(Image.open(path).convert("F"))
     raise ValueError(f"unsupported background format: {ext}")
+
+
+TIF_EXTS = (".tif", ".tiff")
+SIBLING_STACK_MAX_BYTES = 2 << 30   # auto-project sibling stacks only up to 2 GiB
+
+
+def _tif_shape(path: str) -> tuple:
+    """Shape of the first series of a TIFF, read from the header only."""
+    import tifffile
+    with tifffile.TiffFile(path) as tf:
+        return tuple(tf.series[0].shape)
+
+
+def _stack_projections(path: str, chunk: int = 256) -> dict:
+    """Mean and max projections of a TIFF stack, streamed frame by frame.
+
+    Never holds more than ``chunk`` frames in memory, so multi-GB BigTIFF
+    movies work.  Leading axes (time, z, channel) are all reduced; the last
+    two are (H, W).  A 2-D TIFF returns the image as both projections.
+    """
+    import tifffile
+    shape = _tif_shape(path)
+    if len(shape) <= 2:
+        img = np.asarray(tifffile.imread(path), dtype=np.float32)
+        return {"stack mean": img, "stack max": img}
+    H, W = shape[-2:]
+    acc = np.zeros((H, W), dtype=np.float64)
+    mx  = np.full((H, W), -np.inf, dtype=np.float32)
+    n   = 0
+    try:                                        # contiguous: memmap + chunks
+        arr = tifffile.memmap(path, mode="r").reshape(-1, H, W)
+        for s in range(0, arr.shape[0], chunk):
+            blk = np.asarray(arr[s:s + chunk], dtype=np.float32)
+            acc += blk.sum(axis=0, dtype=np.float64)
+            np.maximum(mx, blk.max(axis=0), out=mx)
+            n += blk.shape[0]
+    except Exception:                           # compressed / tiled: per page
+        acc[:] = 0; mx[:] = -np.inf; n = 0
+        with tifffile.TiffFile(path) as tf:
+            for page in tf.pages:
+                fr = np.asarray(page.asarray(), dtype=np.float32).reshape(-1, H, W)
+                acc += fr.sum(axis=0, dtype=np.float64)
+                np.maximum(mx, fr.max(axis=0), out=mx)
+                n += fr.shape[0]
+    if n == 0:
+        raise ValueError(f"no frames in {path}")
+    return {"stack mean": (acc / n).astype(np.float32), "stack max": mx}
+
+
+def resolve_results_for_stack(stack_path: str) -> str:
+    """Find the CNMF results file that belongs to a raw ``.tif`` stack.
+
+    Looks in the stack's folder, then its parent, for (in order)
+    ``<stem>_results.hdf5``, ``<stem>_caiman_results.hdf5``, then any
+    ``<stem>*.hdf5`` / ``<stem>*.h5``; originals are preferred over
+    ``*_curated`` copies.  Raises FileNotFoundError listing where it looked.
+    """
+    import glob
+    stem   = os.path.splitext(os.path.basename(stack_path))[0]
+    folder = _os_dirname(stack_path)
+    dirs   = [folder, os.path.dirname(folder)]
+    for d in dirs:                              # exact names win in either dir
+        for name in (f"{stem}_results.hdf5", f"{stem}_caiman_results.hdf5"):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    for d in dirs:
+        cands = sorted(glob.glob(os.path.join(glob.escape(d), glob.escape(stem) + "*.hdf5"))
+                       + glob.glob(os.path.join(glob.escape(d), glob.escape(stem) + "*.h5")))
+        cands.sort(key=lambda p: os.path.splitext(p)[0].endswith("_curated"))
+        if cands:
+            return cands[0]
+    raise FileNotFoundError(
+        f"no CNMF results for stack '{os.path.basename(stack_path)}' — looked for "
+        f"{stem}_results.hdf5 / {stem}*.hdf5 in {dirs[0]} and {dirs[1]}. "
+        f"Pass the results file instead, or use --results.")
+
+
+def load_any(path: str, results: str = None) -> 'ComponentStore':
+    """Open a results file, or a raw ``.tif`` stack plus its results.
+
+    For a stack, the matching results file is found with
+    :func:`resolve_results_for_stack` (or taken from ``results``), and the
+    stack's streamed mean / max projections are added as backgrounds with
+    the mean made active, so the actual cells are visible.
+    """
+    if os.path.splitext(path)[1].lower() not in TIF_EXTS:
+        return load_from_hdf5(results or path)
+    res_path = results or resolve_results_for_stack(path)
+    print(f"Stack {os.path.basename(path)} -> results {res_path}")
+    store = load_from_hdf5(res_path)
+    for name, img in _stack_projections(path).items():
+        store.add_background(name, img)
+    store.set_background("stack mean")
+    return store
 
 
 # ── Correlation helper ───────────────────────────────────────────────────────
@@ -715,9 +813,14 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
     import re as _re
     folder = _os_dirname(path)
     stem   = os.path.splitext(os.path.basename(path))[0]          # <session>_results
-    # Strip a trailing results/cnmf/curated tail to recover the session prefix.
-    prefix = _re.sub(r'[._-]?(results?|cnmf?|cnm|estimates?|curated)$', '',
-                     stem, flags=_re.I)
+    # Strip trailing results/cnmf/curated tails (repeatedly, so
+    # ``<session>_caiman_results_curated`` → ``<session>``) to recover the
+    # session prefix.
+    prefix, prev = stem, None
+    while prefix != prev:
+        prev   = prefix
+        prefix = _re.sub(r'[._-]?(results?|cnmf?|cnm|caiman|estimates?|curated)$',
+                         '', prefix, flags=_re.I)
     tokens = ("projection", "percentile", "mean", "median",
               "max", "pnr", "summary", "anat", "template", "_cn")
     exts   = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
@@ -735,12 +838,26 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
         if not (shares_prefix or has_token):
             continue
         try:
-            img = _load_image_file(f)
-            if np.asarray(img).squeeze().ndim != 2:   # skip stacks at auto-load
-                continue
             label = name_stem
             if shares_prefix:
                 label = name_stem[len(prefix):].lstrip("._- ") or name_stem
+            # SLab rule: the raw stack <session>.tif next to the results is the
+            # anatomical reference.  Project it (streamed) unless it is huge.
+            if (low.endswith(TIF_EXTS) and name_stem == prefix
+                    and len(_tif_shape(f)) > 2):
+                if os.path.getsize(f) > SIBLING_STACK_MAX_BYTES:
+                    print(f"[bg] skipping {os.path.basename(f)} "
+                          f"({os.path.getsize(f) / 2**30:.1f} GiB); "
+                          f"pass it with --background or open the .tif",
+                          file=sys.stderr)
+                    continue
+                for pname, img in _stack_projections(f).items():
+                    store.add_background(pname, img)
+                    found.append((pname, "mean" if "mean" in pname else "max"))
+                continue
+            img = _load_image_file(f)
+            if np.asarray(img).squeeze().ndim != 2:   # other stacks: skip
+                continue
             store.add_background(label, img)           # coercion dim-checks
             found.append((label, low))
         except Exception:
@@ -1886,11 +2003,12 @@ class InspectorWindow(QMainWindow):
     def _open_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CaImAn results", "",
-            "HDF5 files (*.hdf5 *.h5);;All files (*)")
+            "Results or stack (*.hdf5 *.h5 *.tif *.tiff);;"
+            "HDF5 files (*.hdf5 *.h5);;TIFF stacks (*.tif *.tiff);;All files (*)")
         if not path:
             return
         try:
-            store = load_from_hdf5(path)
+            store = load_any(path)
             self._swap_store(store)
             self.statusBar().showMessage(
                 f"Loaded {store.n} components from {path}")
@@ -2097,7 +2215,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="CaImAn Component Inspector (Qt6 / PyQt6)")
     parser.add_argument("results", nargs="?",
-                        help="Path to a CaImAn .hdf5 results file")
+                        help="CaImAn .hdf5 results file, or a raw .tif/.tiff "
+                             "stack (its <stem>_results.hdf5 is found and the "
+                             "stack's mean/max projections become backgrounds)")
+    parser.add_argument("--results", dest="results_override", default=None,
+                        help="Results file to use when the positional "
+                             "argument is a .tif stack")
     parser.add_argument("--background", "--bg", dest="background", default=None,
                         help="Image to show behind the footprints "
                              "(.npy/.npz/.tif/.png; a 3-D stack is max-projected)")
@@ -2108,8 +2231,8 @@ def main():
 
     if args.results:
         try:
-            store = load_from_hdf5(args.results)
-            print(f"Loaded {store.n} components from {args.results}")
+            store = load_any(args.results, args.results_override)
+            print(f"Loaded {store.n} components from {store.fpath}")
         except Exception as exc:
             print(f"Error loading '{args.results}': {exc}", file=sys.stderr)
             sys.exit(1)
