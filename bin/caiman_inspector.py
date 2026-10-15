@@ -25,6 +25,22 @@ Controls
     ↩ Undo       — Ctrl+Z  — undo last merge or delete (up to 5 steps)
     ↪ Redo       — Ctrl+Y  — redo last undone operation
     File > Save  — write modified A / C back to the .hdf5
+
+Event detection & curation (ported from SLabAnalysisPackage)
+-------------------------------------------------------------
+    Analysis > Detect events  — Ctrl+D — SLab peak detection on ΔF/F
+                                (caiman.utils.event_detection); include
+                                flags start at the automatic approval
+    ✓ Include / exclude       — I — non-destructive approval; excluded
+                                footprints are red ("Hide excluded" hides them)
+    Event panel               — filtered ΔF/F, threshold, peaks, binary trace
+                                of the last-selected component
+    Analysis > Export         — Ctrl+E — <session>_PeakStats / _ROIStats
+    Analysis > Batch detect   — stroh_results into every file of a folder
+    Analysis > Blinded review — Ctrl+R — shuffled, name-blind rating;
+                                Ctrl+Return saves SLabRandomization/<RATER>
+    Events and include flags are saved as an SLab-compatible stroh_results
+    group, so SLabAnalysisApp.py opens curated files.
 """
 
 import sys
@@ -37,6 +53,7 @@ import scipy.sparse
 HISTORY_MAXLEN = 5   # maximum undo / redo steps retained
 
 TRACE_DENOISED = "C (denoised)"   # canonical trace key; this one is saved back
+TRACE_DFF      = "ΔF/F"           # estimates.F_dff; input to event detection
 
 import pyqtgraph as pg
 
@@ -44,6 +61,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QTableWidget,
     QTableWidgetItem, QLabel, QFileDialog, QComboBox,
     QMessageBox, QSizePolicy, QAbstractItemView, QHeaderView,
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QInputDialog, QProgressDialog,
 )
 from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
 from PyQt6.QtGui   import (
@@ -62,9 +81,11 @@ PALETTE_HEX = [
 CORR_A   = "#FF8C00"   # orange  – first of a clicked corr pair
 CORR_B   = "#FF00FF"   # magenta – second
 CYAN     = "#00FFFF"   # default (unselected) footprint colour
+EXCLUDED = "#FF3B3B"   # footprints of components not approved (events mode)
 
 ALPHA_SEL    = 0.55   # overlay alpha for selected components
 ALPHA_DEF    = 0.12   # overlay alpha for unselected components
+ALPHA_EXCL   = 0.22   # excluded components: a little stronger, so red reads
 CROSS_MIN_ARM = 25    # minimum cross arm half-length in pixels
 
 BG_DARK  = "#111111"
@@ -154,9 +175,24 @@ class ComponentStore:
 
     def __init__(self, A, C, Cn, dims,
                  SNR_comp=None, r_values=None, cnn_preds=None,
-                 cnm_obj=None, fpath=None, traces=None):
+                 cnm_obj=None, fpath=None, traces=None,
+                 orig_idx=None, fr=None, decay_time=None):
         self._A = _to_dense(A)
         self.dims = dims
+        K = self._A.shape[1]
+
+        # ── Event detection / curation (SLab stroh_results) ──────────────────
+        # events   : EventResults aligned to rows, or None until detected/loaded
+        # approved : manual include flag (SLab "manually_approved"); unlike
+        #            delete it is non-destructive and is saved alongside A/C
+        # orig_idx : row in the source file's estimates (-1 for merged rows),
+        #            used to map file-level stroh_results onto the shown subset
+        self.events   = None
+        self.approved = np.ones(K, dtype=bool)
+        self.orig_idx = (np.arange(K) if orig_idx is None
+                         else np.asarray(orig_idx, dtype=np.int64))
+        self.fr         = fr
+        self.decay_time = decay_time
 
         # ── Temporal traces (display registry) ───────────────────────────────
         # Every entry is a (K, T) array.  TRACE_DENOISED is the canonical
@@ -308,6 +344,9 @@ class ComponentStore:
             "SNR_comp":  self.SNR_comp.copy()  if self.SNR_comp  is not None else None,
             "r_values":  self.r_values.copy()  if self.r_values  is not None else None,
             "cnn_preds": self.cnn_preds.copy() if self.cnn_preds is not None else None,
+            "events":    self.events.copy() if self.events is not None else None,
+            "approved":  self.approved.copy(),
+            "orig_idx":  self.orig_idx.copy(),
         }
 
     def _restore(self, snap: dict):
@@ -321,6 +360,9 @@ class ComponentStore:
         self.SNR_comp  = snap["SNR_comp"]
         self.r_values  = snap["r_values"]
         self.cnn_preds = snap["cnn_preds"]
+        self.events    = snap["events"]
+        self.approved  = snap["approved"]
+        self.orig_idx  = snap["orig_idx"]
         self.invalidate_corr()
 
     def _push_undo(self, op: str):
@@ -427,6 +469,12 @@ class ComponentStore:
             if arr is not None:
                 setattr(self, attr,
                         np.append(arr[keep], float(arr[idx].mean())))
+        # Merged component is included if any constituent was; it has no
+        # source row.  Its events are re-detected on the merged traces.
+        self.approved = np.append(self.approved[keep], bool(self.approved[idx].any()))
+        self.orig_idx = np.append(self.orig_idx[keep], -1)
+        if self.events is not None:
+            self.events = self.events.take(keep).append(self._detect_row(self.n - 1))
         self.invalidate_corr()
         return self.n - 1
 
@@ -443,7 +491,86 @@ class ComponentStore:
             arr = getattr(self, attr)
             if arr is not None:
                 setattr(self, attr, arr[keep])
+        self.approved = self.approved[keep]
+        self.orig_idx = self.orig_idx[keep]
+        if self.events is not None:
+            self.events = self.events.take(keep)
         self.invalidate_corr()
+
+    # ── Events / approval ─────────────────────────────────────────────────────
+
+    @property
+    def dff(self):
+        """ΔF/F traces (K, T) or None — the input event detection needs."""
+        return self.traces.get(TRACE_DFF)
+
+    @property
+    def can_detect(self) -> bool:
+        return self.dff is not None
+
+    def detect_events(self, fr, decay_time, progress=None, **kw):
+        """Run SLab event detection on every row; approval := auto-approval."""
+        if not self.can_detect:
+            raise RuntimeError("No ΔF/F traces (estimates.F_dff) in this file — "
+                               "run cnm.estimates.detrend_df_f() first.")
+        self.events = _ed().detect_events(self.dff, self.C, fr, decay_time,
+                                          self.SNR_comp, self.cnn_preds,
+                                          progress=progress, **kw)
+        self.approved = self.events.auto_approved.copy()
+        self.fr, self.decay_time = float(fr), float(decay_time)
+
+    def _detect_row(self, i):
+        """EventResults for row i alone, using the current events' settings
+        (a blank row if ΔF/F is unavailable)."""
+        ev = self.events
+        if self.can_detect:
+            p = ev.params
+            one = _ed().detect_events(
+                self.dff[i:i + 1], self.C[i:i + 1], ev.fr, ev.decay_time,
+                None if self.SNR_comp is None else self.SNR_comp[i:i + 1],
+                None if self.cnn_preds is None else self.cnn_preds[i:i + 1],
+                threshold=ev.threshold, min_snr=p.get("min_snr", 3.0),
+                min_cnn=p.get("min_cnn", 0.15), lowpass_hz=p.get("lowpass_hz"))
+            one.params = dict(p)
+            return one
+        blank = ev.take([0]) if ev.n else ev
+        blank.binary[:] = 0; blank.filtered[:] = 0
+        blank.thresholds[:] = 0; blank.frequencies[:] = 0
+        blank.peaks = [np.zeros((0, 4))]; blank.auto_approved[:] = False
+        return blank
+
+    def toggle_approved(self, indices):
+        for i in indices:
+            self.approved[i] = not self.approved[i]
+
+    @property
+    def n_approved(self) -> int:
+        return int(self.approved.sum())
+
+    def attach_events(self, res, approved):
+        """Adopt file-level stroh_results, mapped through orig_idx.
+
+        Rows whose source index is outside the stored results (or merged
+        rows) are re-detected when possible.  Returns False if the stored
+        results don't fit this file (row count mismatch)."""
+        oi = self.orig_idx
+        if res.n == self.n and np.array_equal(oi, np.arange(self.n)):
+            self.events, self.approved = res, np.asarray(approved, bool).copy()
+        elif oi.size and oi.max() < res.n:
+            ok = oi >= 0
+            if not ok.all():
+                return False
+            self.events = res.take(oi)
+            self.approved = np.asarray(approved, bool)[oi].copy()
+        else:
+            return False
+        if not np.isfinite(self.events.fr) and self.fr:
+            self.events.fr = float(self.fr)
+        if not np.isfinite(self.events.decay_time) and self.decay_time:
+            self.events.decay_time = float(self.decay_time)
+        self.fr = self.events.fr
+        self.decay_time = self.events.decay_time
+        return True
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
@@ -483,12 +610,18 @@ class ComponentStore:
         est.C  = self.C
         est.nr = K
 
-        # Null stale K-indexed derived fields
+        # Null stale K-indexed derived fields.  ΔF/F is carried through
+        # merge/delete in the trace registry (merged rows = mean of their
+        # constituents' ΔF/F); it is written back rather than nulled because
+        # event detection and SLabAnalysisApp both need it.
+        dff = self.dff
         for field in ("S", "YrA", "R", "F_dff",
                       "g", "bl", "c1", "neurons_sn", "lam",
                       "coordinates", "A_thr"):
             if getattr(est, field, None) is not None:
                 setattr(est, field, None)
+        if dff is not None:
+            est.F_dff = dff
 
         # Quality metrics
         est.SNR_comp  = self.SNR_comp
@@ -506,6 +639,8 @@ class ComponentStore:
                 "time":         int(_time.time()),
                 "description":  "Manual curation via cnmf_inspector",
                 "n_components": K,
+                "n_approved":   self.n_approved,
+                "n_merged_dff_rows": int((self.orig_idx < 0).sum()),
                 "source_file":  self.fpath or "",
                 "save_path":    path,
             })
@@ -513,6 +648,13 @@ class ComponentStore:
         # Delegate to CaImAn's own serialiser
         self.cnm_obj.save(path)
         self.fpath = path
+        self.orig_idx = np.arange(K)          # rows now index the saved file
+
+        # Events + approvals as an SLab stroh_results group, rows = saved rows
+        if self.events is not None:
+            import h5py
+            with h5py.File(path, "a") as f:
+                _ed().write_stroh_results(f, self.events, self.approved)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -521,6 +663,35 @@ def _to_dense(A) -> np.ndarray:
     if scipy.sparse.issparse(A):
         return np.asarray(A.todense(), dtype=np.float32)
     return np.asarray(A, dtype=np.float32)
+
+def _ed():
+    """``caiman.utils.event_detection``, imported lazily.
+
+    Falls back to loading the module file from this checkout when the
+    ``caiman`` package itself can't be imported (e.g. demo mode on a machine
+    without the compiled CaImAn stack).
+    """
+    mod = sys.modules.get("_inspector_event_detection")
+    if mod is not None:
+        return mod
+    try:
+        from caiman.utils import event_detection as mod
+    except Exception:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, "caiman", "utils", "event_detection.py")
+        name = "_inspector_event_detection"
+        spec = importlib.util.spec_from_file_location(name, p)
+        mod  = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod          # @dataclass resolves its module here
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            del sys.modules[name]
+            raise
+    sys.modules["_inspector_event_detection"] = mod
+    return mod
+
 
 def _opt_arr(x):
     if x is None:
@@ -736,7 +907,10 @@ def _active_pearson_corr(C: np.ndarray,
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-def load_from_hdf5(path: str) -> ComponentStore:
+def load_from_hdf5(path: str, all_components: bool = False) -> ComponentStore:
+    """Load a CNMF results file.  By default only ``idx_components`` are
+    shown; ``all_components`` shows every row (as SLabAnalysisApp does —
+    used by blinded review so ratings index the file's full estimates)."""
     import os as _os
     # Ensure CAIMAN_TEMP is set to a writable directory before load_CNMF
     # calls fn_relocated.  If the current value is missing or unwritable,
@@ -754,7 +928,7 @@ def load_from_hdf5(path: str) -> ComponentStore:
     A = _to_dense(est.A)
     C = est.C
 
-    idx = getattr(est, "idx_components", None)
+    idx = None if all_components else getattr(est, "idx_components", None)
 
     def _sel_rows(arr):
         """Slice an optional (K, T) trace array by idx_components."""
@@ -784,7 +958,7 @@ def load_from_hdf5(path: str) -> ComponentStore:
     YrA    = _sel_rows(getattr(est, "YrA",   None))
     S      = _sel_rows(getattr(est, "S",     None))
     if F_dff is not None and F_dff.shape == Cd.shape:
-        traces["ΔF/F"] = F_dff
+        traces[TRACE_DFF] = F_dff
     if YrA is not None and YrA.shape == Cd.shape:
         traces["C + residual (raw)"] = Cd + YrA
     if S is not None and S.shape == Cd.shape and np.any(S):
@@ -792,11 +966,46 @@ def load_from_hdf5(path: str) -> ComponentStore:
 
     _Cn = getattr(est, "Cn", None)
     Cn  = _Cn if _Cn is not None else A.max(axis=1).reshape(dims, order="F")
+    orig_idx = (np.asarray(idx, dtype=np.int64)
+                if idx is not None and len(idx) > 0 else np.arange(Cd.shape[0]))
+    pdata = getattr(getattr(cnm, "params", None), "data", None) or {}
     store = ComponentStore(A, C, Cn, dims,
                            SNR_comp=snr, r_values=rval, cnn_preds=cnn,
-                           cnm_obj=cnm, fpath=path, traces=traces)
+                           cnm_obj=cnm, fpath=path, traces=traces,
+                           orig_idx=orig_idx,
+                           fr=_opt_float(pdata.get("fr")),
+                           decay_time=_opt_float(pdata.get("decay_time")))
+    _attach_stroh_results(store, path)
     _attach_sibling_backgrounds(store, path)
     return store
+
+
+def _opt_float(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) and v > 0 else None
+
+
+def _attach_stroh_results(store: 'ComponentStore', path: str):
+    """Load an SLab ``stroh_results`` group (events + approvals) if present."""
+    try:
+        import h5py
+        with h5py.File(path, "r") as f:
+            if "stroh_results" not in f:
+                return
+            res, appr = _ed().read_stroh_results(f["stroh_results"])
+    except Exception as exc:
+        print(f"[events] could not read stroh_results: {exc}", file=sys.stderr)
+        return
+    if res is None:
+        print("[events] stroh_results too old (< v7.1) — ignored", file=sys.stderr)
+    elif res.binary.shape[1] != store.C.shape[1]:
+        print("[events] stroh_results length differs from C — ignored", file=sys.stderr)
+    elif not store.attach_events(res, appr):
+        print(f"[events] stroh_results has {res.n} rows; cannot map onto "
+              f"{store.n} shown components — ignored", file=sys.stderr)
 
 
 def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
@@ -810,17 +1019,8 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
     auto-activated so the viewer shows the actual cells.
     """
     import glob
-    import re as _re
     folder = _os_dirname(path)
-    stem   = os.path.splitext(os.path.basename(path))[0]          # <session>_results
-    # Strip trailing results/cnmf/curated tails (repeatedly, so
-    # ``<session>_caiman_results_curated`` → ``<session>``) to recover the
-    # session prefix.
-    prefix, prev = stem, None
-    while prefix != prev:
-        prev   = prefix
-        prefix = _re.sub(r'[._-]?(results?|cnmf?|cnm|caiman|estimates?|curated)$',
-                         '', prefix, flags=_re.I)
+    prefix = _session_prefix(path)
     tokens = ("projection", "percentile", "mean", "median",
               "max", "pnr", "summary", "anat", "template", "_cn")
     exts   = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
@@ -873,6 +1073,115 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
         store.set_background(sorted(found, key=_rank)[0][0])
 
 
+def _session_prefix(path: str) -> str:
+    """``<session>`` from ``<session>[_caiman][_results][_curated].hdf5``.
+
+    Trailing results/cnmf/caiman/curated tails are stripped repeatedly, so
+    ``<session>_caiman_results_curated`` → ``<session>``.
+    """
+    import re as _re
+    prefix, prev = os.path.splitext(os.path.basename(path))[0], None
+    while prefix != prev:
+        prev   = prefix
+        prefix = _re.sub(r'[._-]?(results?|cnmf?|cnm|caiman|estimates?|curated)$',
+                         '', prefix, flags=_re.I)
+    return prefix
+
+
+# ── Event exports / blinded review (no Qt; called by the window) ─────────────
+
+def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
+    """Write SLab PeakStats + ROIStats tables for the *included* components.
+
+    ``peak_path`` names the PeakStats file (.xlsx or .csv); ROIStats goes
+    next to it with ``PeakStats`` → ``ROIStats`` in the name.  ``.xlsx``
+    needs pandas + openpyxl and falls back to ``.csv``.  ROIStats lists every
+    included ROI, including those with 0 events (SLab dropped them).
+    Returns the paths written.
+    """
+    ed  = _ed()
+    ev  = store.events
+    if ev is None:
+        raise RuntimeError("no events to export")
+    rows  = np.flatnonzero(store.approved)
+    peaks = ev.peak_table(rows)
+    peaks["label"] = np.array([store.labels[r] for r in peaks["roi"]], dtype=object)
+    rois  = ed.roi_stats(ev, store.approved, ev.binary.shape[1],
+                         labels=store.labels, SNR_comp=store.SNR_comp,
+                         cnn_preds=store.cnn_preds)
+    folder, base = os.path.split(peak_path)
+    stem, ext = os.path.splitext(base)
+    roi_stem = (stem.replace("PeakStats", "ROIStats") if "PeakStats" in stem
+                else stem + "_ROIStats")
+    ext = ext.lower() if ext.lower() in (".xlsx", ".csv") else ".xlsx"
+    pd = None
+    if ext == ".xlsx":
+        import importlib.util
+        if importlib.util.find_spec("openpyxl") is not None:
+            try:
+                import pandas as pd
+            except ImportError:
+                pd = None
+        if pd is None:
+            ext = ".csv"
+    out = []
+    for table, st in ((peaks, stem), (rois, roi_stem)):
+        p = os.path.join(folder, st + ext)
+        if ext == ".xlsx":
+            pd.DataFrame(table).to_excel(p, index=False)
+        else:
+            import csv
+            cols = list(table)
+            with open(p, "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(cols)
+                for k in range(len(table[cols[0]]) if cols else 0):
+                    w.writerow([table[c][k] for c in cols])
+        out.append(p)
+    return out
+
+
+def blind_plan(files, rater: str):
+    """Split results files for a blinded review by ``rater``.
+
+    Returns ``(unrated, rated, skipped)``; files without a ``stroh_results``
+    group (no events yet) or unreadable files are ``skipped``.
+    """
+    import h5py
+    unrated, rated, skipped = [], [], []
+    for p in files:
+        try:
+            with h5py.File(p, "r") as f:
+                if "stroh_results" not in f:
+                    skipped.append(p)
+                elif "SLabRandomization" in f and rater in f["SLabRandomization"]:
+                    rated.append(p)
+                else:
+                    unrated.append(p)
+        except Exception:
+            skipped.append(p)
+    return unrated, rated, skipped
+
+
+def write_blind_rating(path: str, rater: str, store: 'ComponentStore',
+                       file_list) -> None:
+    """Append ``SLabRandomization/<rater>`` to the results file — the SLab
+    inter-rater layout (stroh_results fields + file_list + timestamp attr).
+    Only that group is written; estimates are untouched.  Requires a store
+    loaded with ``all_components=True`` and no merges/deletes, so rows are
+    the file's estimates rows."""
+    import h5py
+    from datetime import datetime
+    if not np.array_equal(store.orig_idx, np.arange(store.n)):
+        raise RuntimeError("ratings must index the file's full estimates")
+    with h5py.File(path, "a") as f:
+        g = _ed().write_stroh_results(f, store.events, store.approved,
+                                      group=f"SLabRandomization/{rater}")
+        g.create_dataset("file_list",
+                         data=[str(p).encode("utf-8") for p in file_list])
+        g.attrs["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _os_dirname(path: str) -> str:
     return os.path.abspath(os.path.dirname(path)) or "."
 
@@ -915,7 +1224,8 @@ def _build_overlay(store: ComponentStore,
     return np.clip(out, 0, 1)
 
 
-def _build_roi_overlay(store: ComponentStore) -> np.ndarray:
+def _build_roi_overlay(store: ComponentStore,
+                       hide_excluded: bool = False) -> np.ndarray:
     """
     Return (d1, d2, 4) RGBA composite of *every* footprint in dim cyan.
 
@@ -926,19 +1236,25 @@ def _build_roi_overlay(store: ComponentStore) -> np.ndarray:
     d1, d2 = store.dims
     out    = np.zeros((d1, d2, 4), dtype=np.float32)
 
-    _h = CYAN.lstrip('#')
-    r = int(_h[0:2], 16) / 255.0
-    g = int(_h[2:4], 16) / 255.0
-    b = int(_h[4:6], 16) / 255.0
+    def _rgb(hex_c):
+        _h = hex_c.lstrip('#')
+        return tuple(int(_h[k:k + 2], 16) / 255.0 for k in (0, 2, 4))
+
+    inc_rgb, exc_rgb = _rgb(CYAN), _rgb(EXCLUDED)
+    use_appr = store.events is not None   # approval only meaningful with events
 
     for i in range(store.n):
         if store.hidden[i]:
             continue
+        excluded = use_appr and not store.approved[i]
+        if excluded and hide_excluded:
+            continue
+        r, g, b = exc_rgb if excluded else inc_rgb
         fp   = store.footprint(i)
         peak = fp.max()
         if peak < 1e-9:
             continue
-        a_mask = (fp / peak) * ALPHA_DEF
+        a_mask = (fp / peak) * (ALPHA_EXCL if excluded else ALPHA_DEF)
         out[..., 0] = np.maximum(out[..., 0], r * a_mask)
         out[..., 1] = np.maximum(out[..., 1], g * a_mask)
         out[..., 2] = np.maximum(out[..., 2], b * a_mask)
@@ -988,8 +1304,10 @@ class CellViewer(pg.GraphicsLayoutWidget):
         self._img_bg.setZValue(0)
         self.vb.addItem(self._img_bg)
 
-        # Persistent "all ROIs" layer (dim cyan, every footprint)
+        # Persistent "all ROIs" layer (dim cyan, every footprint; excluded
+        # components in red once events exist, optionally hidden)
         self._show_all = True
+        self._hide_excluded = False
         self._img_all  = pg.ImageItem()
         self._img_all.setZValue(0.5)
         self.vb.addItem(self._img_all)
@@ -1032,13 +1350,18 @@ class CellViewer(pg.GraphicsLayoutWidget):
         self._centroids          = None
         self._cross_params_cache = None
         if self._show_all:
-            self._img_all.setImage(_build_roi_overlay(self.store))
+            self._img_all.setImage(
+                _build_roi_overlay(self.store, self._hide_excluded))
             self._img_all.setVisible(True)
         else:
             self._img_all.setVisible(False)
 
     def set_show_all(self, flag: bool):
         self._show_all = bool(flag)
+        self.refresh_rois()
+
+    def set_hide_excluded(self, flag: bool):
+        self._hide_excluded = bool(flag)
         self.refresh_rois()
 
     def refresh_background(self):
@@ -1265,6 +1588,75 @@ class TraceViewer(pg.PlotWidget):
             ti = pg.TextItem(f"Draw error: {exc}", color='#ff4444',
                              anchor=(0.5, 0.5))
             self.addItem(ti)
+
+
+# ── Event viewer ──────────────────────────────────────────────────────────────
+
+class EventViewer(pg.PlotWidget):
+    """Below the traces — event detection for the most recently selected
+    component (SLab's dF/f, filtered + peaks and binary panels in one):
+    raw ΔF/F (grey), filtered ΔF/F (green), threshold (dashed), binary
+    onset→peak plateaus (filled white) and detected peaks (red lines)."""
+
+    def __init__(self, store: 'ComponentStore', parent=None):
+        super().__init__(parent, background=BG_DARK)
+        self.store = store
+        self._sel  = []
+        self.getAxis('bottom').setTextPen(pg.mkPen('#888888'))
+        self.getAxis('left').setTextPen(pg.mkPen('#888888'))
+        self.getAxis('left').setLabel('ΔF/F', color='#888888')
+        self.getAxis('left').enableAutoSIPrefix(False)   # no "(x0.001)"
+        self.setMouseEnabled(x=True, y=False)
+        self._redraw()
+
+    def set_selection(self, sel):
+        self._sel = list(sel)
+        self._redraw()
+
+    def refresh(self):
+        self._redraw()
+
+    def _message(self, text):
+        # Title only: this plot is x-linked to the trace viewer, so changing
+        # the range here would squash the traces.
+        self.setTitle(f"<span style='color:#666666;font-size:9pt'>{text}</span>")
+
+    def _redraw(self):
+        self.clear()
+        self.setTitle(None)
+        s = self.store
+        if s.events is None:
+            self._message("No events — Analysis ▸ Detect events…"
+                          if s.can_detect else
+                          "No events (file has no ΔF/F to detect on)")
+            return
+        if not self._sel:
+            self._message("Select a component to see its events")
+            return
+        i  = self._sel[-1]
+        ev = s.events
+        t  = np.arange(ev.binary.shape[1], dtype=np.float32)
+        if s.dff is not None:
+            self.plot(t, s.dff[i], pen=pg.mkPen('#666666', width=1))
+        self.plot(t, ev.binary[i], pen=pg.mkPen('#dddddd', width=1),
+                  fillLevel=0, brush=pg.mkBrush(255, 255, 255, 70))
+        self.plot(t, ev.filtered[i], pen=pg.mkPen('#44dd66', width=1.2))
+        thr = float(ev.thresholds[i])
+        if thr > 0:
+            self.addItem(pg.InfiniteLine(
+                pos=thr, angle=0,
+                pen=pg.mkPen('#ccaa00', width=1, style=Qt.PenStyle.DashLine)))
+        for pk in ev.peaks[i][:, 0]:
+            self.addItem(pg.InfiniteLine(pos=float(pk), angle=90,
+                                         pen=pg.mkPen('#ff4444', width=1)))
+        flag = "✓ included" if s.approved[i] else "✗ excluded"
+        auto = "auto ✓" if ev.auto_approved[i] else "auto ✗"
+        self.setTitle(
+            f"<span style='color:#bbbbbb;font-size:9pt'>{s.labels[i]} — "
+            f"{ev.n_events(i)} events ({ev.frequencies[i]:.2f}/min), "
+            f"thr {thr:.3f} — {flag} ({auto})</span>")
+        self.setXRange(0, len(t), padding=0)
+        self.enableAutoRange(axis='y')
 
 
 # ── Shared matrix widget base ─────────────────────────────────────────────────
@@ -1547,6 +1939,8 @@ class ComponentTable(QTableWidget):
         for label, attr in self._OPTIONAL:
             if getattr(self.store, attr, None) is not None:
                 cols.append(label)
+        if self.store.events is not None:
+            cols += ["Ev/min", "Incl"]
         return cols
 
     def _populate(self):
@@ -1565,6 +1959,9 @@ class ComponentTable(QTableWidget):
             for _, attr in self._OPTIONAL:
                 if getattr(s, attr, None) is not None:
                     vals.append(f"{getattr(s, attr)[i]:.3f}")
+            if s.events is not None:
+                vals.append(f"{s.events.frequencies[i]:.2f}")
+                vals.append("✓" if s.approved[i] else "✗")
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setBackground(QBrush(dark))
@@ -1573,11 +1970,25 @@ class ComponentTable(QTableWidget):
         self.mark_hidden()
 
     def mark_hidden(self):
-        """Dim the text of hidden rows so it is clear which are not shown."""
+        """Dim hidden rows; tint excluded rows red (once events exist) and
+        keep the Incl column in sync with the store."""
         grey   = QColor(105, 105, 105)
         normal = QColor(220, 220, 220)
-        for row in range(self.store.n):
-            fg = grey if self.store.is_hidden(row) else normal
+        excl   = QColor(255, 110, 110)
+        s      = self.store
+        has_ev = s.events is not None and self.columnCount() and \
+            self.horizontalHeaderItem(self.columnCount() - 1).text() == "Incl"
+        for row in range(s.n):
+            if s.is_hidden(row):
+                fg = grey
+            elif has_ev and not s.approved[row]:
+                fg = excl
+            else:
+                fg = normal
+            if has_ev:
+                it = self.item(row, self.columnCount() - 1)
+                if it:
+                    it.setText("✓" if s.approved[row] else "✗")
             for col in range(self.columnCount()):
                 it = self.item(row, col)
                 if it:
@@ -1599,7 +2010,8 @@ class InspectorWindow(QMainWindow):
         self.store = store
         self.setWindowTitle("CaImAn Component Inspector")
         self.resize(1760, 980)
-        self._pair = None
+        self._pair  = None
+        self._blind = None      # blinded-review session state (dict) or None
 
         _apply_dark_palette()
         self._build_menu()
@@ -1645,6 +2057,12 @@ class InspectorWindow(QMainWindow):
         a.setToolTip("Make every hidden component visible again.")
         a.triggered.connect(self._show_all_hidden)
         vm.addAction(a)
+        vm.addSeparator()
+        a = QAction("Session &info…", self)
+        a.setToolTip("SNR range, recording length, approval counts, "
+                     "imaging frequency, decay time, analysis version.")
+        a.triggered.connect(self._session_info)
+        vm.addAction(a)
 
         em = mb.addMenu("&Edit")
         self.act_undo = QAction("↩  Undo", self)
@@ -1657,6 +2075,40 @@ class InspectorWindow(QMainWindow):
         self.act_redo.setEnabled(False)
         self.act_redo.triggered.connect(self._do_redo)
         em.addAction(self.act_redo)
+
+        am = mb.addMenu("&Analysis")
+        self.act_detect = QAction("&Detect events…", self)
+        self.act_detect.setShortcut(QKeySequence("Ctrl+D"))
+        self.act_detect.setToolTip(
+            "SLab calcium-event detection on ΔF/F for every component;\n"
+            "sets the include flags to the automatic approval.")
+        self.act_detect.triggered.connect(self._detect_events_dialog)
+        am.addAction(self.act_detect)
+        self.act_export = QAction("&Export event stats…", self)
+        self.act_export.setShortcut(QKeySequence("Ctrl+E"))
+        self.act_export.setToolTip(
+            "Write <session>_PeakStats and <session>_ROIStats for the included "
+            "components (.xlsx, or .csv without openpyxl).")
+        self.act_export.triggered.connect(self._export_events)
+        am.addAction(self.act_export)
+        am.addSeparator()
+        a = QAction("&Batch detect events in folder…", self)
+        a.setToolTip("Run event detection on every results file under a folder "
+                     "and write stroh_results into each (SLab Auto Mode).")
+        a.triggered.connect(self._batch_detect)
+        am.addAction(a)
+        am.addSeparator()
+        self.act_blind = QAction("&Blinded review…", self)
+        self.act_blind.setShortcut(QKeySequence("Ctrl+R"))
+        self.act_blind.setToolTip(
+            "Shuffled, file-name-blind include/exclude rating of a folder of "
+            "results, saved per rater (SLab Randomization Mode).")
+        self.act_blind.triggered.connect(self._start_blinded)
+        am.addAction(self.act_blind)
+        self.act_blind_end = QAction("&End blinded review", self)
+        self.act_blind_end.setEnabled(False)
+        self.act_blind_end.triggered.connect(self._end_blinded)
+        am.addAction(self.act_blind_end)
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
 
@@ -1689,6 +2141,26 @@ class InspectorWindow(QMainWindow):
         self.act_toggle_vis.triggered.connect(self._toggle_visibility)
         tb.addAction(self.act_toggle_vis)
         self.addAction(self.act_toggle_vis)   # keep shortcut active app-wide
+
+        self.act_include = QAction("✓  Include / exclude", self)
+        self.act_include.setToolTip(
+            "Toggle the include flag of the selected component(s) (I).\n"
+            "Non-destructive curation, saved as SLab manually_approved;\n"
+            "excluded components are drawn red and left out of exports.")
+        self.act_include.setShortcut(QKeySequence("I"))
+        self.act_include.setEnabled(False)
+        self.act_include.triggered.connect(self._toggle_include)
+        tb.addAction(self.act_include)
+        self.addAction(self.act_include)
+
+        self.act_blind_next = QAction("💾  Save rating && next ▶", self)
+        self.act_blind_next.setToolTip(
+            "Blinded review: save your include/exclude ratings for this file "
+            "and open the next one (Ctrl+Return).")
+        self.act_blind_next.setShortcut(QKeySequence("Ctrl+Return"))
+        self.act_blind_next.triggered.connect(self._blind_save_next)
+        self.act_blind_next.setVisible(False)
+        tb.addAction(self.act_blind_next)
 
         tb.addSeparator()
 
@@ -1731,6 +2203,14 @@ class InspectorWindow(QMainWindow):
         self.act_show_rois.triggered.connect(
             lambda checked: self.cell_view.set_show_all(checked))
         tb.addAction(self.act_show_rois)
+
+        self.act_hide_excl = QAction("⊘  Hide excluded", self)
+        self.act_hide_excl.setToolTip(
+            "Hide excluded (not included) components from the all-ROIs layer.")
+        self.act_hide_excl.setCheckable(True)
+        self.act_hide_excl.triggered.connect(
+            lambda checked: self.cell_view.set_hide_excluded(checked))
+        tb.addAction(self.act_hide_excl)
 
         tb.addSeparator()
         tb.addWidget(QLabel("  BG: "))
@@ -1781,7 +2261,9 @@ class InspectorWindow(QMainWindow):
         self.cell_view  = CellViewer(s)
         self.dist_view  = DistMatrix(s)
         self.trace_view = TraceViewer(s)
+        self.event_view = EventViewer(s)
         self.corr_view  = CorrMatrix(s)
+        self.event_view.setXLink(self.trace_view)
 
         # Top row: cell viewer (left) | distance matrix (right)
         top = QSplitter(Qt.Orientation.Horizontal)
@@ -1790,8 +2272,12 @@ class InspectorWindow(QMainWindow):
         top.setSizes([1, 1])
 
         # Bottom row: trace (left) | corr (right)
+        traces = QSplitter(Qt.Orientation.Vertical)
+        traces.addWidget(self.trace_view)
+        traces.addWidget(self.event_view)
+        traces.setSizes([3, 2])
         bot = QSplitter(Qt.Orientation.Horizontal)
-        bot.addWidget(self.trace_view)
+        bot.addWidget(traces)
         bot.addWidget(self.corr_view)
         bot.setSizes([1, 1])
 
@@ -1836,11 +2322,14 @@ class InspectorWindow(QMainWindow):
             sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
             self.cell_view.set_selection(sel)
             self.trace_view.set_selection(sel)
+            self.event_view.set_selection(sel)
             self.table.tint_selection(sel)
             n = len(sel)
-            self.act_merge.setEnabled(n >= 2)
-            self.act_delete.setEnabled(n >= 1)
+            edit = self._blind is None     # blinded review: rate only
+            self.act_merge.setEnabled(edit and n >= 2)
+            self.act_delete.setEnabled(edit and n >= 1)
             self.act_toggle_vis.setEnabled(n >= 1)
+            self.act_include.setEnabled(n >= 1)
             self._sel_lbl.setText(f"  {n} selected  |  {self.store.n} total")
             # Update matrix highlights from table selection:
             # exactly 2 selected → highlight that pair; anything else → clear.
@@ -2000,7 +2489,16 @@ class InspectorWindow(QMainWindow):
 
     # ── File I/O ──────────────────────────────────────────────────────────────
 
+    def _blind_block(self) -> bool:
+        if self._blind is not None:
+            self.statusBar().showMessage(
+                "Blinded review in progress — Analysis ▸ End blinded review first")
+            return True
+        return False
+
     def _open_file(self):
+        if self._blind_block():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open CaImAn results", "",
             "Results or stack (*.hdf5 *.h5 *.tif *.tiff);;"
@@ -2017,6 +2515,8 @@ class InspectorWindow(QMainWindow):
             import traceback; traceback.print_exc()
 
     def _save_file(self):
+        if self._blind_block():
+            return
         if self.store.fpath:
             path = ComponentStore.curated_path(self.store.fpath)
             self._do_save(path)
@@ -2024,6 +2524,8 @@ class InspectorWindow(QMainWindow):
             self._save_as_file()
 
     def _save_as_file(self):
+        if self._blind_block():
+            return
         # Pre-fill the dialog with the _curated path from the source file
         default = (ComponentStore.curated_path(self.store.fpath)
                    if self.store.fpath else "")
@@ -2126,12 +2628,325 @@ class InspectorWindow(QMainWindow):
     def _swap_store(self, new_store: ComponentStore):
         self.store = new_store
         for w in (self.table, self.cell_view,
-                  self.trace_view, self.corr_view,
+                  self.trace_view, self.event_view, self.corr_view,
                   self.dist_view):
             w.store = new_store
         self._refresh_bg_combo()
         self._refresh_trace_combo()
         self.cell_view.refresh_background()
+        self._full_refresh()
+
+
+    # ── Events / approval ─────────────────────────────────────────────────────
+
+    def _selected_rows(self) -> list:
+        return sorted({idx.row() for idx in self.table.selectedIndexes()})
+
+    def _reselect(self, rows):
+        rows = [r for r in rows if 0 <= r < self.store.n]
+        if not rows:
+            return
+        sm, flags = self.table.selectionModel(), (
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows)
+        self.table.blockSignals(True)
+        for r in rows:
+            sm.select(self.table.model().index(r, 0), flags)
+        self.table.blockSignals(False)
+        self._on_table_sel()
+
+    def _toggle_include(self):
+        s, sel = self.store, self._selected_rows()
+        if not sel:
+            return
+        if s.events is None:
+            self.statusBar().showMessage(
+                "Include flags belong to the event results — "
+                "run Analysis ▸ Detect events first")
+            return
+        s.toggle_approved(sel)
+        self.table.mark_hidden()
+        self.cell_view.refresh_rois()
+        self.event_view.refresh()
+        self.statusBar().showMessage(f"{s.n_approved}/{s.n} included")
+
+    def run_detection(self, fr, decay_time, progress=None, **kw):
+        """Detect events on the current store and refresh, keeping the
+        selection.  Raises on failure (callers report it)."""
+        sel = self._selected_rows()
+        self.store.detect_events(fr, decay_time, progress=progress, **kw)
+        self._full_refresh()
+        self._reselect(sel)
+        ev = self.store.events
+        self.statusBar().showMessage(
+            f"Events: {sum(len(p) for p in ev.peaks)} in {ev.n} components; "
+            f"{int(ev.auto_approved.sum())} auto-approved / included")
+
+    def _detect_events_dialog(self):
+        s = self.store
+        if not s.can_detect:
+            QMessageBox.warning(
+                self, "Detect events",
+                "This file has no ΔF/F traces (estimates.F_dff).\n"
+                "Run cnm.estimates.detrend_df_f() in the pipeline first.")
+            return
+        if s.events is not None and QMessageBox.question(
+                self, "Detect events",
+                "Existing events and include flags will be replaced.\n"
+                "Continue?") != QMessageBox.StandardButton.Yes:
+            return
+        ev, prm = s.events, (s.events.params if s.events else {})
+        dlg  = QDialog(self)
+        dlg.setWindowTitle("Detect events")
+        form = QFormLayout(dlg)
+
+        def spin(val, lo, hi, step, dec, suffix=""):
+            w = QDoubleSpinBox(dlg)
+            w.setRange(lo, hi); w.setDecimals(dec); w.setSingleStep(step)
+            w.setValue(val); w.setSuffix(suffix)
+            return w
+        sp_fr  = spin(s.fr or 30.0, 0.1, 1000.0, 0.1, 2, " Hz")
+        sp_dec = spin(s.decay_time or 0.4, 0.0, 5.0, 0.01, 3, " s")
+        sp_thr = spin(ev.threshold if ev else 0.2, 0.01, 2.0, 0.01, 3)
+        sp_snr = spin(prm.get("min_snr", 3.0), 0.0, 100.0, 0.5, 2)
+        sp_cnn = spin(prm.get("min_cnn", 0.15), 0.0, 1.0, 0.05, 2)
+        sp_lp  = spin(prm.get("lowpass_hz") or 0.0, 0.0, 500.0, 0.5, 2, " Hz")
+        sp_lp.setSpecialValueText("SLab (0.974·Nyquist)")
+        for label, w, tip in (
+                ("Imaging frequency", sp_fr, "Frame rate; sets refractory "
+                 "distance and events/min."),
+                ("Indicator decay time", sp_dec, "Minimum peak spacing = "
+                 "decay time × frame rate."),
+                ("Max threshold (ΔF/F)", sp_thr, "Cap on the noise-derived "
+                 "threshold min(10·noise, this)."),
+                ("Min SNR", sp_snr, "Components below are skipped and "
+                 "excluded."),
+                ("Min CNN", sp_cnn, "Auto-exclude below (ignored when the "
+                 "file has no CNN scores)."),
+                ("Low-pass cutoff", sp_lp, "0 = SLab's normalised cutoff "
+                 "(bit-identical to SLabAnalysisApp).")):
+            w.setToolTip(tip)
+            form.addRow(label, w)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        prog = QProgressDialog("Detecting events…", None, 0, s.n, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+
+        def cb(i, n):
+            prog.setMaximum(n); prog.setValue(i)
+            QApplication.processEvents()
+        try:
+            self.run_detection(sp_fr.value(), sp_dec.value(), progress=cb,
+                               threshold=sp_thr.value(), min_snr=sp_snr.value(),
+                               min_cnn=sp_cnn.value(),
+                               lowpass_hz=sp_lp.value() or None)
+        except Exception as exc:
+            QMessageBox.critical(self, "Detect events", str(exc))
+        finally:
+            prog.close()
+
+    def _export_events(self):
+        s = self.store
+        if s.events is None:
+            self.statusBar().showMessage("No events to export — detect first")
+            return
+        folder = _os_dirname(s.fpath) if s.fpath else os.getcwd()
+        prefix = _session_prefix(s.fpath) if s.fpath else "inspector"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export event stats (PeakStats; ROIStats is written alongside)",
+            os.path.join(folder, f"{prefix}_PeakStats.xlsx"),
+            "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        try:
+            out = export_event_tables(s, path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", str(exc))
+            return
+        self.statusBar().showMessage(
+            "Exported " + ", ".join(os.path.basename(p) for p in out)
+            + f"  ({s.n_approved} included components)")
+
+    def _session_info(self):
+        s, ev = self.store, self.store.events
+        snr = (s.SNR_comp[np.isfinite(s.SNR_comp)]
+               if s.SNR_comp is not None else np.array([]))
+        T   = s.C.shape[1]
+        fr  = ev.fr if ev is not None else s.fr
+        dur = f"{T} frames" + (f" ({T / fr / 60:.1f} min)" if fr else "")
+        name = ("(hidden in blinded review)" if self._blind is not None
+                else (s.fpath or "(demo)"))
+        lines = [
+            f"File:  {name}",
+            f"Components:  {s.n}   (hidden {s.n_hidden})",
+            f"Recording length:  {dur}",
+            "SNR min / mean / max:  " + (
+                f"{snr.min():.2f} / {snr.mean():.2f} / {snr.max():.2f}"
+                if snr.size else "n/a"),
+            f"Imaging frequency:  {fr if fr else 'n/a'}",
+            f"Indicator decay time:  "
+            f"{(ev.decay_time if ev is not None else s.decay_time) or 'n/a'}",
+        ]
+        if ev is not None:
+            lines += [
+                f"Auto-approved:  {int(ev.auto_approved.sum())}",
+                f"Included (manual):  {s.n_approved}",
+                f"Events:  {sum(len(p) for p in ev.peaks)}",
+                f"Detection threshold cap:  {ev.threshold}",
+                f"Analysis version:  {ev.version}",
+            ]
+        else:
+            lines.append("Analysis version:  not analysed")
+        QMessageBox.information(self, "Session info", "\n".join(lines))
+
+    def _batch_detect(self):
+        if self._blind_block():
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Folder of results files")
+        if not folder:
+            return
+        ed    = _ed()
+        files = ed.find_results_files(folder)
+        if not files:
+            QMessageBox.information(self, "Batch detect", "No .hdf5/.h5 files found.")
+            return
+        if len(files) <= 10:
+            listing = "\n".join(files)
+        else:
+            from collections import Counter
+            listing = "\n".join(f"{d}: {n} files" for d, n in
+                                 Counter(os.path.dirname(f) for f in files).items())
+        ans = QMessageBox.question(
+            self, "Batch detect events",
+            f"{len(files)} files:\n\n{listing}\n\n"
+            "stroh_results is written into each file (estimates untouched).\n"
+            "Overwrite files that already have results?\n"
+            "Yes = overwrite · No = skip those · Cancel = abort",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.No)
+        if ans == QMessageBox.StandardButton.Cancel:
+            return
+        prog = QProgressDialog("Detecting events…", "Cancel", 0, len(files), self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        log = []
+        for k, f in enumerate(files):
+            if prog.wasCanceled():
+                break
+            prog.setLabelText(f"{os.path.basename(f)}  ({k + 1}/{len(files)})")
+            QApplication.processEvents()
+            try:
+                msg = ed.detect_events_in_hdf5(
+                    f, overwrite=(ans == QMessageBox.StandardButton.Yes))
+            except Exception as exc:
+                msg = f"ERROR {exc}"
+            log.append(f"{os.path.relpath(f, folder)}: {msg}")
+            prog.setValue(k + 1)
+        prog.close()
+        box = QMessageBox(self)
+        box.setWindowTitle("Batch detect events")
+        box.setText(f"Processed {len(log)}/{len(files)} files.")
+        box.setDetailedText("\n".join(log))
+        if self.store.fpath and os.path.abspath(self.store.fpath) in map(os.path.abspath, files):
+            box.setInformativeText("The open file was processed on disk — "
+                                   "reopen it to see its new events.")
+        box.exec()
+
+    # ── Blinded review (SLab Randomization Mode) ──────────────────────────────
+
+    def start_blinded(self, rater: str, files: list):
+        """Begin a blinded review of ``files`` (already filtered/shuffled)."""
+        self._blind = dict(rater=rater, files=list(files), i=0)
+        self.act_blind_next.setVisible(True)
+        self.act_blind_end.setEnabled(True)
+        self.act_blind.setEnabled(False)
+        self._blind_open(0)
+
+    def _start_blinded(self):
+        import random
+        import re as _re
+        rater, ok = QInputDialog.getText(self, "Blinded review", "Rater name:")
+        rater = _re.sub(r"[^A-Z0-9_-]", "", (rater or "").strip().upper())
+        if not ok or not rater:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Folder to review")
+        if not folder:
+            return
+        unrated, rated, skipped = blind_plan(_ed().find_results_files(folder), rater)
+        files = list(unrated)
+        if rated and QMessageBox.question(
+                self, "Blinded review",
+                f"{len(rated)} file(s) were already rated by {rater}.\n"
+                "Rate them again as well?") == QMessageBox.StandardButton.Yes:
+            files += rated
+        if not files:
+            QMessageBox.information(
+                self, "Blinded review",
+                "Nothing to review." + (
+                    f"\n{len(skipped)} file(s) have no events yet — run "
+                    "Analysis ▸ Batch detect events first." if skipped else ""))
+            return
+        random.shuffle(files)
+        if skipped:
+            self.statusBar().showMessage(
+                f"{len(skipped)} file(s) without events skipped")
+        self.start_blinded(rater, files)
+
+    def _blind_open(self, i: int):
+        b = self._blind
+        while i < len(b["files"]):
+            try:
+                store = load_from_hdf5(b["files"][i], all_components=True)
+                if store.events is not None:
+                    break
+                err = "events could not be mapped"
+            except Exception as exc:
+                err = str(exc)
+            print(f"[blind] skipping file {i + 1}: {err}", file=sys.stderr)
+            i += 1
+        else:
+            self._finish_blinded()
+            return
+        b["i"] = i
+        self._swap_store(store)
+        self.setWindowTitle(f"Blinded review — file {i + 1} of "
+                            f"{len(b['files'])} — rater {b['rater']}")
+        self.statusBar().showMessage(
+            f"File {i + 1}/{len(b['files'])}: {store.n} components, "
+            f"{store.n_approved} included — I toggles, Ctrl+Return saves")
+
+    def _blind_save_next(self):
+        b = self._blind
+        if b is None:
+            return
+        try:
+            write_blind_rating(b["files"][b["i"]], b["rater"], self.store, b["files"])
+        except Exception as exc:
+            QMessageBox.critical(self, "Save rating", str(exc))
+            return
+        if b["i"] + 1 >= len(b["files"]):
+            self._finish_blinded()
+        else:
+            self._blind_open(b["i"] + 1)
+
+    def _finish_blinded(self):
+        n = len(self._blind["files"]) if self._blind else 0
+        self._end_blinded()
+        QMessageBox.information(self, "Blinded review",
+                                f"Finished — {n} file(s) in this session.")
+
+    def _end_blinded(self):
+        self._blind = None
+        self.act_blind_next.setVisible(False)
+        self.act_blind_end.setEnabled(False)
+        self.act_blind.setEnabled(True)
+        self.setWindowTitle("CaImAn Component Inspector")
         self._full_refresh()
 
     # ── Refresh ───────────────────────────────────────────────────────────────
@@ -2144,13 +2959,20 @@ class InspectorWindow(QMainWindow):
         self.cell_view.set_selection([])
         self.cell_view.refresh_rois()
         self.trace_view.set_selection([])
+        self.event_view.set_selection([])
         self.corr_view.refresh()
         self.dist_view.refresh()
         self.act_merge.setEnabled(False)
         self.act_delete.setEnabled(False)
+        self.act_include.setEnabled(False)
+        self.act_export.setEnabled(self.store.events is not None)
         self._sel_lbl.setText(f"  0 selected  |  {self.store.n} total")
         self.statusBar().showMessage(f"{self.store.n} components")
         self._update_history_actions()
+        if self._blind is not None:          # undo/redo/save are edit ops
+            for a in (self.act_undo, self.act_undo_tb,
+                      self.act_redo, self.act_redo_tb):
+                a.setEnabled(False)
 
 
 # ── Dark palette (module-level so it can be called before QMainWindow) ────────
