@@ -11,6 +11,7 @@ Requires
 
 Usage
 -----
+    caiman-inspector /path/to/results.hdf5            # installed command
     python bin/caiman_inspector.py /path/to/results.hdf5
     python bin/caiman_inspector.py /path/to/<session>.tif   # stack + its results
     python bin/caiman_inspector.py                          # synthetic demo
@@ -3033,8 +3034,9 @@ def _make_demo_store() -> ComponentStore:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
+        prog="caiman-inspector",
         description="CaImAn Component Inspector (Qt6 / PyQt6)")
     parser.add_argument("results", nargs="?",
                         help="CaImAn .hdf5 results file, or a raw .tif/.tiff "
@@ -3046,7 +3048,7 @@ def main():
     parser.add_argument("--background", "--bg", dest="background", default=None,
                         help="Image to show behind the footprints "
                              "(.npy/.npz/.tif/.png; a 3-D stack is max-projected)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     app = QApplication.instance() or QApplication(sys.argv)
     _apply_dark_palette()
