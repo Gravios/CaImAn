@@ -9,7 +9,8 @@ pattern as ``caiman-batch-gui``).
 
     caiman-inspector /path/to/<session>_results.hdf5
     caiman-inspector /path/to/<session>.tif        # stack + its results
-    caiman-inspector                               # synthetic demo
+    caiman-inspector                               # session in the current folder
+    caiman-inspector --demo                        # synthetic demo
 """
 from __future__ import annotations
 

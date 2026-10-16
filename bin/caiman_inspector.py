@@ -11,10 +11,13 @@ Requires
 
 Usage
 -----
-    caiman-inspector /path/to/results.hdf5            # installed command
-    python bin/caiman_inspector.py /path/to/results.hdf5
-    python bin/caiman_inspector.py /path/to/<session>.tif   # stack + its results
-    python bin/caiman_inspector.py                          # synthetic demo
+    caiman-inspector                         # session in the current folder:
+                                             #   <dir>_results.hdf5 + <dir>.tif
+    caiman-inspector /path/to/<session>/     # same, for another folder
+    caiman-inspector /path/to/results.hdf5
+    caiman-inspector /path/to/<session>.tif  # stack + its results
+    caiman-inspector --demo                  # synthetic demo
+    (python bin/caiman_inspector.py … works the same)
 
 Controls
 --------
@@ -216,6 +219,7 @@ class ComponentStore:
         # projection, etc).  self.Cn always mirrors the active entry so the
         # rest of the code can keep reading store.Cn unchanged.
         self.backgrounds: dict = {}
+        self.bg_sources:  dict = {}    # background name -> source file path
         self.bg_key = None
         self.add_background("correlation",
                             np.asarray(Cn, dtype=np.float32), make_active=True)
@@ -825,15 +829,61 @@ def load_any(path: str, results: str = None) -> 'ComponentStore':
     stack's streamed mean / max projections are added as backgrounds with
     the mean made active, so the actual cells are visible.
     """
+    if os.path.isdir(path):
+        res_path, tif = discover_session(path, results)
+        return load_any(tif, res_path) if tif else load_from_hdf5(res_path)
     if os.path.splitext(path)[1].lower() not in TIF_EXTS:
         return load_from_hdf5(results or path)
     res_path = results or resolve_results_for_stack(path)
     print(f"Stack {os.path.basename(path)} -> results {res_path}")
     store = load_from_hdf5(res_path)
-    for name, img in _stack_projections(path).items():
-        store.add_background(name, img)
+    # The sibling scan may already have projected this very stack.
+    if store.bg_sources.get("stack mean") != os.path.abspath(path):
+        for name, img in _stack_projections(path).items():
+            store.add_background(name, img)
+            store.bg_sources[name] = os.path.abspath(path)
     store.set_background("stack mean")
     return store
+
+
+RESULTS_SUFFIX = "_results.hdf5"
+
+
+def discover_session(folder: str, results: str = None):
+    """Find a session's results file and raw stack inside ``folder``.
+
+    The session base name is the folder's own name (``<dir>/``), so a
+    session directory laid out as::
+
+        <base>/<base>_results.hdf5
+        <base>/<base>.tif
+
+    is found from inside it.  Results: ``<base>_results.hdf5``, else the one
+    ``*_results.hdf5`` in the folder (``*_results_curated.hdf5`` copies don't
+    match the pattern).  Stack: ``<base>.tif`` / ``<base>.tiff``, or None.
+    ``results`` overrides the results lookup.  Returns ``(results, tif)``.
+    """
+    import glob
+    folder = os.path.abspath(folder)
+    base   = os.path.basename(folder)
+    tif = next((os.path.join(folder, base + e) for e in TIF_EXTS
+                if os.path.isfile(os.path.join(folder, base + e))), None)
+    if results:
+        return results, tif
+    exact = os.path.join(folder, base + RESULTS_SUFFIX)
+    if os.path.isfile(exact):
+        return exact, tif
+    cands = sorted(glob.glob(os.path.join(glob.escape(folder), "*" + RESULTS_SUFFIX)))
+    if len(cands) == 1:
+        return cands[0], tif
+    if cands:
+        raise FileNotFoundError(
+            f"{len(cands)} *{RESULTS_SUFFIX} files in {folder} and none is "
+            f"{base}{RESULTS_SUFFIX}: "
+            + ", ".join(os.path.basename(c) for c in cands)
+            + " — pass one explicitly.")
+    raise FileNotFoundError(
+        f"no {base}{RESULTS_SUFFIX} (or any *{RESULTS_SUFFIX}) in {folder}")
 
 
 # ── Correlation helper ───────────────────────────────────────────────────────
@@ -1054,6 +1104,7 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
                     continue
                 for pname, img in _stack_projections(f).items():
                     store.add_background(pname, img)
+                    store.bg_sources[pname] = os.path.abspath(f)
                     found.append((pname, "mean" if "mean" in pname else "max"))
                 continue
             img = _load_image_file(f)
@@ -3039,12 +3090,16 @@ def main(argv=None):
         prog="caiman-inspector",
         description="CaImAn Component Inspector (Qt6 / PyQt6)")
     parser.add_argument("results", nargs="?",
-                        help="CaImAn .hdf5 results file, or a raw .tif/.tiff "
-                             "stack (its <stem>_results.hdf5 is found and the "
-                             "stack's mean/max projections become backgrounds)")
+                        help="CaImAn .hdf5 results file, a raw .tif/.tiff stack "
+                             "(its <stem>_results.hdf5 is found), or a session "
+                             "folder.  Default: the current directory — opens "
+                             "<dir>_results.hdf5 and <dir>.tif, where <dir> is "
+                             "the folder's name")
     parser.add_argument("--results", dest="results_override", default=None,
-                        help="Results file to use when the positional "
-                             "argument is a .tif stack")
+                        help="Results file to use with a .tif stack or "
+                             "session folder")
+    parser.add_argument("--demo", action="store_true",
+                        help="Open synthetic demo data")
     parser.add_argument("--background", "--bg", dest="background", default=None,
                         help="Image to show behind the footprints "
                              "(.npy/.npz/.tif/.png; a 3-D stack is max-projected)")
@@ -3053,15 +3108,19 @@ def main(argv=None):
     app = QApplication.instance() or QApplication(sys.argv)
     _apply_dark_palette()
 
-    if args.results:
+    if args.demo:
+        store = _make_demo_store()
+    else:
+        target = args.results or os.getcwd()
         try:
-            store = load_any(args.results, args.results_override)
+            store = load_any(target, args.results_override)
             print(f"Loaded {store.n} components from {store.fpath}")
         except Exception as exc:
-            print(f"Error loading '{args.results}': {exc}", file=sys.stderr)
+            print(f"Error loading '{target}': {exc}", file=sys.stderr)
+            if not args.results:
+                print("Run inside a session folder, pass a results file / "
+                      "stack / folder, or use --demo.", file=sys.stderr)
             sys.exit(1)
-    else:
-        store = _make_demo_store()
 
     if args.background:
         try:
