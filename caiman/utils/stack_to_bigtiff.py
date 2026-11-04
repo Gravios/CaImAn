@@ -142,12 +142,16 @@ def parse_args():
         help="Overwrite output file if it already exists"
     )
     parser.add_argument(
-        "--keep-sources", action="store_true",
+        "--delete-sources", action="store_true",
         help=(
-            "Do not delete the source frame TIFFs after a successful write. "
-            "By default the source frames are removed once the output file "
-            "has been verified on disk."
+            "Delete the source frame TIFFs once the output has been written. "
+            "Off by default: source frames are kept unless this flag is given "
+            "(same convention as stack-sessions)."
         )
+    )
+    parser.add_argument(
+        "--keep-sources", action="store_true",
+        help="Accepted for backward compatibility; keeping sources is now the default."
     )
     parser.add_argument(
         "--flat-output", action="store_true",
@@ -197,9 +201,28 @@ def parse_args():
 # Helpers
 # ---------------------------------------------------------------------------
 
+_TIME_RE = re.compile(r'_t(\d+)(?=[._])', re.IGNORECASE)
+
+
+def frame_sort_key(path: Path):
+    """Order frames by their numeric ``_t<N>`` index, not by text.
+
+    Text order breaks whenever index widths differ: Olympus FluoView writes
+    ``_t9999`` then ``_t10000``, and an interrupted zero-padding pass leaves
+    ``_t000000`` next to ``_t0001``.  Files without a time token sort after,
+    by name.
+    """
+    m = None
+    for m in _TIME_RE.finditer(path.name):
+        pass
+    if m is None:
+        return (1, path.name, 0, "")
+    return (0, path.name[:m.start()], int(m.group(1)), path.name[m.end():])
+
+
 def collect_frames(input_dir: Path, pattern: str, start, end) -> list[Path]:
-    """Sort and slice the list of TIFF paths in input_dir."""
-    frames = sorted(input_dir.glob(pattern))
+    """Sort (by numeric time index) and slice the list of TIFF paths in input_dir."""
+    frames = sorted(input_dir.glob(pattern), key=frame_sort_key)
     if not frames:
         logger.error(f"No files matching '{pattern}' found in {input_dir}")
         sys.exit(1)
@@ -240,8 +263,8 @@ def collect_channel_frames(input_dir: Path, pattern: str, channel_id: str,
     """
     ch_re = re.compile(rf'_C{re.escape(channel_id)}_t\d+', re.IGNORECASE)
     frames = sorted(
-        fpath for fpath in input_dir.glob(pattern)
-        if ch_re.search(fpath.name)
+        (fpath for fpath in input_dir.glob(pattern) if ch_re.search(fpath.name)),
+        key=frame_sort_key,
     )
     if not frames:
         logger.error(
@@ -749,7 +772,7 @@ def main():
             print(f"  Compression   : {args.compression}  level {args.compression_level}")
             yaml_path = output_path.parent / f"{output_path.stem}.yaml"
             print(f"  YAML sidecar  : {yaml_path}")
-            if not args.keep_sources:
+            if args.delete_sources:
                 total = sum(len(v) for v in ch_frames.values())
                 print(f"  Delete src    : {total} source frame(s) will be deleted after write")
             print("--- nothing written ---\n")
@@ -785,7 +808,7 @@ def main():
         )
 
         # ── Delete sources ────────────────────────────────────────────────────
-        if not args.keep_sources:
+        if args.delete_sources:
             all_frames = [f for frames in ch_frames.values() for f in frames]
             # Verify all outputs are intact before deleting anything
             for cid, op in ch_outputs.items():
@@ -797,7 +820,7 @@ def main():
                     sys.exit(1)
             _delete_sources(all_frames)
         else:
-            logger.info("Source frames preserved (--keep-sources).")
+            logger.info("Source frames preserved (pass --delete-sources to remove them).")
 
     else:
         # ── Single-channel mode (original behaviour) ─────────────────────────
@@ -840,17 +863,17 @@ def main():
             print(f"  Est. size   : {estimate_output_size(len(frames), frame_shape, dtype)} (uncompressed)")
             if use_preallocate:
                 print(f"  Flush every : {args.flush_every} frames")
-            if not args.keep_sources:
+            if args.delete_sources:
                 print(f"  Delete src  : {len(frames)} source frame(s) will be deleted after write")
             else:
-                print(f"  Delete src  : --keep-sources set, source frames preserved")
+                print(f"  Delete src  : no (pass --delete-sources to remove them)")
             print("--- nothing written ---\n")
             return
 
         _write_single_channel(args, frames, output_path)
 
         # ── Delete source frames ──────────────────────────────────────────────
-        if not args.keep_sources:
+        if args.delete_sources:
             if not output_path.exists() or output_path.stat().st_size == 0:
                 logger.error(
                     "Output file missing or empty after write — "
@@ -859,7 +882,7 @@ def main():
                 sys.exit(1)
             _delete_sources(frames)
         else:
-            logger.info("Source frames preserved (--keep-sources).")
+            logger.info("Source frames preserved (pass --delete-sources to remove them).")
 
 
 def _delete_sources(frames: list) -> None:

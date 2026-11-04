@@ -738,6 +738,7 @@ class StackTab(QWidget):
         self.dry = QCheckBox("Dry run (preview only)")
         self.dry.setChecked(True)
         self.delete = QCheckBox("Delete source frames after each successful stack")
+        self.incomplete = QCheckBox("Allow incomplete (fewer frames than SizeT, contiguous from 0)")
 
         self.b_run = QPushButton("Run stack-sessions")
         self.b_stop = QPushButton("Stop")
@@ -751,7 +752,7 @@ class StackTab(QWidget):
         self.log.setMaximumBlockCount(20000)
 
         opts = QVBoxLayout()
-        for w in (self.r_sel, self.r_all, self.dry, self.delete):
+        for w in (self.r_sel, self.r_all, self.dry, self.delete, self.incomplete):
             opts.addWidget(w)
         row = QHBoxLayout()
         row.addWidget(self.b_run)
@@ -791,6 +792,8 @@ class StackTab(QWidget):
             args.append("--dry-run")
         if self.delete.isChecked():
             args.append("--delete-sources")
+        if self.incomplete.isChecked():
+            args.append("--allow-incomplete")
         return args
 
     def run(self) -> None:

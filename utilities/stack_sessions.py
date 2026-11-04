@@ -9,16 +9,23 @@ For each session this script:
   1. Finds the master OME-TIFF and reads frame count / sample rate from
      its OME-XML header.
   2. Discovers channels from *_CNN_t0*.ome.tif sentinel files.
-  3. Zero-pads time indices to 6 digits so alphabetic sort equals
-     temporal order (fixes Olympus FluoView mixed-width indices).
-  4. Creates or updates the session Trial YAML, populating every field
+  3. Creates or updates the session Trial YAML, populating every field
      it can infer from the directory name, frame filename, and OME header.
-  5. Stacks each channel into a single preallocated BigTIFF.  The stack is
+  4. Validates each channel's frame set: time indices unique and
+     contiguous from 0, count equal to the OME SizeT.  A gap or duplicate
+     would shift every later frame in time, so the channel is refused.
+  5. Zero-pads time indices to 6 digits (for tools that sort by text;
+     stacking itself orders frames numerically).
+  6. Stacks each channel into a single preallocated BigTIFF.  The stack is
      written as ``*.partial.tif`` and renamed only once complete, so an
      interrupted run is redone, not skipped, on the next invocation.
 
 A failure in one channel or session is reported and the batch continues;
-the exit status is 1 if anything failed.
+the exit status is 1 if anything failed.  --dry-run writes nothing.
+
+Single session / trial
+----------------------
+  stack-sessions --session strohA-ia-000000-20150709-TL001_134044-25x-spont
 
 Quick start
 -----------
@@ -35,8 +42,12 @@ Flags
                         Combined with --prefix, both must match.
   --parent DIR          Parent directory containing session subdirs.
                         Default: current working directory.
-  --delete-sources      Delete source frame TIFFs after each successful
-                        stack write. Off by default.
+  --delete-sources      Delete source frame TIFFs after the session's
+                        channels are stacked. Off by default. The OME master
+                        frame is kept while any channel is still unstacked.
+  --allow-incomplete    Accept fewer frames than SizeT when indices are
+                        contiguous from 0 (aborted acquisition). Gaps are
+                        always refused.
   --dry-run             Preview what would be done — no files written.
   -h / --help           Show this help message.
 
@@ -64,7 +75,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 try:
     from caiman.utils.ome_meta import extract_pixels, format_rate_str, update_yaml
-    from caiman.utils.stack_to_bigtiff import stack_frames
+    from caiman.utils.stack_to_bigtiff import frame_sort_key, stack_frames
 except ImportError as _exc:
     sys.exit(
         f"ImportError: {_exc}\n"
@@ -88,19 +99,23 @@ logger = logging.getLogger(__name__)
 # Regexes
 # ---------------------------------------------------------------------------
 
-# Session directory name pattern:
+# Session directory name pattern (same schema as utilities/rename_stem.py):
 #   strohA-ia-000000-20150709-TL001_134044-25x-spont
-#   {prefix}-{subject_id}-{date8}-TL{trial}_{time6}-{mag}x-{condition}
+#   strohA-ia-STO0647-20150113-TL001_122919-25x-spont
+#   {prefix}-{subject_id}-{date8}-{trial}_{time6}-{mag}-{condition}
+# Subject ids may be alphanumeric; trial and magnification numbers are taken
+# from the digits in their tokens (TL001 → 1, 25x → 25).
 _SESSION_RE = re.compile(
     r'^(?P<prefix>.+?)'            # strohA-ia
-    r'-(?P<subject_id>\d+)'        # 000000
+    r'-(?P<subject_id>[^-]+)'      # 000000 | STO0647
     r'-(?P<date>\d{8})'            # 20150709
-    r'-TL(?P<trial>\d+)'           # TL001
+    r'-(?P<trial>[^-_]+)'          # TL001
     r'_(?P<time>\d{6})'            # 134044
-    r'-(?P<mag>\d+)x'              # 25x
+    r'-(?P<mag>[^-]+)'             # 25x
     r'-(?P<condition>[^/]+)$',     # spont
     re.IGNORECASE,
 )
+_DIGITS_RE = re.compile(r'\d+')
 
 # Frame filename tokens:  tl1-FA1-LP11-90um-spont25x_C00_t0000.ome.tif
 #   FA{n}   → frame averaging factor
@@ -144,11 +159,9 @@ def _parse_session_name(name: str) -> dict:
     if not m:
         return out
 
-    # subject id
-    try:
-        out["subject_id"] = int(m.group("subject_id"))
-    except ValueError:
-        pass
+    # subject id: numeric ids as int (000082 → 82, as before), others verbatim
+    sid = m.group("subject_id")
+    out["subject_id"] = int(sid) if sid.isdigit() else sid
 
     # datetime
     try:
@@ -159,17 +172,15 @@ def _parse_session_name(name: str) -> dict:
     except ValueError:
         pass
 
-    # trial number → experiment id
-    try:
-        out["experiment_id"] = int(m.group("trial"))
-    except ValueError:
-        pass
+    # trial number → experiment id (last digit run: TL001 → 1)
+    digits = _DIGITS_RE.findall(m.group("trial"))
+    if digits:
+        out["experiment_id"] = int(digits[-1])
 
-    # magnification
-    try:
-        out["magnification"] = int(m.group("mag"))
-    except ValueError:
-        pass
+    # magnification (leading digit run: 25x → 25)
+    mm = _DIGITS_RE.match(m.group("mag"))
+    if mm:
+        out["magnification"] = int(mm.group())
 
     # condition - normalise known keywords
     cond_raw = m.group("condition").lower()
@@ -405,20 +416,73 @@ def _discover_channels(session_dir: Path) -> list[str]:
     return sorted(ids)
 
 
+def _channel_frames(session_dir: Path, channel: str) -> list[Path]:
+    """Raw frames of one channel in numeric time order (width-independent)."""
+    return sorted(session_dir.glob(f"*_C{channel}_t*.tif"), key=frame_sort_key)
+
+
+def _check_frames(frames: list[Path], frame_count: int,
+                  allow_incomplete: bool) -> tuple[int | None, str]:
+    """Validate a channel's frame set before stacking.
+
+    The stack's time axis is the frame order, so a missing or duplicated
+    index would silently shift every later frame.  Requires indices to be
+    unique and contiguous from 0.  Fewer frames than the OME SizeT (an
+    aborted acquisition) is accepted only with *allow_incomplete*; more is
+    always an error (the header does not describe this series).
+
+    Returns ``(n_frames, "")`` on success or ``(None, reason)``.
+    """
+    idx: dict[int, list[str]] = {}
+    for f in frames:
+        m = _TINDEX_RE.search(f.name)
+        if m is None:
+            return None, f"no _t<index> in {f.name}"
+        idx.setdefault(int(m.group(2)), []).append(f.name)
+    dups = {i: names for i, names in idx.items() if len(names) > 1}
+    if dups:
+        i, names = next(iter(sorted(dups.items())))
+        return None, (f"{len(dups)} duplicated time index(es), e.g. t={i}: "
+                      + ", ".join(names))
+    n = len(idx)
+    missing = sorted(set(range(max(idx) + 1)) - set(idx)) if idx else []
+    if missing:
+        shown = ", ".join(map(str, missing[:10])) + (" ..." if len(missing) > 10 else "")
+        return None, f"{len(missing)} missing frame index(es): {shown}"
+    if frame_count and n > frame_count:
+        return None, f"{n} frames on disk but OME SizeT is {frame_count}"
+    if frame_count and n < frame_count and not allow_incomplete:
+        return None, (f"{n} of {frame_count} frames (indices 0-{n - 1}); "
+                      "pass --allow-incomplete to stack the recorded frames")
+    return n, ""
+
+
 def _pad_time_indices(session_dir: Path, channel: str, width: int) -> int:
-    renamed = 0
+    """Zero-pad ``_t<N>`` to *width* digits so text order equals time order
+    for downstream tools.  Never overwrites: an existing target name means
+    the same index exists twice, which :func:`_check_frames` rejects first.
+    """
+    plan = []
     for f in session_dir.glob(f"*_C{channel}_t*.tif"):
         m = _TINDEX_RE.search(f.name)
         if m and len(m.group(2)) < width:
-            new_name = (
-                f.name[: m.start(1)]
-                + m.group(1)
-                + m.group(2).zfill(width)
-                + m.group(3)
-            )
-            f.rename(f.parent / new_name)
-            renamed += 1
-    return renamed
+            new = f.parent / (f.name[: m.start(1)] + m.group(1)
+                              + m.group(2).zfill(width) + m.group(3))
+            if new.exists():
+                raise FileExistsError(f"refusing to overwrite {new.name} with {f.name}")
+            plan.append((f, new))
+    for f, new in plan:
+        f.rename(new)
+    return len(plan)
+
+
+def _stacked_output(session_dir: Path, session_name: str, channel: str) -> Path | None:
+    """Existing finished stack for *channel*, whatever frame count its name carries."""
+    for d in sorted(session_dir.glob(f"{session_name}-C{channel}-fc*")):
+        out = d / f"{d.name}.tif"
+        if d.is_dir() and out.exists():
+            return out
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +516,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--dry-run", action="store_true",
         help="Preview what would be done without writing any files.",
+    )
+    p.add_argument(
+        "--allow-incomplete", action="store_true",
+        help="Stack a channel that has fewer frames than the OME SizeT, as long as "
+             "its indices are contiguous from 0 (e.g. an aborted acquisition). "
+             "The stem then carries the recorded count. Gaps are always refused.",
     )
     return p.parse_args(argv)
 
@@ -539,11 +609,14 @@ def main(argv: list[str] | None = None) -> int:
         # ── Build and write Trial YAML (before stacking) ─────────────────────
         yaml_path = session_dir / f"{session_name}.yaml"
         if yaml_path.exists():
-            print(f"    yaml: {yaml_path.name} already exists - updating OME fields only")
-            try:
-                update_yaml(yaml_path, px)
-            except (Exception, SystemExit) as exc:
-                print(f"    yaml: WARNING update failed: {exc}")
+            if args.dry_run:
+                print(f"    yaml: {yaml_path.name} exists - would update OME fields only")
+            else:
+                print(f"    yaml: {yaml_path.name} already exists - updating OME fields only")
+                try:
+                    update_yaml(yaml_path, px)
+                except (Exception, SystemExit) as exc:
+                    print(f"    yaml: WARNING update failed: {exc}")
         else:
             if not args.dry_run:
                 try:
@@ -578,37 +651,57 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"           dirname -> {dn}")
                 print(f"           frame   -> {fn}")
 
+        to_delete: list[Path] = []
         for ch in channel_ids:
-            stem       = f"{session_name}-C{ch}-fc{fc_str}"
-            ch_dir     = session_dir / stem
-            output     = ch_dir / f"{stem}.tif"
-
             # Writes are atomic (*.partial.tif → rename), so an existing
             # output is a complete stack.
-            if output.exists():
-                print(f"    C{ch}: already exists, skipping")
+            existing = _stacked_output(session_dir, session_name, ch)
+            if existing is not None:
+                print(f"    C{ch}: already exists ({existing.parent.name}/), skipping")
+                left = _channel_frames(session_dir, ch)
+                if left and args.delete_sources:
+                    print(f"    C{ch}: {len(left)} raw frame(s) remain beside the existing "
+                          "stack (e.g. a kept OME master); not deleted by this run")
                 continue
 
-            frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
-            print(f"    C{ch}: {len(frames)} frames -> {stem}/")
-
+            frames = _channel_frames(session_dir, ch)
             if not frames:
                 print(f"    C{ch}: ERROR - no *_C{ch}_t*.tif frames, skipping")
                 failed.append(f"{session_name} C{ch}")
                 continue
 
+            n_frames, why = _check_frames(frames, frame_count, args.allow_incomplete)
+            if n_frames is None:
+                print(f"    C{ch}: ERROR - {why}; not stacked, sources preserved")
+                failed.append(f"{session_name} C{ch}")
+                continue
+            if n_frames != frame_count:
+                print(f"    C{ch}: WARNING - {n_frames} of {frame_count} frames "
+                      "(--allow-incomplete); stem carries the recorded count")
+
+            stem   = f"{session_name}-C{ch}-fc{n_frames:06d}"
+            output = session_dir / stem / f"{stem}.tif"
+            print(f"    C{ch}: {n_frames} frames -> {stem}/")
+
             if args.dry_run:
                 continue
 
             # ── Pad time indices ─────────────────────────────────────────────
-            sample_t  = _TINDEX_RE.search(frames[0].name)
-            cur_width = len(sample_t.group(2)) if sample_t else 4
-            needed    = max(6, len(str(max(frame_count - 1, 0))))
-            if cur_width < needed:
+            # Stacking orders frames numerically, so padding is not needed for
+            # correctness; it keeps text order right for other tools.  Every
+            # file is checked (not just the first), so a run interrupted
+            # mid-rename is completed.
+            needed = max(6, len(str(max(n_frames - 1, 0))))
+            if any(len(_TINDEX_RE.search(f.name).group(2)) < needed for f in frames):
                 print(f"    C{ch}: padding time indices -> {needed} digits...")
-                n = _pad_time_indices(session_dir, ch, needed)
+                try:
+                    n = _pad_time_indices(session_dir, ch, needed)
+                except FileExistsError as exc:
+                    print(f"    C{ch}: ERROR - {exc}; not stacked")
+                    failed.append(f"{session_name} C{ch}")
+                    continue
                 print(f"    C{ch}: padded {n} filename(s)")
-                frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
+                frames = _channel_frames(session_dir, ch)
 
             # ── Create channel subdir and stack ──────────────────────────────
             # stack_to_bigtiff reports bad input via sys.exit; catch it here so
@@ -632,13 +725,29 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if args.delete_sources:
-                print(f"    C{ch}: deleting {len(frames)} source frame(s)...")
-                for f in frames:
-                    try:
-                        f.unlink()
-                    except OSError as exc:
-                        logger.warning(f"      Could not delete {f.name}: {exc}")
-                print(f"    C{ch}: deleted")
+                to_delete.extend(frames)
+
+        # ── Delete sources (deferred to the end of the session) ──────────────
+        # The OME master frame is the session's only record of SizeT and the
+        # sample rate.  Keep it while any channel is still unstacked so a
+        # rerun for that channel can still read the header.
+        if to_delete:
+            keep: set[Path] = set()
+            pending = [ch for ch in channel_ids
+                       if _stacked_output(session_dir, session_name, ch) is None]
+            if pending:
+                cur_master = _find_master(session_dir)
+                if cur_master is not None:
+                    keep.add(cur_master)
+                    print(f"    keeping OME master {cur_master.name} until "
+                          f"{', '.join('C' + c for c in pending)} is stacked")
+            doomed = [f for f in to_delete if f not in keep]
+            print(f"    deleting {len(doomed)} source frame(s)...")
+            for f in doomed:
+                try:
+                    f.unlink()
+                except OSError as exc:
+                    logger.warning(f"      Could not delete {f.name}: {exc}")
 
         print()
 

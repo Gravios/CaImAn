@@ -152,33 +152,39 @@ def update_yaml(yaml_path: Path, px: dict):
 
     s = doc.setdefault("acquisition_system", {}).setdefault("settings", {})
 
-    # sample_rate
-    if px["sample_rate_hz"] is not None:
-        s["sample_rate"] = {
-            "value": round(px["sample_rate_hz"], 4),
-            "units": "Hz",
-        }
+    # Only fields the OME header actually provides are written: a value the
+    # header lacks (None) never overwrites what the YAML already holds, and
+    # existing sub-keys such as "units" are kept.  Field names follow
+    # utilities/pipelines/template_acquisition.yaml.
+    def _merge(key: str, values: dict) -> None:
+        values = {k: v for k, v in values.items() if v is not None}
+        if not values:
+            return
+        cur = s.get(key)
+        s[key] = {**cur, **values} if isinstance(cur, dict) else values
 
-    # frame dimensions
-    s["frame_size"] = {
-        "x": px["size_x"],
-        "y": px["size_y"],
-    }
+    def _set(key: str, value) -> None:
+        if value is not None:
+            s[key] = value
 
-    # pixel size
-    s["pixel_size"] = {
-        "x": px["physical_size_x"],
-        "y": px["physical_size_y"],
-        "units": "um",
-    }
+    rate = px.get("sample_rate_hz")
+    if rate is not None:
+        _merge("sample_rate", {"value": round(rate, 4), "units": "Hz"})
+    _merge("frame_size", {"x": px.get("size_x"), "y": px.get("size_y")})
+    if px.get("physical_size_x") is not None or px.get("physical_size_y") is not None:
+        _merge("pixel_size", {"x": px.get("physical_size_x"), "y": px.get("physical_size_y"),
+                              "units": "um"})
 
-    # channels / planes
-    s["n_channels"] = px["size_c"]
-    s["n_planes"]   = px["size_z"]
-    s["n_frames"]   = px["size_t"]
-    s["pixel_type"] = px["pixel_type"]
+    _set("n_channels",  px.get("size_c"))
+    _set("n_planes",    px.get("size_z"))
+    _set("n_frames",    px.get("size_t"))
+    _set("pixel_dtype", px.get("pixel_type"))
+    if "pixel_dtype" in s:
+        s.pop("pixel_type", None)           # legacy key written by older versions
 
-    yaml_path.write_text(yaml.dump(doc, default_flow_style=False, sort_keys=False))
+    tmp = yaml_path.with_name(yaml_path.name + ".tmp")
+    tmp.write_text(yaml.dump(doc, default_flow_style=False, sort_keys=False))
+    tmp.replace(yaml_path)
     print(f"Updated: {yaml_path}")
 
 
