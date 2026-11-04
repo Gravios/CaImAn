@@ -99,6 +99,7 @@ setup(
         'caiman-batch-gui    = utilities.batch_gui_launcher:main',
         'caiman-inspector    = utilities.inspector_launcher:main',
         'stack-sessions      = utilities.stack_sessions:main',
+        'stack-sessions-gui  = utilities.stack_gui_launcher:main',
         'stack-bigtiff       = caiman.utils.stack_to_bigtiff:main',
         'rename-stem         = utilities.rename_stem:main',
         'tiff-viewer         = utilities.tiff_viewer:main',

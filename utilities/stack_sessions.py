@@ -29,8 +29,10 @@ Quick start
 
 Flags
 -----
-  --prefix PREFIX       Session directory prefix to match (required).
-                        e.g. strohA-ia
+  --prefix PREFIX       Session directory prefix to match, e.g. strohA-ia.
+                        Required unless --session is given.
+  --session NAME        Process only this session directory (repeatable).
+                        Combined with --prefix, both must match.
   --parent DIR          Parent directory containing session subdirs.
                         Default: current working directory.
   --delete-sources      Delete source frame TIFFs after each successful
@@ -430,8 +432,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog='Output per session:\n  <session>-C00-fc<NNNNNN>/<session>-C00-fc<NNNNNN>.tif\n                             BigTIFF stack for channel 00\n  <session>.yaml             Trial YAML (created/updated)\n\nExamples:\n  stack-sessions --prefix strohA-ia\n  stack-sessions --prefix strohA-ia --delete-sources\n  stack-sessions --prefix strohA-ia --dry-run',
     )
     p.add_argument(
-        "--prefix", required=True, metavar="PREFIX",
-        help="Session directory prefix, e.g. strohA-ia",
+        "--prefix", default=None, metavar="PREFIX",
+        help="Session directory prefix, e.g. strohA-ia "
+             "(required unless --session is given)",
+    )
+    p.add_argument(
+        "--session", action="append", default=None, metavar="NAME",
+        help="Process only this session directory name (repeatable)",
     )
     p.add_argument(
         "--parent", default=None, metavar="DIR",
@@ -461,9 +468,23 @@ def main(argv: list[str] | None = None) -> int:
         logger.error(f"--parent is not a directory: {parent_dir}")
         return 1
 
-    session_dirs = sorted(
-        d for d in parent_dir.glob(f"{args.prefix}-*/") if d.is_dir()
-    )
+    if not args.prefix and not args.session:
+        logger.error("one of --prefix or --session is required")
+        return 2
+
+    if args.session:
+        missing = [n for n in args.session if not (parent_dir / n).is_dir()]
+        if missing:
+            logger.error(f"--session not found under {parent_dir}: {', '.join(missing)}")
+            return 1
+        session_dirs = sorted(
+            parent_dir / n for n in dict.fromkeys(args.session)
+            if not args.prefix or n.startswith(f"{args.prefix}-")
+        )
+    else:
+        session_dirs = sorted(
+            d for d in parent_dir.glob(f"{args.prefix}-*/") if d.is_dir()
+        )
     if not session_dirs:
         logger.error(
             f"No session directories found matching: {parent_dir}/{args.prefix}-*/"
@@ -471,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Parent dir  : {parent_dir}")
-    print(f"Prefix      : {args.prefix}")
+    print(f"Prefix      : {args.prefix or '-'}")
     print(f"Sessions    : {len(session_dirs)}")
     print(f"Dry run     : {args.dry_run}")
     print(f"Del sources : {args.delete_sources}")
