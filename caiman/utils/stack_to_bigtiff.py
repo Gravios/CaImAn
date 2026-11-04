@@ -154,8 +154,7 @@ def parse_args():
         help=(
             "Write the output TIF directly to the path given by --output "
             "instead of placing it inside a subdirectory named after its stem. "
-            "Use when the caller (e.g. stack_sessions.sh) manages directory "
-            "layout itself."
+            "Use when the caller manages directory layout itself."
         )
     )
     parser.add_argument(
@@ -594,7 +593,36 @@ def _resolve_output(raw_output: Path) -> Path:
     return raw_output.parent / raw_output.stem / raw_output.name
 
 
+def partial_path(output_path: Path) -> Path:
+    """In-progress name for *output_path*: ``stack.tif`` → ``stack.partial.tif``."""
+    return output_path.with_name(f"{output_path.stem}.partial{output_path.suffix}")
+
+
 def _write_single_channel(
+    args,
+    frames: list[Path],
+    output_path: Path,
+    label: str = "",
+) -> None:
+    """Write one stack atomically.
+
+    Pixels go to :func:`partial_path` first and are renamed onto
+    *output_path* only after the writer returns.  A preallocated file has its
+    full size from the first byte, so without this an interrupted write is
+    indistinguishable from a finished one and would be skipped on rerun.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = partial_path(output_path)
+    tmp.unlink(missing_ok=True)           # stale leftover from a killed run
+    try:
+        _dispatch_write(args, frames, tmp, label)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(output_path)
+
+
+def _dispatch_write(
     args,
     frames: list[Path],
     output_path: Path,
@@ -679,7 +707,7 @@ def main():
 
     # ── Channel detection ────────────────────────────────────────────────────
     # Require ≥ 2 distinct channel IDs to enter multi-channel mode.
-    # When the caller (e.g. stack_sessions.sh) already filters to one channel
+    # When the caller already filters to one channel
     # via --pattern, detect_channel_ids returns a single-element list and we
     # correctly fall through to the faster single-channel path.
     _detected = detect_channel_ids(input_dir, args.pattern)
@@ -871,7 +899,7 @@ def stack_frames(
     """Stack frame TIFFs matching *pattern* in *input_dir* into a single
     BigTIFF at *output_path*.
 
-    Programmatic entry point for use by :mod:`caiman.utils.stack_sessions`
+    Programmatic entry point for use by :mod:`utilities.stack_sessions`
     and other callers that do not go through the CLI.  Write-mode selection
     (in-memory / preallocated / streaming) and all logging are identical to
     the CLI behaviour.

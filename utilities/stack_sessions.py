@@ -11,15 +11,20 @@ For each session this script:
   2. Discovers channels from *_CNN_t0*.ome.tif sentinel files.
   3. Zero-pads time indices to 6 digits so alphabetic sort equals
      temporal order (fixes Olympus FluoView mixed-width indices).
-  4. Stacks each channel into a single preallocated BigTIFF.
-  5. Creates or updates the session Trial YAML, populating every field
+  4. Creates or updates the session Trial YAML, populating every field
      it can infer from the directory name, frame filename, and OME header.
+  5. Stacks each channel into a single preallocated BigTIFF.  The stack is
+     written as ``*.partial.tif`` and renamed only once complete, so an
+     interrupted run is redone, not skipped, on the next invocation.
+
+A failure in one channel or session is reported and the batch continues;
+the exit status is 1 if anything failed.
 
 Quick start
 -----------
   cd /data/source/strohA/.../strohA-ia-000000-20150709
-  stack-sessions --prefix strohA-ia            # dry run
-  stack-sessions --prefix strohA-ia            # live run (sources kept)
+  stack-sessions --prefix strohA-ia --dry-run          # preview
+  stack-sessions --prefix strohA-ia                    # live run (sources kept)
   stack-sessions --prefix strohA-ia --delete-sources   # delete frames after stack
 
 Flags
@@ -35,9 +40,12 @@ Flags
 
 Output layout (per session)
 ---------------------------
-  <session>-C00-fc<N>.tif          BigTIFF stack, channel 00
-  <session>-C01-fc<N>.tif          BigTIFF stack, channel 01  (if present)
-  <session>.yaml                   Trial YAML (created or updated)
+  <session>/
+    <session>.yaml                                          Trial YAML
+    <session>-C00-fc<NNNNNN>/<session>-C00-fc<NNNNNN>.tif   channel 00
+    <session>-C01-fc<NNNNNN>/<session>-C01-fc<NNNNNN>.tif   channel 01 (if present)
+
+This is the layout new-session and batch-sessions discover.
 """
 
 from __future__ import annotations
@@ -419,7 +427,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Output per session:\n  <session>-C00-fc<N>.tif    BigTIFF stack for channel 00\n  <session>.yaml             Trial YAML (created/updated)\n\nExamples:\n  stack-sessions --prefix strohA-ia\n  stack-sessions --prefix strohA-ia --delete-sources\n  stack-sessions --prefix strohA-ia --dry-run',
+        epilog='Output per session:\n  <session>-C00-fc<NNNNNN>/<session>-C00-fc<NNNNNN>.tif\n                             BigTIFF stack for channel 00\n  <session>.yaml             Trial YAML (created/updated)\n\nExamples:\n  stack-sessions --prefix strohA-ia\n  stack-sessions --prefix strohA-ia --delete-sources\n  stack-sessions --prefix strohA-ia --dry-run',
     )
     p.add_argument(
         "--prefix", required=True, metavar="PREFIX",
@@ -469,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Del sources : {args.delete_sources}")
     print()
 
+    failed: list[str] = []
+
     for session_dir in session_dirs:
         session_name = session_dir.name
         print(f"==> {session_name}")
@@ -482,9 +492,21 @@ def main(argv: list[str] | None = None) -> int:
             px = extract_pixels(master)
         except SystemExit:
             print(f"    ome_meta failed on {master.name}, skipping")
+            failed.append(session_name)
+            continue
+
+        channel_ids = _discover_channels(session_dir)
+        if not channel_ids:
+            print("    No channel frame files found, skipping")
             continue
 
         frame_count = px["size_t"] or 0
+        if not frame_count:
+            # No SizeT in the OME header: fall back to the on-disk frame count
+            # of the first channel rather than stamping the stem with fc000000.
+            frame_count = len(list(session_dir.glob(f"*_C{channel_ids[0]}_t*.tif")))
+            print(f"    WARNING: OME header has no SizeT; using {frame_count} "
+                  f"frames found on disk for C{channel_ids[0]}")
         sample_rate = px["sample_rate_hz"]
         rate_str    = format_rate_str(sample_rate) if sample_rate else "?p??"
         fc_str      = f"{frame_count:06d}"
@@ -493,25 +515,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    Frame count : {fc_str}")
         print(f"    Sample rate : {rate_str} Hz")
 
-        channel_ids = _discover_channels(session_dir)
-        if not channel_ids:
-            print("    No channel frame files found, skipping")
-            continue
-
         # ── Build and write Trial YAML (before stacking) ─────────────────────
-        yaml_path   = session_dir / f"{session_name}.yaml"
-        yaml_updated = False
+        yaml_path = session_dir / f"{session_name}.yaml"
         if yaml_path.exists():
             print(f"    yaml: {yaml_path.name} already exists - updating OME fields only")
             try:
                 update_yaml(yaml_path, px)
-                yaml_updated = True
-            except Exception as exc:
+            except (Exception, SystemExit) as exc:
                 print(f"    yaml: WARNING update failed: {exc}")
         else:
             if not args.dry_run:
-                doc = build_yaml(session_name, master, px, len(channel_ids))
-                _write_yaml(yaml_path, doc)
+                try:
+                    doc = build_yaml(session_name, master, px, len(channel_ids))
+                    _write_yaml(yaml_path, doc)
+                except Exception as exc:
+                    print(f"    yaml: WARNING write failed: {exc}")
+                    doc = {}
                 s   = doc.get("acquisition_system", {}).get("settings", {})
                 exp = doc.get("experiment", {})
                 sub = doc.get("subject", {})
@@ -528,9 +547,9 @@ def main(argv: list[str] | None = None) -> int:
                     "n_channels": s.get("n_channels"),
                     "n_frames":   s.get("n_frames"),
                 }.items() if v is not None}
-                fields_str = "  ".join(f"{k}={v}" for k, v in populated.items())
-                print(f"    yaml: wrote {yaml_path.name}  [{fields_str}]")
-                yaml_updated = True
+                if doc:
+                    fields_str = "  ".join(f"{k}={v}" for k, v in populated.items())
+                    print(f"    yaml: wrote {yaml_path.name}  [{fields_str}]")
             else:
                 dn = _parse_session_name(session_name)
                 fn = _parse_frame_name(master.name)
@@ -543,7 +562,8 @@ def main(argv: list[str] | None = None) -> int:
             ch_dir     = session_dir / stem
             output     = ch_dir / f"{stem}.tif"
 
-            # Skip if the channel subdir already contains a stacked TIF
+            # Writes are atomic (*.partial.tif → rename), so an existing
+            # output is a complete stack.
             if output.exists():
                 print(f"    C{ch}: already exists, skipping")
                 continue
@@ -551,11 +571,16 @@ def main(argv: list[str] | None = None) -> int:
             frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
             print(f"    C{ch}: {len(frames)} frames -> {stem}/")
 
+            if not frames:
+                print(f"    C{ch}: ERROR - no *_C{ch}_t*.tif frames, skipping")
+                failed.append(f"{session_name} C{ch}")
+                continue
+
             if args.dry_run:
                 continue
 
             # ── Pad time indices ─────────────────────────────────────────────
-            sample_t  = _TINDEX_RE.search(frames[0].name) if frames else None
+            sample_t  = _TINDEX_RE.search(frames[0].name)
             cur_width = len(sample_t.group(2)) if sample_t else 4
             needed    = max(6, len(str(max(frame_count - 1, 0))))
             if cur_width < needed:
@@ -563,27 +588,26 @@ def main(argv: list[str] | None = None) -> int:
                 n = _pad_time_indices(session_dir, ch, needed)
                 print(f"    C{ch}: padded {n} filename(s)")
                 frames = sorted(session_dir.glob(f"*_C{ch}_t*.tif"))
-                if ch == channel_ids[0]:
-                    new_master = session_dir / re.sub(
-                        r'_t(\d+)((?:\.ome)?\.tif)$',
-                        lambda m: f"_t{m.group(1).zfill(needed)}{m.group(2)}",
-                        master.name,
-                    )
-                    if new_master.exists():
-                        master = new_master
 
             # ── Create channel subdir and stack ──────────────────────────────
-            ch_dir.mkdir(exist_ok=True)
-            stack_frames(
-                input_dir   = session_dir,
-                output_path = output,
-                pattern     = f"*_C{ch}_t*.tif",
-                preallocate = True,
-                compression = "none",
-            )
+            # stack_to_bigtiff reports bad input via sys.exit; catch it here so
+            # one broken channel does not abort the remaining sessions.
+            try:
+                stack_frames(
+                    input_dir   = session_dir,
+                    output_path = output,
+                    pattern     = f"*_C{ch}_t*.tif",
+                    preallocate = True,
+                    compression = "none",
+                )
+            except (Exception, SystemExit) as exc:
+                print(f"    C{ch}: ERROR - stacking failed ({exc!r}), sources preserved")
+                failed.append(f"{session_name} C{ch}")
+                continue
 
-            if not output.exists() or output.stat().st_size == 0:
-                print(f"    C{ch}: ERROR - output missing or empty, sources preserved")
+            if not output.exists():
+                print(f"    C{ch}: ERROR - output missing, sources preserved")
+                failed.append(f"{session_name} C{ch}")
                 continue
 
             if args.delete_sources:
@@ -597,6 +621,11 @@ def main(argv: list[str] | None = None) -> int:
 
         print()
 
+    if failed:
+        print(f"FAILED ({len(failed)}):")
+        for item in failed:
+            print(f"  {item}")
+        return 1
     return 0
 
 
