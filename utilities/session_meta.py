@@ -380,7 +380,7 @@ def _owned(name: str, stem: str) -> bool:
 def plan_rename(session_dir: Path, new_stem: str) -> list[tuple[Path, Path]]:
     """``(old, new)`` pairs renaming *session_dir* and every entry inside it whose
     name starts with the session stem, deepest first.  Raw frame files
-    (``tl1-…_C00_t000000.ome.tif``) do not carry the stem and are untouched.
+    (``tl1-…_C00_t0000000000.ome.tif``) do not carry the stem and are untouched.
     """
     old_stem = session_dir.name
     if new_stem == old_stem:

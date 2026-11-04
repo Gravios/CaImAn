@@ -14,7 +14,7 @@ For each session this script:
   4. Validates each channel's frame set: time indices unique and
      contiguous from 0, count equal to the OME SizeT.  A gap or duplicate
      would shift every later frame in time, so the channel is refused.
-  5. Zero-pads time indices to 6 digits (for tools that sort by text;
+  5. Zero-pads time indices to 10 digits (for tools that sort by text;
      stacking itself orders frames numerically).
   6. Stacks each channel into a single preallocated BigTIFF.  The stack is
      written as ``*.partial.tif`` and renamed only once complete, so an
@@ -137,6 +137,10 @@ _CONDITION_KEYWORDS = {
     "dark":   "dark",
     "default": "default",
 }
+
+# Minimum zero-padded width of the _t<index> token (10 digits ≈ 10^10 frames,
+# ~10 years at 30 Hz); widened automatically if a series ever needs more.
+PAD_WIDTH = 10
 
 # Time-index regex for padding
 _TINDEX_RE = re.compile(r'(_t)(\d+)((?:\.ome)?\.tif)$', re.IGNORECASE)
@@ -691,7 +695,7 @@ def main(argv: list[str] | None = None) -> int:
             # correctness; it keeps text order right for other tools.  Every
             # file is checked (not just the first), so a run interrupted
             # mid-rename is completed.
-            needed = max(6, len(str(max(n_frames - 1, 0))))
+            needed = max(PAD_WIDTH, len(str(max(n_frames - 1, 0))))
             if any(len(_TINDEX_RE.search(f.name).group(2)) < needed for f in frames):
                 print(f"    C{ch}: padding time indices -> {needed} digits...")
                 try:
