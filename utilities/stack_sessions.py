@@ -117,15 +117,22 @@ _SESSION_RE = re.compile(
 )
 _DIGITS_RE = re.compile(r'\d+')
 
-# Frame filename tokens:  tl1-FA1-LP11-90um-spont25x_C00_t0000.ome.tif
+# Frame filename tokens, in any order:
+#   tl1-FA1-LP11-90um-spont25x_C00_t0000.ome.tif
+#   tl1-25xspont-FA1-LP4-87um_C00_t0000.ome.tif
 #   FA{n}   → frame averaging factor
 #   LP{n}   → laser power (integer percent; LP11_5 → 11.5)
 #   {n}um   → imaging depth in µm
 #   {n}x    → magnification (fallback if not in dirname)
-_FA_RE    = re.compile(r'\bFA(\d+)\b',              re.IGNORECASE)
-_LP_RE    = re.compile(r'\bLP(\d+(?:_\d+)?)\b',     re.IGNORECASE)
-_DEPTH_RE = re.compile(r'\b(\d+)um\b',              re.IGNORECASE)
-_MAG_RE   = re.compile(r'\b(\d+)x\b',               re.IGNORECASE)
+# Token boundaries are any non-alphanumeric character.  \b is not used
+# because "_" is a word character: "87um_C00" never matched \b(\d+)um\b.
+# Magnification may touch letters on either side (25xspont, spont25x).
+_A = r'(?<![A-Za-z0-9])'
+_Z = r'(?![A-Za-z0-9])'
+_FA_RE    = re.compile(_A + r'FA(\d+)' + _Z,              re.IGNORECASE)
+_LP_RE    = re.compile(_A + r'LP(\d+(?:_\d+)?)' + _Z,     re.IGNORECASE)
+_DEPTH_RE = re.compile(_A + r'(\d+)um' + _Z,              re.IGNORECASE)
+_MAG_RE   = re.compile(r'(?<![0-9.])(\d+)x(?![0-9])',      re.IGNORECASE)
 
 # Condition keywords found anywhere in session name after the magnification
 _CONDITION_KEYWORDS = {
@@ -687,16 +694,21 @@ def main(argv: list[str] | None = None) -> int:
             output = session_dir / stem / f"{stem}.tif"
             print(f"    C{ch}: {n_frames} frames -> {stem}/")
 
-            if args.dry_run:
-                continue
-
             # ── Pad time indices ─────────────────────────────────────────────
             # Stacking orders frames numerically, so padding is not needed for
             # correctness; it keeps text order right for other tools.  Every
             # file is checked (not just the first), so a run interrupted
             # mid-rename is completed.
             needed = max(PAD_WIDTH, len(str(max(n_frames - 1, 0))))
-            if any(len(_TINDEX_RE.search(f.name).group(2)) < needed for f in frames):
+            n_short = sum(len(_TINDEX_RE.search(f.name).group(2)) < needed for f in frames)
+
+            if args.dry_run:
+                if n_short:
+                    print(f"    C{ch}: would rename {n_short} frame file(s) in place "
+                          f"to pad time indices -> {needed} digits")
+                continue
+
+            if n_short:
                 print(f"    C{ch}: padding time indices -> {needed} digits...")
                 try:
                     n = _pad_time_indices(session_dir, ch, needed)
