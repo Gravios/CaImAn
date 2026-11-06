@@ -49,6 +49,7 @@ Event detection & curation (ported from SLabAnalysisPackage)
 
 import sys
 import os
+import re
 import argparse
 from collections import deque
 import numpy as np
@@ -1919,11 +1920,61 @@ class DistMatrix(_MatrixWidget):
 
 # ── Component table ───────────────────────────────────────────────────────────
 
+_COMP_ROLE = Qt.ItemDataRole.UserRole        # component index of the row
+_SORT_ROLE = Qt.ItemDataRole.UserRole + 1    # typed sort key
+_MISS_ROLE = Qt.ItemDataRole.UserRole + 2    # True for NaN / missing values
+
+
+def _num_key(v) -> tuple:
+    """Numeric sort key; NaN / None compare after every number."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return (1, 0.0)
+    return (1, 0.0) if f != f else (0, f)
+
+
+def _is_missing(key) -> bool:
+    return isinstance(key, tuple) and len(key) == 2 and key[0] == 1 \
+        and isinstance(key[1], float)
+
+
+def _label_key(label: str) -> tuple:
+    """Natural order: C002 < C010 < C002+C010."""
+    return tuple((0, int(t), "") if t.isdigit() else (1, 0, t)
+                 for t in re.split(r"(\d+)", str(label)) if t)
+
+
+class _SortItem(QTableWidgetItem):
+    """Sorts by _SORT_ROLE (numbers numerically) instead of display text.
+    Missing values (NaN) stay at the bottom in both sort directions."""
+
+    def __lt__(self, other):
+        a, b = self.data(_SORT_ROLE), other.data(_SORT_ROLE)
+        if a is None or b is None:
+            return super().__lt__(other)
+        ma, mb = bool(self.data(_MISS_ROLE)), bool(other.data(_MISS_ROLE))
+        if ma != mb:
+            tw = self.tableWidget()
+            desc = tw is not None and tw.horizontalHeader().sortIndicatorOrder() \
+                == Qt.SortOrder.DescendingOrder
+            # Qt reverses the comparison for descending order; pre-flip so
+            # the missing value still lands last.
+            return ma if desc else mb
+        return a < b
+
+
 class ComponentTable(QTableWidget):
     """
     Left panel — one row per component with quality metrics.
     Selected rows are lightly tinted with their palette colour.
     A corr-pair click tints those two rows in orange / magenta.
+
+    Click a column header to sort (again to reverse).  Sorting changes
+    only the view: callers address components by store index through
+    :meth:`selected_comps`, :meth:`select_comps`, :meth:`row_of` and
+    :meth:`comp_of`, never by table row.  The sort order survives
+    refreshes (merge, delete, event detection).
     """
 
     _FIXED    = ("Label", "Max A", "Peak ΔF")
@@ -1947,42 +1998,81 @@ class ComponentTable(QTableWidget):
         f = QFont()
         f.setPointSize(8)
         self.setFont(f)
+        self._row_of: dict[int, int] = {}
+        hdr = self.horizontalHeader()
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)   # start in store order
+        hdr.setToolTip("Click a column to sort; click again to reverse")
+        self.model().layoutChanged.connect(self._reindex)
         self._populate()
+        self.setSortingEnabled(True)
 
     # ── Public ────────────────────────────────────────────────────────────────
 
     def refresh(self):
         self._populate()
 
+    def comp_of(self, row: int) -> int:
+        """Store index of the component shown in table *row*."""
+        it = self.item(row, 0)
+        return int(it.data(_COMP_ROLE)) if it is not None else row
+
+    def row_of(self, comp: int) -> int:
+        """Table row currently showing store component *comp* (-1 if none)."""
+        return self._row_of.get(comp, -1)
+
+    def selected_comps(self) -> list:
+        """Selected components as sorted store indices."""
+        return sorted({self.comp_of(idx.row()) for idx in self.selectedIndexes()})
+
+    def select_comps(self, comps, clear: bool = True, scroll_to=None) -> None:
+        """Select store components *comps* without emitting
+        itemSelectionChanged (callers propagate via _on_table_sel)."""
+        sm    = self.selectionModel()
+        flags = (QItemSelectionModel.SelectionFlag.Select
+                 | QItemSelectionModel.SelectionFlag.Rows)
+        self.blockSignals(True)
+        if clear:
+            sm.clearSelection()
+        for c in comps:
+            r = self.row_of(c)
+            if r >= 0:
+                sm.select(self.model().index(r, 0), flags)
+        self.blockSignals(False)
+        if scroll_to is not None and self.row_of(scroll_to) >= 0:
+            self.scrollToItem(self.item(self.row_of(scroll_to), 0),
+                              QAbstractItemView.ScrollHint.EnsureVisible)
+
     def tint_selection(self, sel: list):
-        """Palette tint on selected rows; dark reset on others.
+        """Palette tint on selected components; dark reset on others.
+        *sel* holds store indices; the palette slot follows their order.
         Note: no blockSignals here — setBackground emits itemChanged,
         which is not connected to any slot, so it is safe to let it fire.
         Blocking table signals here was causing itemSelectionChanged to be
         re-emitted after blockSignals(False) in PyQt6, overwriting _sel.
         """
         dark = QColor(30, 30, 30)
-        for row in range(self.store.n):
-            if row in sel:
-                k  = sel.index(row)
-                hx = PALETTE_HEX[k % len(PALETTE_HEX)].lstrip("#")
+        slot = {c: k for k, c in enumerate(sel)}
+        for comp in range(self.store.n):
+            if comp in slot:
+                hx = PALETTE_HEX[slot[comp] % len(PALETTE_HEX)].lstrip("#")
                 bg = QColor(int(hx[0:2], 16),
                             int(hx[2:4], 16),
                             int(hx[4:6], 16), 55)
             else:
                 bg = dark
-            self._set_row_bg(row, bg)
+            self._set_row_bg(self.row_of(comp), bg)
 
     def tint_pair(self, i: int, j: int):
-        """Orange / magenta tint for a corr-clicked pair.
+        """Orange / magenta tint for a corr-clicked pair (store indices).
         Note: no blockSignals — see tint_selection for rationale.
         """
         dark = QColor(30, 30, 30)
-        for row in range(self.store.n):
-            if   row == i: bg = QColor(255, 140,   0, 80)
-            elif row == j: bg = QColor(255,   0, 255, 80)
-            else:          bg = dark
-            self._set_row_bg(row, bg)
+        for comp in range(self.store.n):
+            if   comp == i: bg = QColor(255, 140,   0, 80)
+            elif comp == j: bg = QColor(255,   0, 255, 80)
+            else:           bg = dark
+            self._set_row_bg(self.row_of(comp), bg)
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -1998,6 +2088,10 @@ class ComponentTable(QTableWidget):
     def _populate(self):
         s    = self.store
         cols = self._col_names()
+        hdr  = self.horizontalHeader()
+        sort_col, sort_ord = hdr.sortIndicatorSection(), hdr.sortIndicatorOrder()
+        sorting = self.isSortingEnabled()
+        self.setSortingEnabled(False)          # rows must land at row == comp
         self.blockSignals(True)
         self.clear()
         self.setColumnCount(len(cols))
@@ -2005,48 +2099,80 @@ class ComponentTable(QTableWidget):
         self.setRowCount(s.n)
         dark = QColor(30, 30, 30)
         for i in range(s.n):
-            vals = [s.labels[i],
-                    f"{s.max_a(i):.3f}",
-                    f"{s.peak_df(i):.1f}"]
+            vals = [(s.labels[i], _label_key(s.labels[i])),
+                    (f"{s.max_a(i):.3f}", _num_key(s.max_a(i))),
+                    (f"{s.peak_df(i):.1f}", _num_key(s.peak_df(i)))]
             for _, attr in self._OPTIONAL:
                 if getattr(s, attr, None) is not None:
-                    vals.append(f"{getattr(s, attr)[i]:.3f}")
+                    v = getattr(s, attr)[i]
+                    vals.append((f"{v:.3f}", _num_key(v)))
             if s.events is not None:
-                vals.append(f"{s.events.frequencies[i]:.2f}")
-                vals.append("✓" if s.approved[i] else "✗")
-            for c, v in enumerate(vals):
-                item = QTableWidgetItem(v)
+                fq = s.events.frequencies[i]
+                vals.append((f"{fq:.2f}", _num_key(fq)))
+                vals.append(("✓" if s.approved[i] else "✗",
+                             (0 if s.approved[i] else 1,)))
+            for c, (text, key) in enumerate(vals):
+                item = _SortItem(text)
+                item.setData(_COMP_ROLE, i)
+                item.setData(_SORT_ROLE, key)
+                item.setData(_MISS_ROLE, _is_missing(key))
                 item.setBackground(QBrush(dark))
                 self.setItem(i, c, item)
         self.blockSignals(False)
+        self._reindex()
+        if sort_col >= self.columnCount():     # e.g. Incl gone after a reload
+            sort_col = -1
+        hdr.setSortIndicator(sort_col, sort_ord)
+        self.setSortingEnabled(sorting)        # re-applies the user's sort
+        self._reindex()
         self.mark_hidden()
+
+    def _reindex(self):
+        """Rebuild component → row after populate or a sort."""
+        self._row_of = {}
+        for r in range(self.rowCount()):
+            it = self.item(r, 0)
+            if it is not None and it.data(_COMP_ROLE) is not None:
+                self._row_of[int(it.data(_COMP_ROLE))] = r
 
     def mark_hidden(self):
         """Dim hidden rows; tint excluded rows red (once events exist) and
-        keep the Incl column in sync with the store."""
+        keep the Incl column (text and sort key) in sync with the store."""
         grey   = QColor(105, 105, 105)
         normal = QColor(220, 220, 220)
         excl   = QColor(255, 110, 110)
         s      = self.store
         has_ev = s.events is not None and self.columnCount() and \
             self.horizontalHeaderItem(self.columnCount() - 1).text() == "Incl"
-        for row in range(s.n):
-            if s.is_hidden(row):
+        # Changing the Incl key while sorted by it would re-sort mid-loop and
+        # invalidate row_of; suspend sorting and re-apply it once at the end.
+        sorting = self.isSortingEnabled()
+        self.setSortingEnabled(False)
+        for comp in range(s.n):
+            row = self.row_of(comp)
+            if row < 0:
+                continue
+            if s.is_hidden(comp):
                 fg = grey
-            elif has_ev and not s.approved[row]:
+            elif has_ev and not s.approved[comp]:
                 fg = excl
             else:
                 fg = normal
             if has_ev:
                 it = self.item(row, self.columnCount() - 1)
                 if it:
-                    it.setText("✓" if s.approved[row] else "✗")
+                    it.setText("✓" if s.approved[comp] else "✗")
+                    it.setData(_SORT_ROLE, (0 if s.approved[comp] else 1,))
             for col in range(self.columnCount()):
                 it = self.item(row, col)
                 if it:
                     it.setForeground(QBrush(fg))
+        self.setSortingEnabled(sorting)
+        self._reindex()
 
     def _set_row_bg(self, row: int, color: QColor):
+        if row < 0:
+            return
         for col in range(self.columnCount()):
             item = self.item(row, col)
             if item:
@@ -2371,7 +2497,7 @@ class InspectorWindow(QMainWindow):
             return
         self._in_table_sel = True
         try:
-            sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
+            sel = self.table.selected_comps()
             self.cell_view.set_selection(sel)
             self.trace_view.set_selection(sel)
             self.event_view.set_selection(sel)
@@ -2412,15 +2538,7 @@ class InspectorWindow(QMainWindow):
 
         # Programmatically select both rows in the Qt selection model so
         # the merge / delete buttons are enabled via _on_table_sel.
-        sm    = self.table.selectionModel()
-        flags = (QItemSelectionModel.SelectionFlag.Select
-                 | QItemSelectionModel.SelectionFlag.Rows)
-        self.table.blockSignals(True)
-        sm.clearSelection()
-        for row in (i, j):
-            if 0 <= row < self.store.n:
-                sm.select(self.table.model().index(row, 0), flags)
-        self.table.blockSignals(False)
+        self.table.select_comps([c for c in (i, j) if 0 <= c < self.store.n])
 
         # Propagate selection → enables toolbar, updates trace viewer,
         # and calls cell_view.set_selection([i, j]) which clears _pair.
@@ -2454,7 +2572,7 @@ class InspectorWindow(QMainWindow):
         the single source of truth), then _on_table_sel is called manually
         to propagate the change to all dependent views.
         """
-        cur = sorted({i.row() for i in self.table.selectedIndexes()})
+        cur = self.table.selected_comps()
         if ctrl:
             if idx in cur:
                 new_sel = [r for r in cur if r != idx]
@@ -2465,20 +2583,9 @@ class InspectorWindow(QMainWindow):
 
         # Apply to table selection model without triggering the signal
         # (we call _on_table_sel manually below)
-        sm = self.table.selectionModel()
-        self.table.blockSignals(True)
-        sm.clearSelection()
-        flags = (QItemSelectionModel.SelectionFlag.Select
-                 | QItemSelectionModel.SelectionFlag.Rows)
-        for row in new_sel:
-            sm.select(self.table.model().index(row, 0), flags)
-        self.table.blockSignals(False)
-
         # Scroll to the last-selected row so it is visible
-        if new_sel:
-            self.table.scrollToItem(
-                self.table.item(new_sel[-1], 0),
-                QAbstractItemView.ScrollHint.EnsureVisible)
+        self.table.select_comps(new_sel,
+                                scroll_to=new_sel[-1] if new_sel else None)
 
         # Propagate to all views
         self._on_table_sel()
@@ -2490,25 +2597,20 @@ class InspectorWindow(QMainWindow):
     # ── Merge / Delete ────────────────────────────────────────────────────────
 
     def _do_merge(self):
-        sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        sel = self.table.selected_comps()
         if len(sel) < 2:
             return
         n_sel   = len(sel)
         new_idx = self.store.merge(sel)
         self._full_refresh()
-        self.table.blockSignals(True)
-        self.table.selectRow(new_idx)
-        self.table.scrollToItem(
-            self.table.item(new_idx, 0),
-            QAbstractItemView.ScrollHint.EnsureVisible)
-        self.table.blockSignals(False)
+        self.table.select_comps([new_idx], scroll_to=new_idx)
         self._on_table_sel()
         self.statusBar().showMessage(
             f"Merged {n_sel} → {self.store.labels[new_idx]}  "
             f"({self.store.n} components)")
 
     def _do_delete(self):
-        sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        sel = self.table.selected_comps()
         if not sel:
             return
         n_del = len(sel)
@@ -2641,7 +2743,7 @@ class InspectorWindow(QMainWindow):
     # ── Visibility ────────────────────────────────────────────────────────────
 
     def _toggle_visibility(self):
-        sel = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        sel = self.table.selected_comps()
         if not sel:
             self.statusBar().showMessage("Select component(s) to hide / show")
             return
@@ -2692,19 +2794,14 @@ class InspectorWindow(QMainWindow):
     # ── Events / approval ─────────────────────────────────────────────────────
 
     def _selected_rows(self) -> list:
-        return sorted({idx.row() for idx in self.table.selectedIndexes()})
+        """Selected components (store indices, not table rows)."""
+        return self.table.selected_comps()
 
     def _reselect(self, rows):
         rows = [r for r in rows if 0 <= r < self.store.n]
         if not rows:
             return
-        sm, flags = self.table.selectionModel(), (
-            QItemSelectionModel.SelectionFlag.Select
-            | QItemSelectionModel.SelectionFlag.Rows)
-        self.table.blockSignals(True)
-        for r in rows:
-            sm.select(self.table.model().index(r, 0), flags)
-        self.table.blockSignals(False)
+        self.table.select_comps(rows, clear=False)
         self._on_table_sel()
 
     def _toggle_include(self):
