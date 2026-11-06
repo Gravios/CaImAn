@@ -17,6 +17,11 @@ Quick start
   new-session --run-mc --estimate-params -y
   new-session --run-mc --estimate-params --run -y
 
+  # From a session or date dir: the one stack below is found recursively
+  # (<stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif); several are listed instead.
+  cd /data/source/.../strohA-ia-000000-20151117
+  new-session --template-json ./template.json --dry-run
+
   # Explicit:
   new-session <session-stem> <dest-path> --run-mc --estimate-params -y
 
@@ -246,6 +251,30 @@ def _check_tif(dest: Path, session: str) -> str | None:
 
 # ── Inference ────────────────────────────────────────────────────────────────
 
+_CH_SUBDIR_RE = re.compile(r'.+-C\d{2}-fc\d+$')
+_RAW_FRAME_RE = re.compile(r'_C\d{2}_t\d+(?:\.ome)?\.tif$', re.IGNORECASE)
+
+
+def _find_stacks(root: Path) -> list[Path]:
+    """Session inputs anywhere below *root*, in the canonical layouts only:
+
+      <stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif   stack-sessions output
+      <dir>/<dir>.msr                             channel subdir or TL_dir MSR
+
+    The file stem must equal its directory name, so raw frames, MC outputs
+    (*_els_*.tif, *.mmap) and unfinished *.partial.tif are never picked.
+    """
+    found = []
+    for suffix in (".tif", ".msr"):
+        for p in root.rglob(f"*{suffix}"):
+            if p.stem != p.parent.name or not p.is_file():
+                continue
+            if suffix == ".tif" and not _CH_SUBDIR_RE.match(p.stem):
+                continue
+            found.append(p)
+    return sorted(found)
+
+
 def _infer_from_cwd() -> tuple[str, Path]:
     """Infer (session, dest) from CWD.
 
@@ -255,18 +284,43 @@ def _infer_from_cwd() -> tuple[str, Path]:
       3. TL_dir containing <TL_dir>.msr (organize_msr.py output, pre-channel
          subdir)                                     → session = TL_dir.name,     dest = cwd
 
+    If CWD holds no input, subdirectories are searched recursively for one
+    of these layouts (see :func:`_find_stacks`); exactly one match is used,
+    several are listed.
+
     For case 3 the MSR branch in main() will create the channel subdir and
     rebind dest/session before any pipeline files are written.
     """
     cwd  = Path.cwd()
-    tifs = sorted(p for p in cwd.glob("*.tif") if p.is_file())
+    # The canonical input is named after its directory; it wins over any
+    # other file here (QC/MC side files).
+    for suffix in (".tif", ".msr"):
+        own = cwd / f"{cwd.name}{suffix}"
+        if own.is_file():
+            return own.stem, cwd
+    # Raw acquisition frames (…_C00_t0000.ome.tif) and unfinished stacks are
+    # never session inputs; a session dir with kept sources holds thousands.
+    tifs = sorted(p for p in cwd.glob("*.tif")
+                  if p.is_file() and not _RAW_FRAME_RE.search(p.name)
+                  and not p.name.endswith(".partial.tif"))
     msrs = sorted(p for p in cwd.glob("*.msr") if p.is_file())
     candidates = tifs + msrs
     if not candidates:
+        found = _find_stacks(cwd)
+        if len(found) == 1:
+            return found[0].stem, found[0].parent
+        if not found:
+            raise SystemExit(
+                f"new_session.py: no .tif or .msr found in or below {cwd}.\n"
+                "  Expected <stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif (run stack-sessions first)\n"
+                "  or <dir>/<dir>.msr, or supply session and dest explicitly."
+            )
+        names = "\n    ".join(str(p.relative_to(cwd)) for p in found[:20])
+        more  = f"\n    ... and {len(found) - 20} more" if len(found) > 20 else ""
         raise SystemExit(
-            f"new_session.py: no .tif or .msr found in {cwd}.\n"
-            "  cd into the channel subdir (or the TL_dir for an MSR session),\n"
-            "  or supply session and dest explicitly."
+            f"new_session.py: {len(found)} input stacks below {cwd}:\n    {names}{more}\n"
+            "  cd into one channel subdir, supply session and dest explicitly,\n"
+            "  or process them all with batch-sessions (date dir) / batch-subject (subject dir)."
         )
     if len(candidates) == 1:
         return candidates[0].stem, cwd
@@ -413,9 +467,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("session", nargs="?", default=None,
-                   help="Session stem. Inferred from CWD if omitted.")
+                   help="Session stem. Inferred from CWD (searched recursively) if omitted.")
     p.add_argument("dest", nargs="?", default=None,
-                   help="Channel subdir path. Inferred from CWD if omitted.")
+                   help="Channel subdir path. Inferred from CWD (searched recursively) if omitted.")
     p.add_argument("--template-json",   metavar="PATH",
                    help="Path to a custom template_pipeline.json. "
                         "Defaults to utilities/pipelines/template_pipeline.json.")
