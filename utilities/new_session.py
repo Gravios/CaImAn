@@ -21,6 +21,7 @@ Quick start
   # (<stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif); several are listed instead.
   cd /data/source/.../strohA-ia-000000-20151117
   new-session --template-json ./template.json --dry-run
+  new-session --prefix strohA-ia-000000-20151117-TL002 --template-json ./template.json -y
 
   # Explicit:
   new-session <session-stem> <dest-path> --run-mc --estimate-params -y
@@ -29,6 +30,8 @@ Positional arguments
 --------------------
   session               Session identifier (TIF stem). Inferred from CWD if omitted.
   dest                  Path to the channel subdir. Inferred from CWD if omitted.
+  --prefix PREFIX       Only infer from stacks whose stem starts with PREFIX
+                        (searched recursively below CWD).
 
 Session / data flags
 ---------------------
@@ -255,7 +258,7 @@ _CH_SUBDIR_RE = re.compile(r'.+-C\d{2}-fc\d+$')
 _RAW_FRAME_RE = re.compile(r'_C\d{2}_t\d+(?:\.ome)?\.tif$', re.IGNORECASE)
 
 
-def _find_stacks(root: Path) -> list[Path]:
+def _find_stacks(root: Path, prefix: str | None = None) -> list[Path]:
     """Session inputs anywhere below *root*, in the canonical layouts only:
 
       <stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif   stack-sessions output
@@ -263,11 +266,14 @@ def _find_stacks(root: Path) -> list[Path]:
 
     The file stem must equal its directory name, so raw frames, MC outputs
     (*_els_*.tif, *.mmap) and unfinished *.partial.tif are never picked.
+    With *prefix*, only stems starting with it are returned.
     """
     found = []
     for suffix in (".tif", ".msr"):
         for p in root.rglob(f"*{suffix}"):
             if p.stem != p.parent.name or not p.is_file():
+                continue
+            if prefix and not p.stem.startswith(prefix):
                 continue
             if suffix == ".tif" and not _CH_SUBDIR_RE.match(p.stem):
                 continue
@@ -275,7 +281,7 @@ def _find_stacks(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _infer_from_cwd() -> tuple[str, Path]:
+def _infer_from_cwd(prefix: str | None = None) -> tuple[str, Path]:
     """Infer (session, dest) from CWD.
 
     Three layouts are recognised:
@@ -286,7 +292,8 @@ def _infer_from_cwd() -> tuple[str, Path]:
 
     If CWD holds no input, subdirectories are searched recursively for one
     of these layouts (see :func:`_find_stacks`); exactly one match is used,
-    several are listed.
+    several are listed.  *prefix* restricts every candidate to stems that
+    start with it.
 
     For case 3 the MSR branch in main() will create the channel subdir and
     rebind dest/session before any pipeline files are written.
@@ -294,32 +301,36 @@ def _infer_from_cwd() -> tuple[str, Path]:
     cwd  = Path.cwd()
     # The canonical input is named after its directory; it wins over any
     # other file here (QC/MC side files).
+    def _ok(stem: str) -> bool:
+        return not prefix or stem.startswith(prefix)
+
     for suffix in (".tif", ".msr"):
         own = cwd / f"{cwd.name}{suffix}"
-        if own.is_file():
+        if own.is_file() and _ok(own.stem):
             return own.stem, cwd
     # Raw acquisition frames (…_C00_t0000.ome.tif) and unfinished stacks are
     # never session inputs; a session dir with kept sources holds thousands.
     tifs = sorted(p for p in cwd.glob("*.tif")
                   if p.is_file() and not _RAW_FRAME_RE.search(p.name)
-                  and not p.name.endswith(".partial.tif"))
-    msrs = sorted(p for p in cwd.glob("*.msr") if p.is_file())
+                  and not p.name.endswith(".partial.tif") and _ok(p.stem))
+    msrs = sorted(p for p in cwd.glob("*.msr") if p.is_file() and _ok(p.stem))
     candidates = tifs + msrs
     if not candidates:
-        found = _find_stacks(cwd)
+        found = _find_stacks(cwd, prefix)
+        what  = f" matching --prefix {prefix!r}" if prefix else ""
         if len(found) == 1:
             return found[0].stem, found[0].parent
         if not found:
             raise SystemExit(
-                f"new_session.py: no .tif or .msr found in or below {cwd}.\n"
+                f"new_session.py: no .tif or .msr{what} found in or below {cwd}.\n"
                 "  Expected <stem>-C<NN>-fc<N>/<stem>-C<NN>-fc<N>.tif (run stack-sessions first)\n"
                 "  or <dir>/<dir>.msr, or supply session and dest explicitly."
             )
         names = "\n    ".join(str(p.relative_to(cwd)) for p in found[:20])
         more  = f"\n    ... and {len(found) - 20} more" if len(found) > 20 else ""
         raise SystemExit(
-            f"new_session.py: {len(found)} input stacks below {cwd}:\n    {names}{more}\n"
-            "  cd into one channel subdir, supply session and dest explicitly,\n"
+            f"new_session.py: {len(found)} input stacks{what} below {cwd}:\n    {names}{more}\n"
+            "  narrow with --prefix, cd into one channel subdir, supply session and dest,\n"
             "  or process them all with batch-sessions (date dir) / batch-subject (subject dir)."
         )
     if len(candidates) == 1:
@@ -470,6 +481,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Session stem. Inferred from CWD (searched recursively) if omitted.")
     p.add_argument("dest", nargs="?", default=None,
                    help="Channel subdir path. Inferred from CWD (searched recursively) if omitted.")
+    p.add_argument("--prefix",          metavar="PREFIX", default=None,
+                   help="When inferring the session, only consider stacks whose "
+                        "stem starts with PREFIX (e.g. a full session name, or "
+                        "strohA-ia-000000-20151117-TL002). Ignored if session and "
+                        "dest are given.")
     p.add_argument("--template-json",   metavar="PATH",
                    help="Path to a custom template_pipeline.json. "
                         "Defaults to utilities/pipelines/template_pipeline.json.")
@@ -509,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Resolve session + dest ─────────────────────────────────────────────
     if args.session is None or args.dest is None:
-        _session, _dest = _infer_from_cwd()
+        _session, _dest = _infer_from_cwd(args.prefix)
         session = args.session or _session
         dest    = Path(args.dest).resolve() if args.dest else _dest
         print(f"  Inferred   : session={session}")
