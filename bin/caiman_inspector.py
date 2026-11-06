@@ -21,7 +21,14 @@ Usage
 
 Controls
 --------
-    Table        — click to select; Ctrl/Shift for multi-select
+    Table        — click to select; Ctrl/Shift for multi-select;
+                   click a column header to sort
+    Movie bar    — under the cell viewer: play / scrub the raw stack
+                   (<session>.tif / .msr next to the results is found;
+                   View > Open movie… / Ctrl+M for another).  With the
+                   image focused: Space play/pause, ←/→ ±1, Shift+←/→ ±10,
+                   Home/End, Shift+wheel steps frames.  Drag the yellow
+                   cursor in the trace view to seek.
     Corr matrix  — click any off-diagonal cell to highlight that pair
                    in orange / magenta on the cell viewer
     ⊕ Merge      — merge ≥ 2 selected (footprint = pixel max, trace = mean)
@@ -68,10 +75,11 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSizePolicy, QAbstractItemView, QHeaderView,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QInputDialog, QProgressDialog,
+    QWidget, QHBoxLayout, QVBoxLayout, QSlider, QSpinBox, QToolButton,
 )
-from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
+from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer
 from PyQt6.QtGui   import (
-    QAction, QColor, QBrush, QFont, QPalette, QKeySequence,
+    QAction, QColor, QBrush, QFont, QPalette, QKeySequence, QShortcut,
 )
 from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
 
@@ -1141,6 +1149,108 @@ def _session_prefix(path: str) -> str:
     return prefix
 
 
+# ── Movie source for the cell-view background (no Qt) ────────────────────────
+
+MOVIE_EXTS = (".tif", ".tiff", ".msr")
+
+
+def find_session_movie(store: 'ComponentStore'):
+    """The session's raw stack, if it sits next to the results file.
+
+    Same rule as the background scan: ``<session>.tif`` / ``.tiff`` /
+    ``.msr`` (session = results name without _results/_curated tails), or a
+    file named after the folder.  A stack already projected as the
+    "stack mean" background is used first.
+    """
+    src = store.bg_sources.get("stack mean")
+    if src and os.path.isfile(src) and src.lower().endswith(MOVIE_EXTS):
+        return src
+    if not store.fpath:
+        return None
+    folder = _os_dirname(store.fpath)
+    for name in dict.fromkeys((_session_prefix(store.fpath),
+                               os.path.basename(folder))):
+        for ext in MOVIE_EXTS:
+            p = os.path.join(folder, name + ext)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+class MovieSource:
+    """Random-access frames of a .tif / .msr stack, oriented to ``dims``.
+
+    Wraps :class:`caiman.utils.stack_io.StackReader` (persistent handle)
+    with a small frame cache, a running mean for denoised playback, and
+    fixed display levels so playback does not flicker.
+    """
+
+    CACHE_FRAMES = 64
+    MAX_AVG      = 32
+
+    def __init__(self, path: str, dims):
+        from caiman.utils.stack_io import StackReader
+        from collections import OrderedDict
+        self.path = path
+        self._r   = StackReader(path)
+        self.n_frames = int(self._r.n_frames)
+        shape, dims = (int(self._r.h), int(self._r.w)), tuple(int(d) for d in dims)
+        if shape == dims:
+            self._transpose = False
+        elif shape == dims[::-1]:
+            self._transpose = True
+        else:
+            self._r.close()
+            raise ValueError(f"movie frames are {shape[0]}×{shape[1]} but the "
+                             f"results FOV is {dims[0]}×{dims[1]}")
+        self._cache  = OrderedDict()
+        self._levels = None
+
+    def _read(self, i: int) -> np.ndarray:
+        a = np.asarray(self._r.read_frame(i), dtype=np.float32)
+        return np.ascontiguousarray(a.T if self._transpose else a)
+
+    def frame(self, i: int) -> np.ndarray:
+        i = int(min(max(i, 0), self.n_frames - 1))
+        f = self._cache.get(i)
+        if f is None:
+            f = self._read(i)
+            self._cache[i] = f
+            if len(self._cache) > self.CACHE_FRAMES:
+                self._cache.popitem(last=False)
+        else:
+            self._cache.move_to_end(i)
+        return f
+
+    def mean(self, i: int, n: int) -> np.ndarray:
+        """Mean of frames i-n+1 … i (clipped at 0)."""
+        n = int(min(max(n, 1), self.MAX_AVG))
+        if n == 1:
+            return self.frame(i)
+        lo = max(0, int(i) - n + 1)
+        acc = np.zeros_like(self.frame(lo))
+        for j in range(lo, int(i) + 1):
+            acc += self.frame(j)
+        return acc / (int(i) + 1 - lo)
+
+    def levels(self) -> tuple:
+        """Display range from robust percentiles of ~24 frames across the movie."""
+        if self._levels is None:
+            idx = np.unique(np.linspace(0, self.n_frames - 1,
+                                        min(24, self.n_frames)).astype(int))
+            sample = np.stack([self._read(int(j)) for j in idx])
+            lo, hi = np.percentile(sample, [0.5, 99.8])
+            self._levels = (float(lo), float(hi) if hi > lo else float(lo) + 1.0)
+        return self._levels
+
+    def close(self) -> None:
+        try:
+            self._r.close()
+        except Exception:
+            pass
+        self._cache.clear()
+
+
 # ── Event exports / blinded review (no Qt; called by the window) ─────────────
 
 def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
@@ -1332,9 +1442,11 @@ class CellViewer(pg.GraphicsLayoutWidget):
       Right-click    → context menu (includes "View All" / reset zoom)
       Left-click     → select component under cursor (footprint hit-test)
       Ctrl+Left      → toggle component in/out of selection
+      Shift+Scroll   → step through movie frames (when a movie is shown)
     """
 
     component_clicked = pyqtSignal(int, bool)
+    frame_scrolled    = pyqtSignal(int)      # ±steps from Shift+wheel
 
     def __init__(self, store: 'ComponentStore', parent=None):
         super().__init__(parent)
@@ -1344,6 +1456,8 @@ class CellViewer(pg.GraphicsLayoutWidget):
         self._centroids = None
         self._cross_params_cache = None
         self._invert_bg = False
+        self._movie_img    = None     # current movie frame (float32, dims) or None
+        self._movie_levels = None
 
         self.setBackground(BG_DARK)
 
@@ -1420,6 +1534,33 @@ class CellViewer(pg.GraphicsLayoutWidget):
     def refresh_background(self):
         """Redraw after the store's active background image has changed."""
         self._redraw()
+
+    def set_movie_frame(self, img, levels):
+        """Show a movie frame as the background (fixed display *levels*).
+        Only the background layer is redrawn, so playback stays cheap."""
+        self._movie_img, self._movie_levels = img, levels
+        self._draw_background()
+
+    def clear_movie(self):
+        """Return to the static background image."""
+        if self._movie_img is not None:
+            self._movie_img = self._movie_levels = None
+            self._draw_background()
+
+    @property
+    def showing_movie(self) -> bool:
+        return self._movie_img is not None
+
+    def wheelEvent(self, ev):
+        if (self._movie_img is not None
+                and ev.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            d = ev.angleDelta()
+            delta = d.y() or d.x()          # some platforms turn Shift+wheel horizontal
+            if delta:
+                self.frame_scrolled.emit(-1 if delta > 0 else 1)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
 
     def refresh_visibility(self):
         """Redraw after per-component visibility (hidden flags) has changed."""
@@ -1527,11 +1668,15 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
-    def _redraw(self):
-        s = self.store
-
-        # Background
-        cn = s.Cn.copy()
+    def _draw_background(self):
+        if self._movie_img is not None:
+            lo, hi = self._movie_levels
+            img = self._movie_img
+            if self._invert_bg:
+                img = (lo + hi) - img
+            self._img_bg.setImage(img, levels=(lo, hi), autoLevels=False)
+            return
+        cn = self.store.Cn.copy()
         if self._invert_bg:
             cn = cn.max() - cn
         lo, hi = cn.min(), cn.max()
@@ -1539,7 +1684,13 @@ class CellViewer(pg.GraphicsLayoutWidget):
             cn8 = ((cn - lo) / (hi - lo) * 255).astype(np.uint8)
         else:
             cn8 = np.zeros_like(cn, dtype=np.uint8)
-        self._img_bg.setImage(cn8)
+        self._img_bg.setImage(cn8, levels=(0, 255), autoLevels=False)
+
+    def _redraw(self):
+        s = self.store
+
+        # Background (static image, or the current movie frame)
+        self._draw_background()
 
         # RGBA overlay (selected + pair only)
         rgba = _build_overlay(s, self._sel, self._pair)
@@ -1583,15 +1734,269 @@ class CellViewer(pg.GraphicsLayoutWidget):
             self._cross_items.extend([h, v])
 
 
+# ── Movie playback bar (under the cell viewer) ──────────────────────────────
+
+class MovieBar(QWidget):
+    """Play / scrub the session's raw .tif / .msr stack as the cell-view
+    background, with the ROI overlay and crosses drawn on top.
+
+    The movie next to the results file (``<session>.tif`` / ``.msr``) is
+    found automatically and opened only when first used.  Keys while the
+    image or this bar has focus: Space play/pause · ←/→ ±1 frame ·
+    Shift+←/→ ±10 · Home/End.  Shift+wheel over the image steps frames.
+    """
+
+    def __init__(self, cell_view: 'CellViewer', trace_view: 'TraceViewer',
+                 store: 'ComponentStore', parent=None):
+        super().__init__(parent)
+        self.cell_view, self.trace_view = cell_view, trace_view
+        self.store = store
+        self.src: MovieSource | None = None
+        self.path = None
+        self.cur  = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+        def _btn(text, tip, slot, checkable=False):
+            b = QToolButton(self)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(checkable)
+            b.setAutoRaise(True)
+            (b.toggled if checkable else b.clicked).connect(slot)
+            return b
+
+        self.b_open  = _btn("⏏", "Open a movie (.tif / .msr) to play behind the ROIs…",
+                            self.open_dialog)
+        self.b_movie = _btn("Movie", "Show the movie frame as background "
+                            "(off: the static BG image)", self.set_active, True)
+        self.b_play  = _btn("▶", "Play / pause (Space)", self.toggle_play)
+        self.slider  = QSlider(Qt.Orientation.Horizontal, self)
+        self.slider.setToolTip("Scrub frames (←/→, Shift+←/→ ×10, Home/End; "
+                               "Shift+wheel over the image)")
+        self.slider.valueChanged.connect(self.seek)
+        self.lbl = QLabel(self)
+        self.lbl.setMinimumWidth(96)
+        self.lbl.setStyleSheet("color: #aaaaaa; font-family: monospace;")
+        self.fps = QSpinBox(self)
+        self.fps.setRange(1, 1000)
+        self.fps.setSuffix(" fps")
+        self.fps.setToolTip("Playback rate (default: the recording's frame rate)")
+        self.fps.valueChanged.connect(self._on_fps)
+        self.avg = QSpinBox(self)
+        self.avg.setRange(1, MovieSource.MAX_AVG)
+        self.avg.setPrefix("avg ")
+        self.avg.setToolTip("Show the running mean of the last N frames "
+                            "(denoises raw 2P frames)")
+        self.avg.valueChanged.connect(lambda _: self.src and self.cell_view.showing_movie
+                                      and self.seek(self.cur))
+
+        # Take the cell pane's width instead of asking for one: a width hint
+        # here pulls the window's splitters off their even split.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(4)
+        for w in (self.b_open, self.b_movie, self.b_play):
+            lay.addWidget(w)
+        lay.addWidget(self.slider, 1)
+        for w in (self.lbl, self.fps, self.avg):
+            lay.addWidget(w)
+
+        cell_view.frame_scrolled.connect(self.step)
+        trace_view.cursor_dragged.connect(self.seek)
+        self.set_store(store)
+
+    # ── Store / file ──────────────────────────────────────────────────────────
+
+    def set_store(self, store: 'ComponentStore'):
+        """Reset for a new results file and look for its movie."""
+        self.stop()
+        self._close()
+        self.store = store
+        self.cur   = 0
+        self.cell_view.clear_movie()
+        self.trace_view.set_cursor(None)
+        self.path = find_session_movie(store)
+        fr = getattr(store, "fr", None)
+        self.fps.blockSignals(True)
+        self.fps.setValue(int(round(fr)) if fr and np.isfinite(fr) and fr >= 1 else 30)
+        self.fps.blockSignals(False)
+        self._update_ui()
+
+    def open_dialog(self):
+        start = self.path or (_os_dirname(self.store.fpath) if self.store.fpath else "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open movie", start,
+            "Stacks (*.tif *.tiff *.msr);;TIFF (*.tif *.tiff);;MSR (*.msr);;All files (*)")
+        if path and self.open_path(path):
+            self.set_active(True)
+
+    def open_path(self, path: str) -> bool:
+        try:
+            src = MovieSource(path, self.store.dims)
+        except Exception as exc:
+            QMessageBox.warning(self, "Movie",
+                                f"Cannot open {os.path.basename(path)}:\n{exc}")
+            return False
+        self.stop()
+        self._close()
+        self.src, self.path, self.cur = src, path, 0
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, src.n_frames - 1)
+        self.slider.setPageStep(max(1, src.n_frames // 50))
+        self.slider.setValue(0)
+        self.slider.blockSignals(False)
+        self._update_ui()
+        win = self.window()
+        if hasattr(win, "statusBar"):
+            win.statusBar().showMessage(
+                f"Movie: {path}  ({src.n_frames} frames)", 8000)
+        return True
+
+    def _ensure_open(self) -> bool:
+        if self.src is not None:
+            return True
+        return bool(self.path) and self.open_path(self.path)
+
+    def _close(self):
+        if self.src is not None:
+            self.src.close()
+            self.src = None
+
+    def shutdown(self):
+        self.stop()
+        self._close()
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+
+    def set_active(self, on: bool):
+        """Movie frame (on) or the static background image (off)."""
+        if on:
+            if not self._ensure_open():
+                self._set_movie_btn(False)
+                return
+            self.seek(self.cur)
+        else:
+            self.stop()
+            self.cell_view.clear_movie()
+            self.trace_view.set_cursor(None)
+            self._set_movie_btn(False)
+            self._update_ui()
+
+    def seek(self, i: int):
+        if not self._ensure_open():
+            return
+        src = self.src
+        self.cur = int(min(max(int(i), 0), src.n_frames - 1))
+        if self.slider.value() != self.cur:
+            self.slider.blockSignals(True)
+            self.slider.setValue(self.cur)
+            self.slider.blockSignals(False)
+        try:
+            img = src.mean(self.cur, self.avg.value())
+        except Exception as exc:
+            self.stop()
+            QMessageBox.warning(self, "Movie", f"Frame {self.cur}: {exc}")
+            return
+        self.cell_view.set_movie_frame(img, src.levels())
+        self.sync_cursor()
+        self._set_movie_btn(True)
+        self._update_ui()
+
+    def sync_cursor(self):
+        """Trace cursor only when movie frames and trace samples align 1:1."""
+        if self.src is not None and self.cell_view.showing_movie \
+                and self.src.n_frames == self.store.disp_T:
+            self.trace_view.set_cursor(self.cur)
+        else:
+            self.trace_view.set_cursor(None)
+
+    def step(self, d: int):
+        self.seek(self.cur + int(d))
+
+    def seek_end(self):
+        if self._ensure_open():
+            self.seek(self.src.n_frames - 1)
+
+    def toggle_play(self):
+        if self._timer.isActive():
+            self.stop()
+        else:
+            self.play()
+
+    def play(self):
+        if not self._ensure_open():
+            return
+        if not self.cell_view.showing_movie:
+            self.seek(self.cur)
+        self._timer.start(max(1, int(round(1000 / self.fps.value()))))
+        self.b_play.setText("⏸")
+
+    def stop(self):
+        self._timer.stop()
+        self.b_play.setText("▶")
+
+    @property
+    def playing(self) -> bool:
+        return self._timer.isActive()
+
+    def _tick(self):
+        nxt = self.cur + 1
+        self.seek(0 if nxt >= self.src.n_frames else nxt)    # loops
+
+    def _on_fps(self, v):
+        if self._timer.isActive():
+            self._timer.setInterval(max(1, int(round(1000 / v))))
+
+    # ── UI state ──────────────────────────────────────────────────────────────
+
+    def _set_movie_btn(self, on: bool):
+        self.b_movie.blockSignals(True)
+        self.b_movie.setChecked(on)
+        self.b_movie.blockSignals(False)
+
+    def _update_ui(self):
+        have = bool(self.path)
+        for w in (self.b_movie, self.b_play, self.slider, self.fps, self.avg):
+            w.setEnabled(have)
+        open_tip = "Open a movie (.tif / .msr) to play behind the ROIs…"
+        if not have:
+            self.lbl.setText("no movie")
+            self.b_open.setToolTip(open_tip)
+            self.b_movie.setToolTip("No movie found next to the results — ⏏ to open one")
+            return
+        self.b_open.setToolTip(f"{open_tip}\nCurrent: {self.path}")
+        self.b_movie.setToolTip(f"Show {os.path.basename(self.path)} as the background "
+                                "(off: the static BG image)")
+        if self.src is None:
+            self.lbl.setText("not loaded")
+        else:
+            self.lbl.setText(f"{self.cur:>6d} / {self.src.n_frames - 1}")
+
+
 # ── Trace viewer ──────────────────────────────────────────────────────────────
 
 class TraceViewer(pg.PlotWidget):
-    """Bottom-left — stacked normalised traces for selected components."""
+    """Bottom-left — stacked normalised traces for selected components.
+    While a movie plays, a yellow frame cursor marks the shown frame; drag
+    it to seek."""
+
+    cursor_dragged = pyqtSignal(int)
 
     def __init__(self, store: 'ComponentStore', parent=None):
         super().__init__(parent, background=BG_DARK)
         self.store = store
         self._sel  = []
+        self._cursor_frame = None
+        self._cursor = pg.InfiniteLine(
+            angle=90, movable=True,
+            pen=pg.mkPen('#ffd23f', width=1.5),
+            hoverPen=pg.mkPen('#ffe680', width=3))
+        self._cursor.setZValue(10)
+        self._cursor.sigDragged.connect(
+            lambda line: self.cursor_dragged.emit(int(round(line.value()))))
         self.getAxis('bottom').setLabel('Frame', color='#888888')
         self.getAxis('bottom').setTextPen(pg.mkPen('#888888'))
         self.getAxis('left').hide()
@@ -1607,6 +2012,18 @@ class TraceViewer(pg.PlotWidget):
     def refresh(self):
         """Redraw after the active display trace has changed."""
         self._redraw()
+
+    def set_cursor(self, frame):
+        """Show the movie frame cursor at *frame* (None hides it)."""
+        self._cursor_frame = frame
+        if frame is None:
+            if self._cursor.scene() is not None:
+                self.removeItem(self._cursor)
+            return
+        if self._cursor.scene() is None and self._sel:
+            self.addItem(self._cursor, ignoreBounds=True)
+        self._cursor.setBounds((0, max(self.store.disp_T - 1, 0)))
+        self._cursor.setValue(frame)
 
     def _redraw(self):
         self.clear()
@@ -1636,6 +2053,8 @@ class TraceViewer(pg.PlotWidget):
                 offset += 1.3
             self.setXRange(0, T, padding=0)
             self.setYRange(-0.3, offset, padding=0)
+            if self._cursor_frame is not None:     # clear() dropped it
+                self.set_cursor(self._cursor_frame)
         except Exception as exc:
             self.clear()
             ti = pg.TextItem(f"Draw error: {exc}", color='#ff4444',
@@ -2225,6 +2644,11 @@ class InspectorWindow(QMainWindow):
         a.triggered.connect(self._full_refresh)
         vm.addAction(a)
         vm.addSeparator()
+        a = QAction("Open &movie (.tif / .msr)…", self)
+        a.setShortcut(QKeySequence("Ctrl+M"))
+        a.setToolTip("Play / scrub a raw stack behind the ROI overlay.")
+        a.triggered.connect(lambda: self.movie_bar.open_dialog())
+        vm.addAction(a)
         a = QAction("Load &background image…", self)
         a.setToolTip("Load a data projection / anatomical image (.npy/.tif/.png) "
                      "to show behind the footprints.")
@@ -2398,6 +2822,9 @@ class InspectorWindow(QMainWindow):
             "Use View ▸ Load background image… to add a data projection.")
         self.bg_combo.setMinimumWidth(140)
         self.bg_combo.currentTextChanged.connect(self._on_bg_changed)
+        # Picking a static background leaves movie mode
+        self.bg_combo.activated.connect(
+            lambda _i: self.movie_bar.set_active(False))
         tb.addWidget(self.bg_combo)
         self._refresh_bg_combo()
 
@@ -2443,9 +2870,29 @@ class InspectorWindow(QMainWindow):
         self.corr_view  = CorrMatrix(s)
         self.event_view.setXLink(self.trace_view)
 
+        # Cell viewer with the movie playback bar underneath
+        self.movie_bar = MovieBar(self.cell_view, self.trace_view, s)
+        cell_box = QWidget()
+        cbl = QVBoxLayout(cell_box)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        cbl.setSpacing(0)
+        cbl.addWidget(self.cell_view, 1)
+        cbl.addWidget(self.movie_bar)
+        self.cell_view.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        for key, slot in (("Space",       self.movie_bar.toggle_play),
+                          ("Right",       lambda: self.movie_bar.step(1)),
+                          ("Left",        lambda: self.movie_bar.step(-1)),
+                          ("Shift+Right", lambda: self.movie_bar.step(10)),
+                          ("Shift+Left",  lambda: self.movie_bar.step(-10)),
+                          ("Home",        lambda: self.movie_bar.seek(0)),
+                          ("End",         self.movie_bar.seek_end)):
+            sc = QShortcut(QKeySequence(key), cell_box)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+
         # Top row: cell viewer (left) | distance matrix (right)
         top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(self.cell_view)
+        top.addWidget(cell_box)
         top.addWidget(self.dist_view)
         top.setSizes([1, 1])
 
@@ -2477,6 +2924,10 @@ class InspectorWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self.statusBar().showMessage(f"Loaded {s.n} components")
+
+    def closeEvent(self, ev):
+        self.movie_bar.shutdown()
+        super().closeEvent(ev)
 
     # ── Signals ───────────────────────────────────────────────────────────────
 
@@ -2738,6 +3189,7 @@ class InspectorWindow(QMainWindow):
         except KeyError:
             return
         self.trace_view.refresh()
+        self.movie_bar.sync_cursor()          # trace length may differ
         self.statusBar().showMessage(f"Trace → {name}")
 
     # ── Visibility ────────────────────────────────────────────────────────────
@@ -2787,6 +3239,7 @@ class InspectorWindow(QMainWindow):
             w.store = new_store
         self._refresh_bg_combo()
         self._refresh_trace_combo()
+        self.movie_bar.set_store(new_store)
         self.cell_view.refresh_background()
         self._full_refresh()
 
