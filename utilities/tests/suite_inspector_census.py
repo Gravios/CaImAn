@@ -147,8 +147,23 @@ try:
     assert w.act_hide_rejected.isChecked() and w.store.hide_rejected
     out3 = root / "hidden_saved.hdf5"; w.store.save(str(out3))
     assert load_CNMF(out3).estimates.A.shape[1] == K, "hidden rejected ROIs are still saved"
-    w.close()
     ok("toggle remembered; hidden rejected ROIs still saved")
+
+    # blinded review shows every row even with Hide rejected on
+    import h5py
+    from caiman.utils import event_detection as ed
+    res = ed.detect_events(C * 0.5, C, 30.0, 0.4)
+    with h5py.File(src, "a") as f:
+        ed.write_stroh_results(f, res, res.auto_approved)
+    w.start_blinded("R1", [str(src)]); app.processEvents()
+    t = w.table
+    assert w.store.n == K and not w.store.hide_rejected and not w.act_hide_rejected.isEnabled()
+    assert not any(t.isRowHidden(r) for r in range(t.rowCount()))
+    w._end_blinded(); app.processEvents()
+    assert w.act_hide_rejected.isEnabled() and w.store.hide_rejected
+    assert [t.isRowHidden(t.row_of(i)) for i in range(K)] == [i not in active for i in range(K)]
+    w.close()
+    ok("blinded review: every row shown and ratable; Hide rejected restored afterwards")
     print("ALL OK")
 finally:
     shutil.rmtree(root)

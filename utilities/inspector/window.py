@@ -928,7 +928,9 @@ class InspectorWindow(QMainWindow):
         self._refresh_bg_combo()
         self._refresh_trace_combo()
         self._apply_view_prefs()
-        new_store.hide_rejected = self.act_hide_rejected.isChecked()
+        # a blinded rater must see (and rate) every row
+        new_store.hide_rejected = (self.act_hide_rejected.isChecked()
+                                   and self._blind is None)
         self.movie_bar.set_store(new_store)
         self.cell_view.refresh_background()
         self._full_refresh()
@@ -1182,6 +1184,7 @@ class InspectorWindow(QMainWindow):
     def start_blinded(self, rater: str, files: list):
         """Begin a blinded review of ``files`` (already filtered/shuffled)."""
         self._blind = dict(rater=rater, files=list(files), i=0)
+        self.act_hide_rejected.setEnabled(False)   # every row is rated
         self.act_blind_next.setVisible(True)
         self.act_blind_end.setEnabled(True)
         self.act_blind.setEnabled(False)
@@ -1264,6 +1267,9 @@ class InspectorWindow(QMainWindow):
 
     def _end_blinded(self):
         self._blind = None
+        self.act_hide_rejected.setEnabled(True)
+        self.store.hide_rejected = self.act_hide_rejected.isChecked()
+        self.corr_view.redraw(); self.dist_view.redraw()
         self.act_blind_next.setVisible(False)
         self.act_blind_end.setEnabled(False)
         self.act_blind.setEnabled(True)
