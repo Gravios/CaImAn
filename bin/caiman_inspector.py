@@ -22,7 +22,8 @@ Usage
 Controls
 --------
     Table        — click to select; Ctrl/Shift for multi-select;
-                   click a column header to sort.  ROI-filter columns
+                   click a column header to sort; right-click it (or
+                   View ▸ Columns) to show / hide columns.  ROI-filter columns
                    (QC, Active, Fail, Area, Solid, Ecc, Edge, Rate,
                    Pk ΔF/F, Skew, Act %) appear when the results file has a
                    roi_filter group; Incl then starts from the QC verdict.
@@ -30,6 +31,9 @@ Controls
                    recomputes them, e.g. for sessions processed before the
                    pipeline step existed; thresholds live in Edit ▸
                    Preferences… (Ctrl+,), ~/.config/caiman/inspector_prefs.json
+    Layout       — window and pane sizes, hidden columns, sort, view toggles,
+                   background / trace choice and the last folder are
+                   remembered in the same file (View ▸ Reset layout).
     Movie bar    — under the cell viewer: play / scrub the raw stack
                    (<session>.tif / .msr next to the results is found;
                    View > Open movie… / Ctrl+M for another).  With the
@@ -84,9 +88,9 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QInputDialog, QProgressDialog,
     QWidget, QHBoxLayout, QVBoxLayout, QSlider, QSpinBox, QToolButton,
-    QCheckBox, QGroupBox, QPushButton, QScrollArea, QTabWidget,
+    QCheckBox, QGroupBox, QPushButton, QScrollArea, QTabWidget, QMenu,
 )
-from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer
+from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer, QByteArray
 from PyQt6.QtGui   import (
     QAction, QColor, QBrush, QFont, QPalette, QKeySequence, QShortcut,
 )
@@ -2074,10 +2078,15 @@ class MovieBar(QWidget):
         self._update_ui()
 
     def open_dialog(self):
+        win = self.window()
         start = self.path or (_os_dirname(self.store.fpath) if self.store.fpath else "")
+        if not start and hasattr(win, "_start_dir"):
+            start = win._start_dir()
         path, _ = QFileDialog.getOpenFileName(
             self, "Open movie", start,
             "Stacks (*.tif *.tiff *.msr);;TIFF (*.tif *.tiff);;MSR (*.msr);;All files (*)")
+        if path and hasattr(win, "_remember_dir"):
+            win._remember_dir(path)
         if path and self.open_path(path):
             self.set_active(True)
 
@@ -2701,9 +2710,13 @@ class ComponentTable(QTableWidget):
          "Percent of frames inside detected events"),
     )
 
+    columns_changed = pyqtSignal()           # a column was shown / hidden
+    _UNHIDEABLE = ("Label",)
+
     def __init__(self, store: ComponentStore, parent=None):
         super().__init__(parent)
         self.store = store
+        self._hidden_cols: set = set()       # header names; kept across files
         self.setSelectionMode(
             QAbstractItemView.SelectionMode.MultiSelection)
         self.setSelectionBehavior(
@@ -2721,7 +2734,11 @@ class ComponentTable(QTableWidget):
         hdr = self.horizontalHeader()
         hdr.setSortIndicatorShown(True)
         hdr.setSortIndicator(-1, Qt.SortOrder.AscendingOrder)   # start in store order
-        hdr.setToolTip("Click a column to sort; click again to reverse")
+        hdr.setToolTip("Click a column to sort; click again to reverse; "
+                       "right-click to show / hide columns")
+        hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(
+            lambda pos: self.column_menu(self).exec(hdr.mapToGlobal(pos)))
         self.model().layoutChanged.connect(self._reindex)
         self._populate()
         self.setSortingEnabled(True)
@@ -2730,6 +2747,75 @@ class ComponentTable(QTableWidget):
 
     def refresh(self):
         self._populate()
+
+    # ── Column visibility ─────────────────────────────────────────────────────
+
+    def column_names(self) -> list:
+        return [self.horizontalHeaderItem(c).text() for c in range(self.columnCount())]
+
+    def hidden_columns(self) -> list:
+        """Hidden column names, including ones this file does not have."""
+        return sorted(self._hidden_cols)
+
+    def set_hidden_columns(self, names) -> None:
+        self._hidden_cols = set(names or ()) - set(self._UNHIDEABLE)
+        self._apply_hidden()
+
+    def set_column_visible(self, name: str, visible: bool) -> None:
+        if name in self._UNHIDEABLE:
+            return
+        (self._hidden_cols.discard if visible else self._hidden_cols.add)(name)
+        self._apply_hidden()
+        self.columns_changed.emit()
+
+    def show_all_columns(self) -> None:
+        self._hidden_cols.clear()
+        self._apply_hidden()
+        self.columns_changed.emit()
+
+    def _apply_hidden(self) -> None:
+        for c, name in enumerate(self.column_names()):
+            self.setColumnHidden(c, name in self._hidden_cols)
+
+    def fill_column_menu(self, menu: 'QMenu') -> None:
+        """One checkable entry per column of this file, then Show all."""
+        menu.clear()
+        for c, name in enumerate(self.column_names()):
+            a = menu.addAction(name)
+            a.setCheckable(True)
+            a.setChecked(name not in self._hidden_cols)
+            a.setEnabled(name not in self._UNHIDEABLE)
+            tip = self.horizontalHeaderItem(c).toolTip()
+            if tip:
+                a.setToolTip(tip)
+            a.toggled.connect(lambda on, n=name: self.set_column_visible(n, on))
+        menu.addSeparator()
+        a = menu.addAction("Show all columns")
+        a.setEnabled(bool(self._hidden_cols & set(self.column_names())))
+        a.triggered.connect(self.show_all_columns)
+        menu.setToolTipsVisible(True)
+
+    def column_menu(self, parent) -> 'QMenu':
+        m = QMenu("Columns", parent)
+        self.fill_column_menu(m)
+        return m
+
+    def sort_state(self):
+        """(column name, "asc"/"desc") or None when unsorted."""
+        hdr = self.horizontalHeader()
+        c = hdr.sortIndicatorSection()
+        if not (0 <= c < self.columnCount()):
+            return None
+        return (self.horizontalHeaderItem(c).text(),
+                "desc" if hdr.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder else "asc")
+
+    def sort_by_name(self, name: str, order: str = "asc") -> bool:
+        names = self.column_names()
+        if name not in names:
+            return False
+        self.sortByColumn(names.index(name), Qt.SortOrder.DescendingOrder
+                          if order == "desc" else Qt.SortOrder.AscendingOrder)
+        return True
 
     def comp_of(self, row: int) -> int:
         """Store index of the component shown in table *row*."""
@@ -2814,6 +2900,10 @@ class ComponentTable(QTableWidget):
         cols = self._col_names()
         hdr  = self.horizontalHeader()
         sort_col, sort_ord = hdr.sortIndicatorSection(), hdr.sortIndicatorOrder()
+        # Remember the sorted column by name: the column set differs between
+        # files (optional metrics, ROI-filter fields, events).
+        sort_name = (self.horizontalHeaderItem(sort_col).text()
+                     if 0 <= sort_col < self.columnCount() else None)
         sorting = self.isSortingEnabled()
         self.setSortingEnabled(False)          # rows must land at row == comp
         self.blockSignals(True)
@@ -2857,11 +2947,11 @@ class ComponentTable(QTableWidget):
                 self.setItem(i, c, item)
         self.blockSignals(False)
         self._reindex()
-        if sort_col >= self.columnCount():     # e.g. Incl gone after a reload
-            sort_col = -1
+        sort_col = cols.index(sort_name) if sort_name in cols else -1
         hdr.setSortIndicator(sort_col, sort_ord)
         self.setSortingEnabled(sorting)        # re-applies the user's sort
         self._reindex()
+        self._apply_hidden()
         self.mark_hidden()
 
     def _reindex(self):
@@ -3091,10 +3181,15 @@ class PreferencesDialog(QDialog):
                 w.set_value(values[k])
 
     def _from_json(self):
+        win = self.parent()
         path, _ = QFileDialog.getOpenFileName(
-            self, "Pipeline JSON", "", "JSON (*.json);;All files (*)")
+            self, "Pipeline JSON",
+            win._start_dir() if hasattr(win, "_start_dir") else "",
+            "JSON (*.json);;All files (*)")
         if not path:
             return
+        if hasattr(win, "_remember_dir"):
+            win._remember_dir(path)
         try:
             with open(path) as fh:
                 text = re.sub(r"(?m)^\s*//.*$", "", fh.read())
@@ -3229,6 +3324,11 @@ class InspectorWindow(QMainWindow):
         self.resize(1760, 980)
         self._pair  = None
         self._blind = None      # blinded-review session state (dict) or None
+        # Remembered layout / view / last folder (prefs "ui" section)
+        ui = load_prefs().get("ui")
+        self._ui = dict(ui) if isinstance(ui, dict) else {}
+        if store.fpath:
+            self._ui["last_dir"] = _os_dirname(store.fpath)
 
         _apply_dark_palette()
         self._build_menu()
@@ -3236,6 +3336,7 @@ class InspectorWindow(QMainWindow):
         self._build_central()
         self._wire_signals()
         self._full_refresh()
+        self._restore_ui()
 
     # ── Menu ──────────────────────────────────────────────────────────────────
 
@@ -3262,6 +3363,16 @@ class InspectorWindow(QMainWindow):
         a  = QAction("&Refresh", self)
         a.setShortcut(QKeySequence("F5"))
         a.triggered.connect(self._full_refresh)
+        vm.addAction(a)
+        vm.addSeparator()
+        self._columns_menu = vm.addMenu("&Columns")
+        self._columns_menu.setToolTip("Show / hide table columns "
+                                      "(also: right-click the table header)")
+        self._columns_menu.aboutToShow.connect(
+            lambda: self.table.fill_column_menu(self._columns_menu))
+        a = QAction("&Reset layout", self)
+        a.setToolTip("Default pane sizes, all columns shown, unsorted.")
+        a.triggered.connect(self._reset_layout)
         vm.addAction(a)
         vm.addSeparator()
         a = QAction("Open &movie (.tif / .msr)…", self)
@@ -3351,6 +3462,7 @@ class InspectorWindow(QMainWindow):
 
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
+        tb.setObjectName("main_toolbar")     # needed for saveState / restoreState
         tb.setMovable(False)
 
         self.act_merge = QAction("⊕  Merge selected", self)
@@ -3552,6 +3664,10 @@ class InspectorWindow(QMainWindow):
         root.addWidget(self.table)
         root.addWidget(right)
         root.setSizes([1, 5])
+        self._splitters = {"root": root, "right": right, "top": top,
+                           "bottom": bot, "traces": traces}
+        self._splitter_defaults = {"root": [1, 5], "right": [3, 2], "top": [1, 1],
+                                   "bottom": [1, 1], "traces": [3, 2]}
 
         # Link corr and dist ViewBoxes so zoom/pan stays in sync
         self.corr_view.vb.setXLink(self.dist_view.vb)
@@ -3561,8 +3677,94 @@ class InspectorWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded {s.n} components")
 
     def closeEvent(self, ev):
+        self._save_ui()
         self.movie_bar.shutdown()
         super().closeEvent(ev)
+
+    # ── Remembered layout / last folder ───────────────────────────────────────
+
+    def _start_dir(self, fallback: str = "") -> str:
+        d = self._ui.get("last_dir")
+        return d if d and os.path.isdir(d) else fallback
+
+    def _remember_dir(self, path: str) -> None:
+        if not path:
+            return
+        d = path if os.path.isdir(path) else _os_dirname(path)
+        if d:
+            self._ui["last_dir"] = d
+            self._save_ui()
+
+    def _collect_ui(self) -> dict:
+        b64 = lambda ba: bytes(ba.toBase64()).decode("ascii")
+        ui = dict(self._ui)
+        ui["geometry"]  = b64(self.saveGeometry())
+        ui["state"]     = b64(self.saveState())
+        ui["splitters"] = {k: b64(sp.saveState()) for k, sp in self._splitters.items()}
+        ui["hidden_columns"] = self.table.hidden_columns()
+        st = self.table.sort_state()
+        ui["sort"] = {"column": st[0], "order": st[1]} if st else None
+        ui["view"] = {"invert_bg":     self.act_invert_bg.isChecked(),
+                      "show_rois":     self.act_show_rois.isChecked(),
+                      "hide_excluded": self.act_hide_excl.isChecked(),
+                      "dist_log":      self.act_dist_log.isChecked()}
+        return ui
+
+    def _save_ui(self) -> None:
+        """Write the "ui" section, re-reading the file so other sections
+        (e.g. roi_filter saved from another window) are kept."""
+        try:
+            self._ui = self._collect_ui()
+            prefs = load_prefs()
+            prefs["ui"] = self._ui
+            save_prefs(prefs)
+        except Exception as exc:              # never block closing
+            print(f"[prefs] could not save layout: {exc}", file=sys.stderr)
+
+    def _restore_ui(self) -> None:
+        ui = self._ui
+        ba = lambda s: QByteArray.fromBase64(str(s).encode("ascii"))
+        try:
+            if ui.get("geometry"):
+                self.restoreGeometry(ba(ui["geometry"]))
+            if ui.get("state"):
+                self.restoreState(ba(ui["state"]))
+            for k, st in (ui.get("splitters") or {}).items():
+                if k in self._splitters and st:
+                    self._splitters[k].restoreState(ba(st))
+        except Exception as exc:
+            print(f"[prefs] ignoring saved layout: {exc}", file=sys.stderr)
+        self.table.set_hidden_columns(ui.get("hidden_columns") or ())
+        srt = ui.get("sort")
+        if isinstance(srt, dict) and srt.get("column"):
+            self.table.sort_by_name(srt["column"], srt.get("order", "asc"))
+        view = ui.get("view") or {}
+        for key, act in (("invert_bg", self.act_invert_bg),
+                         ("show_rois", self.act_show_rois),
+                         ("hide_excluded", self.act_hide_excl),
+                         ("dist_log", self.act_dist_log)):
+            want = view.get(key)
+            if want is not None and bool(want) != act.isChecked():
+                act.trigger()                 # runs the toggle's handler
+        self._apply_view_prefs()
+
+    def _apply_view_prefs(self) -> None:
+        """Re-select the remembered background / trace if this file has them."""
+        bg = self._ui.get("background")
+        if bg and bg != self.store.bg_key and bg in self.store.background_names():
+            self.bg_combo.setCurrentText(bg)
+        tr = self._ui.get("trace")
+        if tr and tr != self.store.disp_key and tr in self.store.trace_names():
+            self.trace_combo.setCurrentText(tr)
+
+    def _reset_layout(self) -> None:
+        for k, sp in self._splitters.items():
+            sp.setSizes(self._splitter_defaults[k])
+        self.table.show_all_columns()
+        self.table.sortByColumn(-1, Qt.SortOrder.AscendingOrder)
+        self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.table.refresh()
+        self.statusBar().showMessage("Layout reset: panes, columns and sort")
 
     # ── Signals ───────────────────────────────────────────────────────────────
 
@@ -3571,6 +3773,7 @@ class InspectorWindow(QMainWindow):
         self.corr_view.pair_clicked.connect(self._on_corr_click)
         self.dist_view.pair_clicked.connect(self._on_corr_click)
         self.cell_view.component_clicked.connect(self._on_cell_click)
+        self.table.columns_changed.connect(self._save_ui)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
@@ -3785,11 +3988,12 @@ class InspectorWindow(QMainWindow):
         if self._blind_block():
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open CaImAn results", "",
+            self, "Open CaImAn results", self._start_dir(),
             "Results or stack (*.hdf5 *.h5 *.tif *.tiff);;"
             "HDF5 files (*.hdf5 *.h5);;TIFF stacks (*.tif *.tiff);;All files (*)")
         if not path:
             return
+        self._remember_dir(path)
         try:
             store = load_any(path)
             self._swap_store(store)
@@ -3813,11 +4017,13 @@ class InspectorWindow(QMainWindow):
             return
         # Pre-fill the dialog with the _curated path from the source file
         default = (ComponentStore.curated_path(self.store.fpath)
-                   if self.store.fpath else "")
+                   if self.store.fpath else
+                   os.path.join(self._start_dir(), "curated_results.hdf5"))
         path, _ = QFileDialog.getSaveFileName(
             self, "Save curated CaImAn results", default,
             "HDF5 files (*.hdf5 *.h5)")
         if path:
+            self._remember_dir(path)
             self._do_save(path)
 
     def _do_save(self, path: str):
@@ -3846,6 +4052,7 @@ class InspectorWindow(QMainWindow):
         except KeyError:
             return
         self.cell_view.refresh_background()
+        self._ui["background"] = name
         self.statusBar().showMessage(f"Background → {name}")
 
     # ── Trace selection ───────────────────────────────────────────────────────
@@ -3870,6 +4077,7 @@ class InspectorWindow(QMainWindow):
             return
         self.trace_view.refresh()
         self.movie_bar.sync_cursor()          # trace length may differ
+        self._ui["trace"] = name
         self.statusBar().showMessage(f"Trace → {name}")
 
     # ── Visibility ────────────────────────────────────────────────────────────
@@ -3896,10 +4104,12 @@ class InspectorWindow(QMainWindow):
 
     def _load_background(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load background image", "",
+            self, "Load background image",
+            self._start_dir(_os_dirname(self.store.fpath) if self.store.fpath else ""),
             "Images (*.npy *.npz *.tif *.tiff *.png *.jpg *.jpeg);;All files (*)")
         if not path:
             return
+        self._remember_dir(path)
         try:
             img  = _load_image_file(path)
             name = os.path.splitext(os.path.basename(path))[0]
@@ -3919,6 +4129,7 @@ class InspectorWindow(QMainWindow):
             w.store = new_store
         self._refresh_bg_combo()
         self._refresh_trace_combo()
+        self._apply_view_prefs()
         self.movie_bar.set_store(new_store)
         self.cell_view.refresh_background()
         self._full_refresh()
@@ -4111,9 +4322,11 @@ class InspectorWindow(QMainWindow):
     def _batch_detect(self):
         if self._blind_block():
             return
-        folder = QFileDialog.getExistingDirectory(self, "Folder of results files")
+        folder = QFileDialog.getExistingDirectory(self, "Folder of results files",
+                                                  self._start_dir())
         if not folder:
             return
+        self._remember_dir(folder)
         ed    = _ed()
         files = ed.find_results_files(folder)
         if not files:
@@ -4178,9 +4391,11 @@ class InspectorWindow(QMainWindow):
         rater = _re.sub(r"[^A-Z0-9_-]", "", (rater or "").strip().upper())
         if not ok or not rater:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Folder to review")
+        folder = QFileDialog.getExistingDirectory(self, "Folder to review",
+                                                  self._start_dir())
         if not folder:
             return
+        self._remember_dir(folder)
         unrated, rated, skipped = blind_plan(_ed().find_results_files(folder), rater)
         files = list(unrated)
         if rated and QMessageBox.question(
