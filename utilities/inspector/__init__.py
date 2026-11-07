@@ -34,7 +34,10 @@ Package layout (utilities/inspector/)
     views      cell viewer, movie bar, trace / event views, matrices
     table      sortable component table
     dialogs    Preferences, Run ROI filter, Help
-    window     InspectorWindow
+    window     InspectorWindow: construction, selection, editing, refresh
+    window_build     … menus, toolbar, panes
+    window_session   … open / save, layout, preferences, theme, help
+    window_analysis  … ROI filter, detection, export, blinded review
     cli        caiman-inspector entry point
 
 Controls
@@ -114,7 +117,8 @@ _pg.setConfigOptions(imageAxisOrder='row-major', antialias=True)
 
 from . import (  # noqa: E402
     constants, theme, deps, prefs, store, loading, movie, review,
-    overlay, views, table, dialogs, window, cli,
+    overlay, views, table, dialogs, window_build, window_session,
+    window_analysis, window, cli,
 )
 from .constants import *  # noqa: E402,F401,F403
 from .theme import *  # noqa: E402,F401,F403
@@ -128,11 +132,15 @@ from .overlay import *  # noqa: E402,F401,F403
 from .views import *  # noqa: E402,F401,F403
 from .table import *  # noqa: E402,F401,F403
 from .dialogs import *  # noqa: E402,F401,F403
+from .window_build import *  # noqa: E402,F401,F403
+from .window_session import *  # noqa: E402,F401,F403
+from .window_analysis import *  # noqa: E402,F401,F403
 from .window import *  # noqa: E402,F401,F403
 from .cli import *  # noqa: E402,F401,F403
 
 _MODULES = (constants, theme, deps, prefs, store, loading, movie, review,
-            overlay, views, table, dialogs, window, cli)
+            overlay, views, table, dialogs, window_build, window_session,
+            window_analysis, window, cli)
 
 # Every name of every module, private ones included (the bin/ shim and the
 # tests reach them).  Monkeypatch a name in its defining module, e.g.

@@ -99,7 +99,7 @@ try:
     assert seen == [str(root / "dayB")] * 3, seen
     c_path = root / "dayC" / "C_results.hdf5"; c_path.parent.mkdir()
     QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (str(c_path), ""))
-    insp.window.load_any = lambda p: store(root / "dayC", "C")
+    insp.window_session.load_any = lambda p: store(root / "dayC", "C")
     w._open_file(); app.processEvents()
     assert w._start_dir() == str(root / "dayC")
     assert json.loads(PREFS.read_text())["ui"]["last_dir"] == str(root / "dayC"), "saved right away"
