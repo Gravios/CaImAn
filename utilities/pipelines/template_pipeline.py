@@ -723,6 +723,34 @@ if __name__ == "__main__":
         _extra["Line-scan X shift"] = (
             f"enabled  (max_shift={_xcorr_max_shift} px)")
 
+    # ── 6b. ROI filter (label only) ───────────────────────────────────────
+    # Per-ROI footprint / edge / CaImAn-quality / activity metrics and
+    # pass flags, written as a `roi_filter` group into the results file.
+    # Nothing is removed and estimates / idx_components are untouched.
+    _rf_cfg  = getattr(_P, "roi_filter", None)
+    _rf_dict = _rf_cfg.to_dict() if _rf_cfg is not None else {}
+    if _rf_dict.get("enabled", True):
+        @timer.step("ROI filter")
+        def run_roi_filter():
+            from caiman.utils.roi_filter import apply_to_results
+            return apply_to_results(outdir / f"{session}_results.hdf5",
+                                    cnm2.estimates, cnm2.params, _rf_dict)
+        try:
+            _rf = run_roi_filter()
+            _rf_msg = f"{_rf.get('n_passed', 0)}/{_rf['n_total']} passed"
+            if "n_active" in _rf:
+                _rf_msg += f", {_rf['n_active']} active"
+            _rf_fail = {k: v for k, v in _rf.get("n_fail", {}).items() if v}
+            if _rf_fail:
+                _rf_msg += "  (fails: " + ", ".join(
+                    f"{k} {v}" for k, v in _rf_fail.items()) + ")"
+            _extra["ROI filter"] = _rf_msg
+            logger.info(f"ROI filter: {_rf_msg}")
+        except Exception as _rf_err:
+            # Results are already saved; a filter failure must not abort.
+            logger.warning(f"ROI filter failed ({_rf_err!r}); results saved "
+                           "without the roi_filter group.")
+
     # ── 7. Oscillation analysis ───────────────────────────────────────────
     _osc_npz = None
     _osc_cfg = getattr(_P, "oscillation", None)
