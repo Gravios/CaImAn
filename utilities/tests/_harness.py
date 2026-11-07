@@ -56,7 +56,30 @@ def load_inspector():
                           str(Path(tempfile.mkdtemp()) / "inspector_prefs.json"))
     stub_caiman()
     import utilities.inspector as insp
+    _skip_qt_teardown()
     return insp
+
+
+def _skip_qt_teardown() -> None:
+    """End a *successful* Qt suite with os._exit(0) instead of interpreter
+    teardown.  Destroying PyQt6 / pyqtgraph objects at shutdown segfaults
+    now and then (~1 run in 12 here) after every check has passed.  A
+    failing suite (uncaught exception) exits normally with its error."""
+    import atexit
+    failed = []
+    hook = sys.excepthook
+
+    def excepthook(*exc):
+        failed.append(exc[0])
+        hook(*exc)
+
+    def finish():
+        if not failed:
+            sys.stdout.flush(); sys.stderr.flush()
+            os._exit(0)
+
+    sys.excepthook = excepthook
+    atexit.register(finish)
 
 
 def light_root() -> Path:
