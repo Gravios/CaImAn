@@ -6,8 +6,9 @@ Interactive GUI for reviewing, merging, and deleting CNMF components.
 
 Requires
 --------
-    PyQt6, matplotlib (≥3.7), numpy, scipy
-    caiman  — only needed when loading a real .hdf5 file
+    PyQt6, pyqtgraph, numpy, scipy
+    caiman, h5py — loading / saving a results .hdf5
+    tifffile     — movie playback and image backgrounds (optional)
 
 Usage
 -----
@@ -48,13 +49,15 @@ Controls
                    image focused: Space play/pause, ←/→ ±1, Shift+←/→ ±10,
                    Home/End, Shift+wheel steps frames.  Drag the yellow
                    cursor in the trace view to seek.
-    Corr matrix  — click any off-diagonal cell to highlight that pair
-                   in orange / magenta on the cell viewer
+    Matrices     — Ctrl+click an off-diagonal cell of the correlation or
+                   distance matrix to select that pair (orange / magenta)
     ⊕ Merge      — merge ≥ 2 selected (footprint = pixel max, trace = mean)
     ✕ Delete     — permanently remove selected
-    ↩ Undo       — Ctrl+Z  — undo last merge or delete (up to 5 steps)
+    ↩ Undo       — Ctrl+Z  — undo the last merge, delete or ROI-filter run
+                             (up to 5 steps)
     ↪ Redo       — Ctrl+Y  — redo last undone operation
-    File > Save  — write modified A / C back to the .hdf5
+    File > Save  — write every component (A / C, Eval split, events,
+                   include flags, roi_filter fields) to <name>_curated.hdf5
 
 Event detection & curation (ported from SLabAnalysisPackage)
 -------------------------------------------------------------
@@ -99,11 +102,10 @@ from PyQt6.QtWidgets import (
     QCheckBox, QGroupBox, QPushButton, QScrollArea, QTabWidget, QMenu,
     QTextBrowser, QToolBar,
 )
-from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer, QByteArray
+from PyQt6.QtCore  import Qt, pyqtSignal, QItemSelectionModel, QTimer, QByteArray
 from PyQt6.QtGui   import (
     QAction, QColor, QBrush, QFont, QPalette, QKeySequence, QShortcut,
 )
-from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel
 
 # ── Colour constants ──────────────────────────────────────────────────────────
 
@@ -126,8 +128,6 @@ OVERLAY_ALPHA_DEFAULTS = {"selected": 0.55,   # selected / matrix-pair component
 OVERLAY_ALPHA = dict(OVERLAY_ALPHA_DEFAULTS)
 CROSS_MIN_ARM = 25    # minimum cross arm half-length in pixels
 
-BG_DARK  = "#111111"
-AX_BG    = "#0d0d0d"
 
 
 
@@ -324,10 +324,6 @@ class ComponentStore:
     def toggle_hidden(self, indices):
         for i in indices:
             self.hidden[i] = not self.hidden[i]
-
-    def set_hidden(self, indices, flag: bool):
-        for i in indices:
-            self.hidden[i] = bool(flag)
 
     def show_all(self):
         """Make every component visible again."""
@@ -2534,7 +2530,7 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
     """
     Base for CorrMatrix and DistMatrix.
     Displays a K×K symmetric matrix as a heat-map with a fixed colorbar.
-    Clicking any off-diagonal cell emits pair_clicked(i, j).
+    Ctrl+clicking an off-diagonal cell emits pair_clicked(i, j).
     """
 
     pair_clicked = pyqtSignal(int, int)
@@ -2709,12 +2705,6 @@ class DistMatrix(_MatrixWidget):
                if off.size > 0 else 1.0
         vmin = float(off.min()) if self._log and off.size > 0 else 0.0
         return vmin, vmax
-
-    @staticmethod
-    def _compute_dist(store: 'ComponentStore') -> np.ndarray:
-        """Pairwise centroid distance (cached on the store)."""
-        return store.dist
-
 
 
 # ── Component table ───────────────────────────────────────────────────────────
@@ -2983,10 +2973,8 @@ class ComponentTable(QTableWidget):
         slot = {c: k for k, c in enumerate(sel)}
         for comp in range(self.store.n):
             if comp in slot:
-                hx = PALETTE_HEX[slot[comp] % len(PALETTE_HEX)].lstrip("#")
-                bg = QColor(int(hx[0:2], 16),
-                            int(hx[2:4], 16),
-                            int(hx[4:6], 16), 55)
+                bg = QColor(PALETTE_HEX[slot[comp] % len(PALETTE_HEX)])
+                bg.setAlpha(55)
             else:
                 bg = dark
             self._set_row_bg(self.row_of(comp), bg)
@@ -3505,7 +3493,7 @@ File ▸ Open… starts in the last folder used.</p>
 CaImAn's verdict (✓ accepted / census active, ✗ rejected / census inactive);
 View ▸ Hide rejected / inactive ROIs hides the rejected ones without
 dropping them.  Select components in the table, the cell viewer or the correlation /
-distance matrices; each selected component keeps one colour in the table,
+distance matrices (Ctrl+click a cell selects that pair); each selected component keeps one colour in the table,
 the footprint overlay and the traces.  The trace dropdown switches between
 denoised C, ΔF/F, C+residual and deconvolved S (display only); the BG
 dropdown and View ▸ Load background image… choose the image behind the
@@ -3516,7 +3504,7 @@ footprints.</p>
 <b>Delete</b> change the components; <b>Hide / show</b> (V) only affects
 the display; <b>Include / exclude</b> (I) is the non-destructive curation flag
 (excluded footprints are red; “Hide excluded” hides them).  Undo / redo keep
-the last steps.  <b>Save</b> writes <code>&lt;name&gt;_curated.hdf5</code> next to
+the last 5 merges, deletes or ROI-filter runs.  <b>Save</b> writes <code>&lt;name&gt;_curated.hdf5</code> next to
 the original, with events, include flags and ROI-filter fields.</p>
 
 <h3>Events</h3>
