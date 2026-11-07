@@ -270,14 +270,17 @@ class ComponentStore:
         residual in the file): every event then passes by construction."""
         if self.kinetics_source == "raw" or self.dff is None:
             return False
-        r = self._cached("dff_C_r", lambda: _ek().dff_tracks_C(self.dff, self.C))
-        return bool(r > 0.99)
+        r = self._cached("dff_C_rows", lambda: _ek().row_corr(self.dff, self.C))
+        r = r[np.isfinite(r)]
+        return bool(r.size and np.median(r) > _ek().CIRCULAR_R)
 
     @property
     def kinetics_summary(self):
         """(K,) arrays of event_kinetics.SUMMARY_FIELDS, or None."""
         rows = self.kinetics
-        return None if rows is None else _ek().summary_table(rows)
+        if rows is None:
+            return None
+        return self._cached("kin_summary", lambda: _ek().summary_table(rows))
 
     def set_kinetics_params(self, params) -> bool:
         """Adopt new kinetics criteria; True if they changed (cache dropped)."""
@@ -286,6 +289,7 @@ class ComponentStore:
             return False
         self.kinetics_params = params
         self._derived.pop("kinetics", None)
+        self._derived.pop("kin_summary", None)
         return True
 
     def _kinetics_row(self, i):
@@ -527,6 +531,17 @@ class ComponentStore:
             if merged:
                 ks.append(self._kinetics_row(self.n - 1))
             new["kinetics"] = ks
+            if old.get("kin_summary") is not None:     # one new summary row
+                summ = {f: v[keep] for f, v in old["kin_summary"].items()}
+                if merged:
+                    one = _ek().summary_table(ks[-1:])
+                    summ = {f: np.concatenate([summ[f], one[f]]) for f in summ}
+                new["kin_summary"] = summ
+        if old.get("dff_C_rows") is not None and self.dff is not None:
+            r = old["dff_C_rows"][keep]
+            if merged:
+                r = np.append(r, _ek().row_corr(self.dff[-1:], self.C[-1:]))
+            new["dff_C_rows"] = r
         for key, fn in (("centroids", _centroids),
                         ("peaks", lambda A, d: A.max(axis=0).toarray().ravel())):
             if old.get(key) is not None:
@@ -655,6 +670,7 @@ class ComponentStore:
                 _ek().apply_approval(res, self.kinetics_trace, kinetics)
         self._push_undo("detect events")
         self._derived.pop("kinetics", None)
+        self._derived.pop("kin_summary", None)
         self.events = res
         self.approved = self.events.auto_approved.copy()
         self.fr, self.decay_time = float(fr), float(decay_time)
@@ -699,6 +715,7 @@ class ComponentStore:
         results don't fit this file (row count mismatch)."""
         oi = self.orig_idx
         self._derived.pop("kinetics", None)
+        self._derived.pop("kin_summary", None)
         if res.n == self.n and np.array_equal(oi, np.arange(self.n)):
             self.events, self.approved = res, np.asarray(approved, bool).copy()
         elif oi.size and oi.max() < res.n:

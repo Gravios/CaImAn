@@ -91,18 +91,23 @@ def raw_dff(C, YrA, F_dff) -> np.ndarray:
     return out
 
 
-def dff_tracks_C(F_dff, C, r_min: float = 0.99) -> float:
-    """Median over rows of corr(ΔF/F, C), or NaN.  Above ``r_min`` the ΔF/F
-    is (nearly) C rescaled — computed without the residual — and a kinetic
-    check on it is circular (C has the model's kinetics by construction)."""
+def row_corr(F_dff, C) -> np.ndarray:
+    """(K,) corr(ΔF/Fᵢ, Cᵢ) per row; NaN for a flat row."""
     F = np.asarray(F_dff, dtype=np.float64)
     Cc = np.asarray(C, dtype=np.float64)
     F = F - F.mean(1, keepdims=True); Cc = Cc - Cc.mean(1, keepdims=True)
     den = np.sqrt((F * F).sum(1) * (Cc * Cc).sum(1))
-    ok = den > 0
-    if not ok.any():
-        return float("nan")
-    return float(np.median((F * Cc).sum(1)[ok] / den[ok]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, (F * Cc).sum(1) / den, np.nan)
+
+
+def dff_tracks_C(F_dff, C, r_min: float = 0.99) -> float:
+    """Median over rows of corr(ΔF/F, C), or NaN.  Above ``r_min`` the ΔF/F
+    is (nearly) C rescaled — computed without the residual — and a kinetic
+    check on it is circular (C has the model's kinetics by construction)."""
+    r = row_corr(F_dff, C)
+    r = r[np.isfinite(r)]
+    return float(np.median(r)) if r.size else float("nan")
 
 
 def resolve_params(cfg: Optional[dict] = None) -> dict:

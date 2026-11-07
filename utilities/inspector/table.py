@@ -373,7 +373,8 @@ class ComponentTable(QTableWidget):
             if h in tips:
                 self.horizontalHeaderItem(c).setToolTip(tips[h])
         self.setRowCount(s.n)
-        dark = _ui_color("cell_bg")
+        self.setUpdatesEnabled(False)          # one repaint after the fill
+        dark = QBrush(_ui_color("cell_bg"))     # shared by every cell
         kin = s.kinetics_summary if self._show_kin() else None
         for i in range(s.n):
             vals = [(s.labels[i], _label_key(s.labels[i])),
@@ -404,9 +405,10 @@ class ComponentTable(QTableWidget):
                 item.setData(_COMP_ROLE, i)
                 item.setData(_SORT_ROLE, key)
                 item.setData(_MISS_ROLE, _is_missing(key))
-                item.setBackground(QBrush(dark))
+                item.setBackground(dark)
                 self.setItem(i, c, item)
         self.blockSignals(False)
+        self.setUpdatesEnabled(True)
         self._reindex()
         sort_col = cols.index(sort_name) if sort_name in cols else -1
         hdr.setSortIndicator(sort_col, sort_ord)

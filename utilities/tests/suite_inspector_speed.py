@@ -167,6 +167,21 @@ try:
     check(s, A[:, [j for j in range(K) if j not in (0, 17)]], C[[j for j in range(K) if j not in (0, 17)]], "redo")
     ok("delete / merge update corr, centroids, peaks incrementally; undo / redo restore them exactly")
 
+    # kinetics summary and the per-row ΔF/F ~ C check: carried, equal to recomputing
+    from caiman.utils import event_kinetics as ek
+    s2 = insp.ComponentStore(A, C, np.zeros(dims), dims, fr=30.0, decay_time=0.4,
+                             traces={insp.TRACE_DENOISED: C, insp.TRACE_DFF: C * 0.5 + 0.01})
+    s2.detect_events(30.0, 0.4)
+    _ = s2.kinetics_summary, s2.kinetics_circular
+    s2.delete([1, 4]); s2.merge([0, 2, 9])
+    assert "kin_summary" in s2._derived and "dff_C_rows" in s2._derived
+    fresh = ek.summary_table(ek.validate(s2.kinetics_trace, s2.events, s2.kinetics_params))
+    for f, v in fresh.items():
+        assert np.array_equal(np.isnan(v.astype(float)), np.isnan(s2.kinetics_summary[f].astype(float))), f
+        assert np.allclose(v.astype(float), s2.kinetics_summary[f].astype(float), equal_nan=True), f
+    assert np.allclose(s2._derived["dff_C_rows"], ek.row_corr(s2.dff, s2.C), equal_nan=True)
+    ok("kinetics summary and ΔF/F ~ C rows carried through delete / merge, equal to recomputing")
+
     # undo snapshot shares arrays
     snap = s._capture()
     assert snap["A"] is s._A and snap["traces"][insp.TRACE_DENOISED] is s.C

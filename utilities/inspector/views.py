@@ -571,6 +571,14 @@ class MovieBar(QWidget):
 
 # ── Trace viewer ──────────────────────────────────────────────────────────────
 
+def _long_curve(item):
+    """Draw a full-length trace only at screen resolution: peak-preserving
+    downsampling (transients stay visible) and clipping to the view."""
+    item.setDownsampling(auto=True, method="peak")
+    item.setClipToView(True)
+    return item
+
+
 class TraceViewer(pg.PlotWidget):
     """Bottom-left — stacked normalised traces for selected components.
     While a movie plays, a yellow frame cursor marks the shown frame; drag
@@ -673,9 +681,9 @@ class TraceViewer(pg.PlotWidget):
                 trace = s.disp_trace(i)
                 span  = trace.max() - trace.min()
                 tr    = (trace - trace.min()) / (span + 1e-9)
-                self.plot(t, (tr + offset).astype(np.float32),
-                          pen=pg.mkPen(color, width=1),
-                          name=s.labels[i])
+                _long_curve(self.plot(t, (tr + offset).astype(np.float32),
+                                      pen=pg.mkPen(color, width=1),
+                                      name=s.labels[i]))
                 pk = self._marker_frames(i)
                 if pk.size:                         # one item per component
                     xs = np.repeat(pk, 2)
@@ -759,10 +767,10 @@ class EventViewer(pg.PlotWidget):
         ev = s.events
         t  = np.arange(ev.binary.shape[1], dtype=np.float32)
         if s.dff is not None:
-            self.plot(t, s.dff[i], pen=pg.mkPen(PT["dff"], width=1))
+            _long_curve(self.plot(t, s.dff[i], pen=pg.mkPen(PT["dff"], width=1)))
         self.plot(t, ev.binary[i], pen=pg.mkPen(PT["binary"], width=1),
                   fillLevel=0, brush=pg.mkBrush(*PT["binary_fill"]))
-        self.plot(t, ev.filtered[i], pen=pg.mkPen(PT["filtered"], width=1.2))
+        _long_curve(self.plot(t, ev.filtered[i], pen=pg.mkPen(PT["filtered"], width=1.2)))
         thr = float(ev.thresholds[i])
         if thr > 0:
             self.addItem(pg.InfiniteLine(
