@@ -31,6 +31,9 @@ Controls
                    recomputes them, e.g. for sessions processed before the
                    pipeline step existed; thresholds live in Edit ▸
                    Preferences… (Ctrl+,), ~/.config/caiman/inspector_prefs.json
+    P / H        — Preferences (theme, plot background, font size, ROI-filter
+                   thresholds) / Help with every shortcut and a usage guide
+                   (also Ctrl+, and F1).
     Layout       — window and pane sizes, hidden columns, sort, view toggles,
                    background / trace choice and the last folder are
                    remembered in the same file (View ▸ Reset layout).
@@ -89,6 +92,7 @@ from PyQt6.QtWidgets import (
     QInputDialog, QProgressDialog,
     QWidget, QHBoxLayout, QVBoxLayout, QSlider, QSpinBox, QToolButton,
     QCheckBox, QGroupBox, QPushButton, QScrollArea, QTabWidget, QMenu,
+    QTextBrowser, QToolBar,
 )
 from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer, QByteArray
 from PyQt6.QtGui   import (
@@ -913,8 +917,22 @@ _RF_PREF_FIELDS = (
      "Off: activity is reported separately and silent cells can pass."),
 )
 
+_APPEARANCE_PREF_FIELDS = (
+    ("Theme", "theme", "Theme", "choice",
+     [("system", "System (follow the desktop)"), ("dark", "Dark"), ("light", "Light")], None,
+     "Colours of windows, menus, the table and dialogs."),
+    ("Theme", "plot_background", "Plot background", "choice",
+     [("auto", "Follow theme"), ("dark", "Dark"), ("light", "Light")], None,
+     "Cell viewer, traces, events and matrices.  Dark plots keep the bright "
+     "selection colours; light plots use a darker palette."),
+    ("Theme", "font_size", "Font size (pt)", "int", (6, 32, 1, 0), "default",
+     "Base font size of the whole inspector."),
+)
+
 # section key → (tab title, field specs, defaults loader)
 PREF_SECTIONS = {
+    "appearance": ("Appearance", _APPEARANCE_PREF_FIELDS,
+                   lambda: dict(APPEARANCE_DEFAULTS)),
     "roi_filter": ("ROI filter", _RF_PREF_FIELDS, lambda: roi_filter_prefs({})),
 }
 
@@ -1711,7 +1729,7 @@ class CellViewer(pg.GraphicsLayoutWidget):
         self._movie_img    = None     # current movie frame (float32, dims) or None
         self._movie_levels = None
 
-        self.setBackground(BG_DARK)
+        self.setBackground(PT["bg"])
 
         # ViewBox: aspect locked, Y not inverted → row 0 at bottom (origin='lower')
         self.vb = self.addViewBox(row=0, col=0)
@@ -1785,6 +1803,10 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
     def refresh_background(self):
         """Redraw after the store's active background image has changed."""
+        self._redraw()
+
+    def apply_theme(self):
+        self.setBackground(PT["bg"])
         self._redraw()
 
     def set_movie_frame(self, img, levels):
@@ -2029,7 +2051,7 @@ class MovieBar(QWidget):
         self.slider.valueChanged.connect(self.seek)
         self.lbl = QLabel(self)
         self.lbl.setMinimumWidth(96)
-        self.lbl.setStyleSheet("color: #aaaaaa; font-family: monospace;")
+        self.lbl.setStyleSheet(f"color: {UI['muted']}; font-family: monospace;")
         self.fps = QSpinBox(self)
         self.fps.setRange(1, 1000)
         self.fps.setSuffix(" fps")
@@ -2243,23 +2265,35 @@ class TraceViewer(pg.PlotWidget):
     cursor_dragged = pyqtSignal(int)
 
     def __init__(self, store: 'ComponentStore', parent=None):
-        super().__init__(parent, background=BG_DARK)
+        super().__init__(parent, background=PT["bg"])
         self.store = store
         self._sel  = []
         self._cursor_frame = None
-        self._cursor = pg.InfiniteLine(
-            angle=90, movable=True,
-            pen=pg.mkPen('#ffd23f', width=1.5),
-            hoverPen=pg.mkPen('#ffe680', width=3))
+        self._cursor = pg.InfiniteLine(angle=90, movable=True)
         self._cursor.setZValue(10)
         self._cursor.sigDragged.connect(
             lambda line: self.cursor_dragged.emit(int(round(line.value()))))
-        self.getAxis('bottom').setLabel('Frame', color='#888888')
-        self.getAxis('bottom').setTextPen(pg.mkPen('#888888'))
         self.getAxis('left').hide()
-        self._legend = self.addLegend(labelTextColor='white',
-                                      brush=pg.mkBrush(BG_DARK + 'cc'),
-                                      pen=pg.mkPen('#333333'))
+        self._style()
+        self._legend = self._add_legend()
+        self._redraw()
+
+    def _style(self):
+        self.setBackground(PT["bg"])
+        self._cursor.setPen(pg.mkPen(PT["cursor"], width=1.5))
+        self._cursor.setHoverPen(pg.mkPen(PT["cursor_hover"], width=3))
+        ax = self.getAxis('bottom')
+        ax.setLabel('Frame', color=PT["fg"])
+        ax.setTextPen(pg.mkPen(PT["fg"]))
+        ax.setPen(pg.mkPen(PT["fg"]))
+
+    def _add_legend(self):
+        return self.addLegend(labelTextColor=PT["legend_text"],
+                              brush=pg.mkBrush(PT["legend_bg"]),
+                              pen=pg.mkPen(PT["legend_pen"]))
+
+    def apply_theme(self):
+        self._style()
         self._redraw()
 
     def set_selection(self, sel):
@@ -2284,12 +2318,10 @@ class TraceViewer(pg.PlotWidget):
 
     def _redraw(self):
         self.clear()
-        self._legend = self.addLegend(labelTextColor='white',
-                                      brush=pg.mkBrush(BG_DARK + 'cc'),
-                                      pen=pg.mkPen('#333333'))
+        self._legend = self._add_legend()
         s = self.store
         if not self._sel:
-            ti = pg.TextItem("Select component(s)", color='#555555',
+            ti = pg.TextItem("Select component(s)", color=PT["placeholder"],
                              anchor=(0.5, 0.5))
             self.addItem(ti)
             self.getViewBox().setRange(xRange=(0, 1), yRange=(0, 1))
@@ -2314,7 +2346,7 @@ class TraceViewer(pg.PlotWidget):
                 self.set_cursor(self._cursor_frame)
         except Exception as exc:
             self.clear()
-            ti = pg.TextItem(f"Draw error: {exc}", color='#ff4444',
+            ti = pg.TextItem(f"Draw error: {exc}", color=PT["error"],
                              anchor=(0.5, 0.5))
             self.addItem(ti)
 
@@ -2328,14 +2360,23 @@ class EventViewer(pg.PlotWidget):
     onset→peak plateaus (filled white) and detected peaks (red lines)."""
 
     def __init__(self, store: 'ComponentStore', parent=None):
-        super().__init__(parent, background=BG_DARK)
+        super().__init__(parent, background=PT["bg"])
         self.store = store
         self._sel  = []
-        self.getAxis('bottom').setTextPen(pg.mkPen('#888888'))
-        self.getAxis('left').setTextPen(pg.mkPen('#888888'))
-        self.getAxis('left').setLabel('ΔF/F', color='#888888')
         self.getAxis('left').enableAutoSIPrefix(False)   # no "(x0.001)"
         self.setMouseEnabled(x=True, y=False)
+        self._style()
+        self._redraw()
+
+    def _style(self):
+        self.setBackground(PT["bg"])
+        for side in ('bottom', 'left'):
+            self.getAxis(side).setTextPen(pg.mkPen(PT["fg"]))
+            self.getAxis(side).setPen(pg.mkPen(PT["fg"]))
+        self.getAxis('left').setLabel('ΔF/F', color=PT["fg"])
+
+    def apply_theme(self):
+        self._style()
         self._redraw()
 
     def set_selection(self, sel):
@@ -2348,7 +2389,7 @@ class EventViewer(pg.PlotWidget):
     def _message(self, text):
         # Title only: this plot is x-linked to the trace viewer, so changing
         # the range here would squash the traces.
-        self.setTitle(f"<span style='color:#666666;font-size:9pt'>{text}</span>")
+        self.setTitle(f"<span style='color:{PT['placeholder']};font-size:9pt'>{text}</span>")
 
     def _redraw(self):
         self.clear()
@@ -2366,22 +2407,22 @@ class EventViewer(pg.PlotWidget):
         ev = s.events
         t  = np.arange(ev.binary.shape[1], dtype=np.float32)
         if s.dff is not None:
-            self.plot(t, s.dff[i], pen=pg.mkPen('#666666', width=1))
-        self.plot(t, ev.binary[i], pen=pg.mkPen('#dddddd', width=1),
-                  fillLevel=0, brush=pg.mkBrush(255, 255, 255, 70))
-        self.plot(t, ev.filtered[i], pen=pg.mkPen('#44dd66', width=1.2))
+            self.plot(t, s.dff[i], pen=pg.mkPen(PT["dff"], width=1))
+        self.plot(t, ev.binary[i], pen=pg.mkPen(PT["binary"], width=1),
+                  fillLevel=0, brush=pg.mkBrush(*PT["binary_fill"]))
+        self.plot(t, ev.filtered[i], pen=pg.mkPen(PT["filtered"], width=1.2))
         thr = float(ev.thresholds[i])
         if thr > 0:
             self.addItem(pg.InfiniteLine(
                 pos=thr, angle=0,
-                pen=pg.mkPen('#ccaa00', width=1, style=Qt.PenStyle.DashLine)))
+                pen=pg.mkPen(PT["threshold"], width=1, style=Qt.PenStyle.DashLine)))
         for pk in ev.peaks[i][:, 0]:
             self.addItem(pg.InfiniteLine(pos=float(pk), angle=90,
-                                         pen=pg.mkPen('#ff4444', width=1)))
+                                         pen=pg.mkPen(PT["peak"], width=1)))
         flag = "✓ included" if s.approved[i] else "✗ excluded"
         auto = "auto ✓" if ev.auto_approved[i] else "auto ✗"
         self.setTitle(
-            f"<span style='color:#bbbbbb;font-size:9pt'>{s.labels[i]} — "
+            f"<span style='color:{PT['title']};font-size:9pt'>{s.labels[i]} — "
             f"{ev.n_events(i)} events ({ev.frequencies[i]:.2f}/min), "
             f"thr {thr:.3f} — {flag} ({auto})</span>")
         self.setXRange(0, len(t), padding=0)
@@ -2407,7 +2448,7 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self._highlight = None
         self._hl_items: list = []
 
-        self.setBackground(BG_DARK)
+        self.setBackground(PT["bg"])
 
         # Column 0: matrix ViewBox (no mouse zoom/pan — leave for table/corr UX)
         self.vb = self.addViewBox(row=0, col=0)
@@ -2431,6 +2472,9 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
 
         # Click
         self.vb.scene().sigMouseClicked.connect(self._on_scene_click)
+
+    def apply_theme(self):
+        self.setBackground(PT["bg"])
 
     def refresh(self):
         self._highlight = None
@@ -2856,7 +2900,7 @@ class ComponentTable(QTableWidget):
         Blocking table signals here was causing itemSelectionChanged to be
         re-emitted after blockSignals(False) in PyQt6, overwriting _sel.
         """
-        dark = QColor(30, 30, 30)
+        dark = _ui_color("cell_bg")
         slot = {c: k for k, c in enumerate(sel)}
         for comp in range(self.store.n):
             if comp in slot:
@@ -2872,7 +2916,7 @@ class ComponentTable(QTableWidget):
         """Orange / magenta tint for a corr-clicked pair (store indices).
         Note: no blockSignals — see tint_selection for rationale.
         """
-        dark = QColor(30, 30, 30)
+        dark = _ui_color("cell_bg")
         for comp in range(self.store.n):
             if   comp == i: bg = QColor(255, 140,   0, 80)
             elif comp == j: bg = QColor(255,   0, 255, 80)
@@ -2917,7 +2961,7 @@ class ComponentTable(QTableWidget):
             if h in tips:
                 self.horizontalHeaderItem(c).setToolTip(tips[h])
         self.setRowCount(s.n)
-        dark = QColor(30, 30, 30)
+        dark = _ui_color("cell_bg")
         for i in range(s.n):
             vals = [(s.labels[i], _label_key(s.labels[i])),
                     (f"{s.max_a(i):.3f}", _num_key(s.max_a(i))),
@@ -2965,9 +3009,9 @@ class ComponentTable(QTableWidget):
     def mark_hidden(self):
         """Dim hidden rows; tint excluded rows red (once events exist) and
         keep the Incl column (text and sort key) in sync with the store."""
-        grey   = QColor(105, 105, 105)
-        normal = QColor(220, 220, 220)
-        excl   = QColor(255, 110, 110)
+        grey   = _ui_color("cell_dim")
+        normal = _ui_color("cell_fg")
+        excl   = _ui_color("cell_excl")
         s      = self.store
         has_ev = s.has_approval and self.columnCount() and \
             self.horizontalHeaderItem(self.columnCount() - 1).text() == "Incl"
@@ -3037,6 +3081,11 @@ class _PrefField(QWidget):
         if kind == "bool":
             self.box = QCheckBox(self)
             lay.addWidget(self.box)
+        elif kind == "choice":                 # rng = [(value, label), …]
+            self.combo = QComboBox(self)
+            for val, label in rng:
+                self.combo.addItem(label, val)
+            lay.addWidget(self.combo)
         elif kind == "tristate":
             self.combo = QComboBox(self)
             first = null_text + (f" ({_fmt_num(hint)})" if hint is not None else "")
@@ -3058,19 +3107,18 @@ class _PrefField(QWidget):
                 self.chk = QCheckBox(self)
                 self.chk.setToolTip(f"Unchecked: {null_text}")
                 self.hint = QLabel(null_text + (f": {_fmt_num(hint)}" if hint is not None else ""), self)
-                self.hint.setStyleSheet("color: #888888;")
+                self.hint.setStyleSheet(f"color: {UI['hint']};")
                 self.chk.toggled.connect(self._sync)
                 lay.addWidget(self.chk)
             lay.addWidget(self.spin)
             if self.hint is not None:
                 lay.addWidget(self.hint)
-            if hint is not None and not isinstance(hint, (list, tuple, bool)):
-                try:
-                    self.spin.setValue(float(hint))
+            h = hint[0] if isinstance(hint, (list, tuple)) and hint else hint
+            if h is not None and not isinstance(h, bool):
+                try:                            # QSpinBox needs an int
+                    self.spin.setValue(int(round(float(h))) if kind == "int" else float(h))
                 except (TypeError, ValueError):
                     pass
-            elif isinstance(hint, (list, tuple)) and hint:
-                self.spin.setValue(float(hint[0]))
         lay.addStretch(1)
 
     def _sync(self):
@@ -3081,6 +3129,8 @@ class _PrefField(QWidget):
     def value(self):
         if self.box is not None:
             return bool(self.box.isChecked())
+        if self.combo is not None and self.kind == "choice":
+            return self.combo.currentData()
         if self.combo is not None:
             return {0: None, 1: True, 2: False}[self.combo.currentIndex()]
         if self.chk is not None and not self.chk.isChecked():
@@ -3091,6 +3141,10 @@ class _PrefField(QWidget):
     def set_value(self, v):
         if self.box is not None:
             self.box.setChecked(bool(v))
+            return
+        if self.combo is not None and self.kind == "choice":
+            i = self.combo.findData(v)
+            self.combo.setCurrentIndex(i if i >= 0 else 0)
             return
         if self.combo is not None:
             self.combo.setCurrentIndex(0 if v is None else 1 if v else 2)
@@ -3128,7 +3182,8 @@ class PreferencesDialog(QDialog):
                     gb = QGroupBox(grp, page)
                     forms[grp] = QFormLayout(gb)
                     v.addWidget(gb)
-                hint = (run_hints or {}).get(key) if null_text == "from run" else None
+                hint = ((run_hints or {}).get(key) if null_text == "from run" else
+                        _default_font_pt() if key == "font_size" else None)
                 w = _PrefField(kind, rng, null_text, hint, page)
                 lbl = QLabel(label, page)
                 if tip:
@@ -3164,7 +3219,7 @@ class PreferencesDialog(QDialog):
                 self.tabs.setCurrentIndex(self.tabs.count() - 1)
 
         where = QLabel(f"Saved to {prefs_path()}", self)
-        where.setStyleSheet("color: #888888;")
+        where.setStyleSheet(f"color: {UI['hint']};")
         where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel, self)
@@ -3242,7 +3297,7 @@ class RunFilterDialog(QDialog):
         lay.addWidget(self.summary)
         self.warn = QLabel(self)
         self.warn.setWordWrap(True)
-        self.warn.setStyleSheet("color: #e0a030;")
+        self.warn.setStyleSheet(f"color: {UI['warn']};")
         lay.addWidget(self.warn)
         self.chk_incl = QCheckBox("Set Incl from the new QC verdict", self)
         self.chk_incl.setChecked(not store.has_approval)
@@ -3315,6 +3370,174 @@ class RunFilterDialog(QDialog):
         self.warn.setVisible(bool(warns))
 
 
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+def _clean_action_text(text: str) -> str:
+    t = text.replace("&&", "\0").replace("&", "").replace("\0", "&")
+    return re.sub(r"^[^\w(]+", "", t).strip()
+
+
+# Descriptions for actions whose tooltip is only their name or changes at
+# run time (undo / redo show the pending step).
+_HELP_DESCRIPTIONS = {
+    "Open…":    "Open a results file, stack or session folder",
+    "Save":     "Write <name>_curated.hdf5 next to the source file",
+    "Save As…": "Save the curated results under another name",
+    "Quit":     "Close the inspector (layout is remembered)",
+    "Refresh":  "Rebuild the table and redraw every view",
+    "Undo":     "Undo the last merge, delete or ROI-filter run",
+    "Redo":     "Redo the last undone step",
+}
+
+# Context-dependent input that is not a menu action:  (where, keys, what)
+_HELP_EXTRA_KEYS = (
+    ("Cell viewer", "Click", "Select the component under the cursor"),
+    ("Cell viewer", "Ctrl+Click", "Add / remove it from the selection"),
+    ("Cell viewer", "Wheel · drag", "Zoom · pan (right-click → View all)"),
+    ("Cell viewer", "Shift+Wheel", "Step movie frames (while a movie is shown)"),
+    ("Movie", "Space", "Play / pause"),
+    ("Movie", "← / →", "Previous / next frame"),
+    ("Movie", "Shift+← / Shift+→", "10 frames back / forward"),
+    ("Movie", "Home / End", "First / last frame"),
+    ("Table", "Click · Ctrl/Shift+Click", "Select · extend the selection"),
+    ("Table", "Click a header", "Sort by that column (again: reverse)"),
+    ("Table", "Right-click a header", "Show / hide columns"),
+    ("Matrices", "Click a cell", "Select that pair (orange / magenta)"),
+    ("Trace view", "Drag the yellow line", "Seek the movie to that frame"),
+)
+
+_HELP_USAGE = """
+<h3>Opening</h3>
+<p>Run <code>caiman-inspector</code> in a session folder (it opens
+<code>&lt;dir&gt;_results.hdf5</code> and the movie <code>&lt;dir&gt;.tif</code>), or pass a
+results file, stack or folder; <code>--demo</code> opens synthetic data.
+File ▸ Open… starts in the last folder used.</p>
+
+<h3>Reviewing</h3>
+<p>Select components in the table, the cell viewer or the correlation /
+distance matrices; each selected component keeps one colour in the table,
+the footprint overlay and the traces.  The trace dropdown switches between
+denoised C, ΔF/F, C+residual and deconvolved S (display only); the BG
+dropdown and View ▸ Load background image… choose the image behind the
+footprints.</p>
+
+<h3>Curating</h3>
+<p><b>Merge</b> (≥ 2 selected: footprint = pixel max, trace = mean) and
+<b>Delete</b> change the components; <b>Hide / show</b> (V) only affects
+the display; <b>Include / exclude</b> (I) is the non-destructive curation flag
+(excluded footprints are red; “Hide excluded” hides them).  Undo / redo keep
+the last steps.  <b>Save</b> writes <code>&lt;name&gt;_curated.hdf5</code> next to
+the original, with events, include flags and ROI-filter fields.</p>
+
+<h3>Events</h3>
+<p>Analysis ▸ Detect events… runs SLab peak detection on ΔF/F (include flags
+become the automatic approval); the event panel shows filtered ΔF/F,
+threshold, peaks and binary trace.  Export event stats writes PeakStats and
+ROIStats for the included components; Batch detect and Blinded review work
+on a whole folder.</p>
+
+<h3>ROI filter</h3>
+<p>Results processed by the pipeline carry a <code>roi_filter</code> group
+(footprint shape, edge distance, CaImAn quality, activity); its fields
+appear as table columns and Incl starts from the QC verdict.  Analysis ▸
+Run ROI filter… adds or recomputes them (e.g. for older sessions) with the
+thresholds in Preferences; hover a Fail cell for the full reasons.</p>
+
+<h3>Movie</h3>
+<p>The bar under the cell viewer plays the raw stack behind the footprints
+(fps defaults to the recording rate; “avg N” shows a running mean).  It is
+found next to the results, or opened with View ▸ Open movie….  Picking a BG
+image returns to the static background.</p>
+
+<h3>Preferences &amp; layout</h3>
+<p>Edit ▸ Preferences… (P) sets the theme, plot background, font size and
+ROI-filter thresholds.  Window and pane sizes, hidden columns, sort, view
+toggles, background / trace choice and the last folder are remembered;
+View ▸ Reset layout restores the defaults.  Everything is stored in
+<code>{prefs}</code>.</p>
+"""
+
+
+class HelpDialog(QDialog):
+    """Help ▸ Shortcuts & usage (H / F1).  The shortcut table is built from
+    the window's actual actions, so it always matches the menus."""
+
+    def __init__(self, window: 'QMainWindow'):
+        super().__init__(window)
+        self.setWindowTitle("Inspector help — shortcuts & usage")
+        self.resize(760, 820)
+        self.browser = QTextBrowser(self)
+        self.browser.setOpenExternalLinks(False)
+        self.browser.setHtml(self.build_html(window))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.browser, 1)
+        lay.addWidget(bb)
+
+    @staticmethod
+    def action_rows(window) -> list:
+        """(menu path, keys, tooltip) for every action with a shortcut."""
+        rows, seen = [], set()
+
+        def keys(a):
+            return "  /  ".join(k.toString(QKeySequence.SequenceFormat.NativeText)
+                                for k in a.shortcuts() if not k.isEmpty())
+
+        def desc(a):
+            name = _clean_action_text(a.text())
+            if name in _HELP_DESCRIPTIONS:
+                return _HELP_DESCRIPTIONS[name]
+            tip = " ".join((a.toolTip() or "").split())
+            return "" if _clean_action_text(tip) == name else tip
+
+        def walk(menu, path):
+            for a in menu.actions():
+                if a.menu() is not None:
+                    walk(a.menu(), path + [_clean_action_text(a.menu().title())])
+                elif not a.isSeparator() and keys(a) and id(a) not in seen:
+                    seen.add(id(a))
+                    rows.append((" ▸ ".join(path + [_clean_action_text(a.text())]),
+                                 keys(a), desc(a)))
+        for top in window.menuBar().actions():
+            if top.menu() is not None:
+                walk(top.menu(), [_clean_action_text(top.menu().title())])
+        extra = list(window.actions())
+        for tb in window.findChildren(QToolBar):
+            extra += tb.actions()
+        for a in extra:
+            if not a.isSeparator() and keys(a) and id(a) not in seen:
+                seen.add(id(a))
+                rows.append(("Toolbar ▸ " + _clean_action_text(a.text()),
+                             keys(a), desc(a)))
+        return rows
+
+    @classmethod
+    def build_html(cls, window) -> str:
+        esc = lambda t: (str(t).replace("&", "&amp;").replace("<", "&lt;")
+                         .replace(">", "&gt;"))
+        th = f"style='text-align:left;padding:3px 10px;border-bottom:1px solid {UI['hint']}'"
+        td = "style='padding:2px 10px;vertical-align:top'"
+        kd = "style='padding:2px 10px;vertical-align:top;white-space:nowrap'"
+        out = ["<h2>Keyboard &amp; mouse</h2>",
+               f"<table cellspacing='0'><tr><th {th}>Keys</th><th {th}>Command</th>"
+               f"<th {th}>What it does</th></tr>"]
+        for path, k, tip in cls.action_rows(window):
+            out.append(f"<tr><td {kd}><b>{esc(k)}</b></td><td {td}>{esc(path)}</td>"
+                       f"<td {td}>{esc(tip)}</td></tr>")
+        out.append("</table>")
+        out.append(f"<h3>In context</h3><table cellspacing='0'><tr><th {th}>Where</th>"
+                   f"<th {th}>Input</th><th {th}>What it does</th></tr>")
+        for where, k, what in _HELP_EXTRA_KEYS:
+            out.append(f"<tr><td {td}>{esc(where)}</td><td {kd}><b>{esc(k)}</b></td>"
+                       f"<td {td}>{esc(what)}</td></tr>")
+        out.append("</table>")
+        out.append("<p>Single-letter keys (V, I, P, H) work anywhere in the window "
+                   "except while typing in a text field.</p>")
+        out.append(_HELP_USAGE.replace("{prefs}", esc(prefs_path())))
+        return "\n".join(out)
+
+
 class InspectorWindow(QMainWindow):
 
     def __init__(self, store: ComponentStore):
@@ -3330,7 +3553,7 @@ class InspectorWindow(QMainWindow):
         if store.fpath:
             self._ui["last_dir"] = _os_dirname(store.fpath)
 
-        _apply_dark_palette()
+        set_theme()                            # saved appearance (before any widget)
         self._build_menu()
         self._build_toolbar()
         self._build_central()
@@ -3409,10 +3632,10 @@ class InspectorWindow(QMainWindow):
         self.act_redo.triggered.connect(self._do_redo)
         em.addAction(self.act_redo)
         em.addSeparator()
-        a = QAction("&Preferences…", self)
-        a.setShortcut(QKeySequence("Ctrl+,"))
+        self.act_prefs = a = QAction("&Preferences…", self)
+        a.setShortcuts([QKeySequence("P"), QKeySequence("Ctrl+,")])
         a.setMenuRole(QAction.MenuRole.PreferencesRole)
-        a.setToolTip("ROI-filter thresholds and other inspector settings")
+        a.setToolTip("Theme, ROI-filter thresholds and other inspector settings")
         a.triggered.connect(lambda: self._edit_prefs())
         em.addAction(a)
 
@@ -3457,6 +3680,21 @@ class InspectorWindow(QMainWindow):
         self.act_blind_end.setEnabled(False)
         self.act_blind_end.triggered.connect(self._end_blinded)
         am.addAction(self.act_blind_end)
+
+        hm = mb.addMenu("&Help")
+        self.act_help = a = QAction("&Shortcuts && usage…", self)
+        a.setShortcuts([QKeySequence("H"), QKeySequence("F1")])
+        a.setToolTip("Keyboard / mouse shortcuts and how to use the inspector")
+        a.triggered.connect(self._show_help)
+        hm.addAction(a)
+        a = QAction("&About", self)
+        a.setMenuRole(QAction.MenuRole.AboutRole)
+        a.triggered.connect(lambda: QMessageBox.about(
+            self, "About CaImAn Component Inspector",
+            "<b>CaImAn Component Inspector</b><br>Review, curate and evaluate "
+            "CNMF components (Qt6 / PyQt6).<br><br>Preferences and layout: "
+            f"<code>{prefs_path()}</code>"))
+        hm.addAction(a)
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
 
@@ -3528,7 +3766,7 @@ class InspectorWindow(QMainWindow):
         tb.addSeparator()
 
         self._sel_lbl = QLabel("  0 selected  |  0 total")
-        self._sel_lbl.setStyleSheet("color: #aaaaaa; font-size: 9pt;")
+        self._sel_lbl.setStyleSheet(f"color: {UI['muted']}; font-size: 9pt;")
         tb.addWidget(self._sel_lbl)
 
         tb.addSeparator()
@@ -3951,8 +4189,27 @@ class InspectorWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Preferences", f"Could not save:\n{exc}")
             return False
+        self.apply_theme()
         self.statusBar().showMessage(f"Preferences saved to {path}", 6000)
         return True
+
+    def apply_theme(self, appearance: dict = None) -> None:
+        """Activate the (saved) appearance and re-style every live view."""
+        before = (dict(UI), dict(PT))
+        set_theme(appearance)
+        self.movie_bar.lbl.setStyleSheet(f"color: {UI['muted']}; font-family: monospace;")
+        self._sel_lbl.setStyleSheet(f"color: {UI['muted']}; font-size: 9pt;")
+        if before == (UI, PT):
+            return                             # colours unchanged (font only)
+        sel = self._selected_rows()
+        for v in (self.cell_view, self.trace_view, self.event_view,
+                  self.corr_view, self.dist_view):
+            v.apply_theme()
+        self._full_refresh()
+        self._reselect(sel)
+
+    def _show_help(self) -> None:
+        HelpDialog(self).exec()
 
     def _run_filter_dialog(self):
         if self._blind_block():
@@ -4498,28 +4755,153 @@ class InspectorWindow(QMainWindow):
 
 # ── Dark palette (module-level so it can be called before QMainWindow) ────────
 
-def _apply_dark_palette():
+# ── Themes ────────────────────────────────────────────────────────────────────
+# Two tables: UI (widgets, table cells, labels) and PT (plots).  They are
+# chosen separately so a light interface can keep dark plots.  Views read
+# UI / PT at draw time; InspectorWindow.apply_theme() re-styles live widgets.
+
+PALETTE_DARK_BG = list(PALETTE_HEX)          # bright: for dark plot backgrounds
+PALETTE_LIGHT_BG = [                          # saturated / darker: for white plots
+    "#D62728", "#E67E00", "#B8A000", "#2CA02C",
+    "#C000C0", "#E0559A", "#7B3FD0", "#4A5BD0",
+    "#C8452A", "#6B9A00", "#C2187A", "#D9822B",
+]
+
+UI_THEMES = {
+    "dark": dict(
+        window=(28, 28, 28), window_text=(210, 210, 210), base=(18, 18, 18),
+        alt_base=(32, 32, 32), text=(210, 210, 210), button=(45, 45, 45),
+        button_text=(210, 210, 210), highlight=(55, 95, 155),
+        highlight_text=(255, 255, 255), tooltip_base=(40, 40, 40),
+        tooltip_text=(210, 210, 210), placeholder=(120, 120, 120),
+        cell_bg=(30, 30, 30), cell_fg=(220, 220, 220), cell_dim=(105, 105, 105),
+        cell_excl=(255, 110, 110),
+        muted="#aaaaaa", hint="#888888", warn="#e0a030"),
+    "light": dict(
+        window=(239, 239, 239), window_text=(25, 25, 25), base=(255, 255, 255),
+        alt_base=(246, 246, 246), text=(25, 25, 25), button=(225, 225, 225),
+        button_text=(25, 25, 25), highlight=(48, 110, 200),
+        highlight_text=(255, 255, 255), tooltip_base=(255, 255, 225),
+        tooltip_text=(0, 0, 0), placeholder=(140, 140, 140),
+        cell_bg=(255, 255, 255), cell_fg=(25, 25, 25), cell_dim=(160, 160, 160),
+        cell_excl=(198, 40, 40),
+        muted="#555555", hint="#777777", warn="#a05a00"),
+}
+
+PLOT_THEMES = {
+    "dark": dict(
+        bg="#111111", fg="#888888", title="#bbbbbb", placeholder="#555555",
+        legend_text="#ffffff", legend_bg="#111111cc", legend_pen="#333333",
+        dff="#666666", binary="#dddddd", binary_fill=(255, 255, 255, 70),
+        filtered="#44dd66", threshold="#ccaa00", peak="#ff4444",
+        cursor="#ffd23f", cursor_hover="#ffe680", error="#ff4444",
+        palette=PALETTE_DARK_BG),
+    "light": dict(
+        bg="#ffffff", fg="#444444", title="#333333", placeholder="#999999",
+        legend_text="#000000", legend_bg="#ffffffcc", legend_pen="#bbbbbb",
+        dff="#9a9a9a", binary="#333333", binary_fill=(0, 0, 0, 45),
+        filtered="#1a8f3a", threshold="#a07800", peak="#d62728",
+        cursor="#d08a00", cursor_hover="#f0a000", error="#c62828",
+        palette=PALETTE_LIGHT_BG),
+}
+
+APPEARANCE_DEFAULTS = {"theme": "dark", "plot_background": "auto", "font_size": None}
+
+UI = dict(UI_THEMES["dark"])                 # active tables (mutated in place)
+PT = dict(PLOT_THEMES["dark"])
+_THEME_STATE = {"ui": "dark", "plot": "dark", "default_font_pt": None}
+
+
+def appearance_prefs(prefs: dict = None) -> dict:
+    d = dict(APPEARANCE_DEFAULTS)
+    sec = (load_prefs() if prefs is None else prefs).get("appearance", {})
+    for k, v in (sec if isinstance(sec, dict) else {}).items():
+        if k in d:
+            d[k] = v
+    return d
+
+
+def _system_scheme() -> str:
+    """'dark' or 'light' from the desktop (Qt colour scheme, else palette)."""
     app = QApplication.instance()
+    try:
+        cs = app.styleHints().colorScheme()
+        if cs == Qt.ColorScheme.Dark:
+            return "dark"
+        if cs == Qt.ColorScheme.Light:
+            return "light"
+    except Exception:
+        pass
+    try:
+        win = app.style().standardPalette().color(QPalette.ColorRole.Window)
+        return "dark" if win.lightness() < 128 else "light"
+    except Exception:
+        return "dark"
+
+
+def resolve_theme(appearance: dict) -> tuple:
+    """(ui scheme, plot scheme), each 'dark' or 'light'."""
+    ui = appearance.get("theme") or "dark"
+    if ui == "system" or ui not in UI_THEMES:
+        ui = _system_scheme() if ui == "system" else "dark"
+    plot = appearance.get("plot_background") or "auto"
+    if plot not in PLOT_THEMES:
+        plot = ui
+    return ui, plot
+
+
+def set_theme(appearance: dict = None) -> tuple:
+    """Activate a theme: app palette + font, UI / PT tables and the
+    selection palette.  Widgets already built are re-styled by
+    InspectorWindow.apply_theme()."""
+    app = QApplication.instance()
+    appearance = appearance_prefs() if appearance is None else appearance
+    ui, plot = resolve_theme(appearance)
+    UI.clear(); UI.update(UI_THEMES[ui])
+    PT.clear(); PT.update(PLOT_THEMES[plot])
+    PALETTE_HEX[:] = PT["palette"]
+    _THEME_STATE["ui"], _THEME_STATE["plot"] = ui, plot
     if app is None:
-        return
+        return ui, plot
     app.setStyle("Fusion")
-    p  = QPalette()
+    pal = QPalette()
     CR = QPalette.ColorRole
-    for role, rgb in [
-        (CR.Window,          (28,  28,  28)),
-        (CR.WindowText,      (210, 210, 210)),
-        (CR.Base,            (18,  18,  18)),
-        (CR.AlternateBase,   (32,  32,  32)),
-        (CR.Text,            (210, 210, 210)),
-        (CR.Button,          (45,  45,  45)),
-        (CR.ButtonText,      (210, 210, 210)),
-        (CR.Highlight,       (55,  95,  155)),
-        (CR.HighlightedText, (255, 255, 255)),
-        (CR.ToolTipBase,     (40,  40,  40)),
-        (CR.ToolTipText,     (210, 210, 210)),
-    ]:
-        p.setColor(role, QColor(*rgb))
-    app.setPalette(p)
+    for role, key in ((CR.Window, "window"), (CR.WindowText, "window_text"),
+                      (CR.Base, "base"), (CR.AlternateBase, "alt_base"),
+                      (CR.Text, "text"), (CR.Button, "button"),
+                      (CR.ButtonText, "button_text"), (CR.Highlight, "highlight"),
+                      (CR.HighlightedText, "highlight_text"),
+                      (CR.ToolTipBase, "tooltip_base"),
+                      (CR.ToolTipText, "tooltip_text"),
+                      (CR.PlaceholderText, "placeholder")):
+        pal.setColor(role, QColor(*UI[key]))
+    dis = QColor(*UI["placeholder"])
+    for role in (CR.WindowText, CR.Text, CR.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, dis)
+    app.setPalette(pal)
+    if _THEME_STATE["default_font_pt"] is None:
+        _THEME_STATE["default_font_pt"] = app.font().pointSizeF()
+    f = app.font()
+    size = appearance.get("font_size")
+    f.setPointSizeF(float(size) if size else _THEME_STATE["default_font_pt"])
+    app.setFont(f)
+    return ui, plot
+
+
+def _apply_dark_palette():
+    """Kept for callers outside this module; applies the saved appearance."""
+    set_theme()
+
+
+def _default_font_pt() -> int:
+    pt = _THEME_STATE.get("default_font_pt")
+    if pt is None and QApplication.instance() is not None:
+        pt = QApplication.instance().font().pointSizeF()
+    return int(round(pt)) if pt else 10
+
+
+def _ui_color(key: str) -> QColor:
+    return QColor(*UI[key])
 
 
 # ── Demo data ─────────────────────────────────────────────────────────────────
