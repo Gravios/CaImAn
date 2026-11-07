@@ -160,51 +160,6 @@ CMAP_RDBU_R    = _cmap_rdbu_r()
 CMAP_VIRIDIS_R = _cmap_viridis_r()
 
 
-# ── RGBA overlay builder (pyqtgraph version) ──────────────────────────────────
-
-def _build_overlay(store: 'ComponentStore',
-                   sel: list, pair) -> np.ndarray:
-    """
-    Return (d1, d2, 4) RGBA uint8 composite of selected/pair footprints.
-    Unselected components are skipped entirely.
-    """
-    d1, d2  = store.dims
-    out     = np.zeros((d1, d2, 4), dtype=np.float32)
-    sel_set  = set(sel)
-    pair_set = set(pair) if pair else set()
-
-    for i in range(store.n):
-        if pair and i in pair_set:
-            hex_c = CORR_A if i == pair[0] else CORR_B
-            alpha = OVERLAY_ALPHA["selected"]
-        elif i in sel_set:
-            hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
-            alpha = OVERLAY_ALPHA["selected"]
-        else:
-            continue
-
-        fp   = store.footprint(i)
-        peak = fp.max()
-        if peak < 1e-9:
-            continue
-        norm = fp / peak
-
-        h  = hex_c.lstrip('#')
-        r  = int(h[0:2], 16) / 255.0
-        g  = int(h[2:4], 16) / 255.0
-        b  = int(h[4:6], 16) / 255.0
-        am = norm * alpha
-        out[..., 0] = np.maximum(out[..., 0], r * am)
-        out[..., 1] = np.maximum(out[..., 1], g * am)
-        out[..., 2] = np.maximum(out[..., 2], b * am)
-        out[..., 3] = np.maximum(out[..., 3], am)
-
-    return (np.clip(out, 0, 1) * 255).astype(np.uint8)
-
-
-
-# ── Data model ────────────────────────────────────────────────────────────────
-
 class ComponentStore:
     """
     Mutable container for CNMF component data.
@@ -215,9 +170,13 @@ class ComponentStore:
                  SNR_comp=None, r_values=None, cnn_preds=None,
                  cnm_obj=None, fpath=None, traces=None,
                  orig_idx=None, fr=None, decay_time=None, accepted=None):
-        self._A = _to_dense(A)
+        # Footprints: (d, K) CSC float32, pixels in Fortran order of dims.
+        # Columns are only ever replaced (never written in place), so undo
+        # snapshots can share them.
+        self._A = _to_sparse(A)
         self.dims = dims
         K = self._A.shape[1]
+        self._derived = {}      # corr / centroids / peaks / pixel lookup cache
 
         # ── CaImAn evaluation (census: active / inactive) ────────────────────
         # accepted   : row was in estimates.idx_components (census: active);
@@ -272,7 +231,8 @@ class ComponentStore:
         self.bg_key = None
         self.add_background("correlation",
                             np.asarray(Cn, dtype=np.float32), make_active=True)
-        fp_max = self._A.max(axis=1).reshape(dims, order="F")
+        fp_max = (self._A.max(axis=1).toarray().ravel()
+                  .reshape(dims, order="F").astype(np.float32))
         self.add_background("footprint max", fp_max)
         # If the correlation image is (near-)flat — e.g. SUPPORT-denoised data
         # saturates Cn to ~1.0 — fall back to the footprint projection, which
@@ -288,7 +248,6 @@ class ComponentStore:
         self.fpath   = fpath
         self.labels  = [f"C{i:03d}" for i in range(self._A.shape[1])]
         self.hidden  = np.zeros(self._A.shape[1], dtype=bool)  # per-component visibility
-        self._corr   = None
 
         # History stacks — each entry is (op_label: str, snapshot: dict)
         self._undo_stack: deque = deque(maxlen=HISTORY_MAXLEN)
@@ -385,33 +344,76 @@ class ComponentStore:
     def n(self):
         return self._A.shape[1]
 
+    # ── Derived, cached per component set ─────────────────────────────────────
+    # Kept in self._derived; merge / delete update them incrementally,
+    # undo / redo restore them with the snapshot, anything else drops them.
+
+    def _cached(self, key, build):
+        v = self._derived.get(key)
+        if v is None:
+            v = self._derived[key] = build()
+        return v
+
     @property
-    def corr(self):
-        if self._corr is None or self._corr.shape[0] != self.n:
-            self._corr = _active_pearson_corr(self.C)
-        return self._corr
+    def corr(self) -> np.ndarray:
+        """(K, K) masked Pearson of the denoised traces; diagonal NaN."""
+        return self._cached("corr", lambda: _active_pearson_corr(self.C))
+
+    @property
+    def centroids(self) -> np.ndarray:
+        """(K, 2) footprint-weighted (row, col); FOV centre if empty."""
+        return self._cached("centroids", lambda: _centroids(self._A, self.dims))
+
+    @property
+    def dist(self) -> np.ndarray:
+        """(K, K) centroid distance (px); diagonal NaN."""
+        def build():
+            c = self.centroids.astype(np.float64)
+            d = np.sqrt(((c[:, None, :] - c[None, :, :]) ** 2).sum(-1)).astype(np.float32)
+            np.fill_diagonal(d, np.nan)
+            return d
+        return self._cached("dist", build)
+
+    @property
+    def peaks(self) -> np.ndarray:
+        """(K,) footprint maxima."""
+        return self._cached("peaks",
+                            lambda: self._A.max(axis=0).toarray().ravel())
 
     def invalidate_corr(self):
-        self._corr = None
+        """Drop every cached derived quantity."""
+        self._derived = {}
+
+    def components_at(self, row: int, col: int):
+        """(components, values) with a non-zero footprint at pixel (row, col)."""
+        csr = self._cached("csr", self._A.tocsr)
+        p = int(row) + int(col) * int(self.dims[0])
+        a, b = csr.indptr[p], csr.indptr[p + 1]
+        return csr.indices[a:b], csr.data[a:b]
 
     # ── History ───────────────────────────────────────────────────────────────
 
     def _capture(self) -> dict:
-        """Return a deep copy of all mutable component state."""
+        """Snapshot of all mutable component state.
+
+        Footprints, traces, metrics, events, qc and the derived caches are
+        only ever replaced by merge / delete / ROI filter / detection, never
+        written in place, so the snapshot holds references to them (no copy).
+        Only the flags edited in place (hidden, approved) are copied."""
         return {
-            "A":         self._A.copy(),
-            "traces":    {k: v.copy() for k, v in self.traces.items()},
+            "A":         self._A,
+            "traces":    dict(self.traces),
             "labels":    list(self.labels),
             "hidden":    self.hidden.copy(),
-            "SNR_comp":  self.SNR_comp.copy()  if self.SNR_comp  is not None else None,
-            "r_values":  self.r_values.copy()  if self.r_values  is not None else None,
-            "cnn_preds": self.cnn_preds.copy() if self.cnn_preds is not None else None,
-            "events":    self.events.copy() if self.events is not None else None,
+            "SNR_comp":  self.SNR_comp,
+            "r_values":  self.r_values,
+            "cnn_preds": self.cnn_preds,
+            "events":    self.events,
             "approved":  self.approved.copy(),
-            "accepted":  self.accepted.copy(),
-            "orig_idx":  self.orig_idx.copy(),
-            "qc":        ({k: v.copy() for k, v in self.qc.items()}
-                          if self.qc is not None else None),
+            "accepted":  self.accepted,
+            "orig_idx":  self.orig_idx,
+            "qc":        dict(self.qc) if self.qc is not None else None,
+            "derived":   dict(self._derived),
         }
 
     def _restore(self, snap: dict):
@@ -430,7 +432,7 @@ class ComponentStore:
         self.accepted  = snap.get("accepted", np.ones(self._A.shape[1], dtype=bool))
         self.orig_idx  = snap["orig_idx"]
         self.qc        = snap.get("qc")
-        self.invalidate_corr()
+        self._derived  = dict(snap.get("derived", {}))
 
     def _push_undo(self, op: str):
         """
@@ -497,10 +499,19 @@ class ComponentStore:
 
     # ── Per-component helpers ─────────────────────────────────────────────────
 
-    def footprint(self, i):
-        return self._A[:, i].reshape(self.dims, order="F")
+    def fp_pixels(self, i):
+        """(flat Fortran-order pixel indices, values) of footprint i."""
+        a, b = self._A.indptr[i], self._A.indptr[i + 1]
+        return self._A.indices[a:b], self._A.data[a:b]
 
-    def max_a(self, i):   return float(self._A[:, i].max())
+    def footprint(self, i) -> np.ndarray:
+        """Footprint i as a dense (d1, d2) image."""
+        out = np.zeros(self._A.shape[0], dtype=np.float32)
+        idx, val = self.fp_pixels(i)
+        out[idx] = val
+        return out.reshape(self.dims, order="F")
+
+    def max_a(self, i):   return float(self.peaks[i])
     def peak_df(self, i): return float(self.C[i].max() - self.C[i].min())
     def snr(self, i):     return float(self.SNR_comp[i])  if self.SNR_comp  is not None else float("nan")
     def rval(self, i):    return float(self.r_values[i])  if self.r_values  is not None else float("nan")
@@ -516,13 +527,12 @@ class ComponentStore:
         """
         self._push_undo("merge")
         idx = sorted(indices)
-        new_a = np.zeros(self._A.shape[0], dtype=np.float32)
-        for i in idx:
-            np.maximum(new_a, self._A[:, i], out=new_a)
+        new_a = self._A[:, idx].max(axis=1)              # pixel-wise max
         new_label = "+".join(self.labels[i] for i in idx)
 
         keep = [j for j in range(self.n) if j not in set(idx)]
-        self._A     = np.column_stack([self._A[:, keep], new_a[:, None]])
+        old, self._derived = self._derived, {}
+        self._A     = _to_sparse(scipy.sparse.hstack([self._A[:, keep], new_a]))
         for name, arr in self.traces.items():
             new_row = arr[idx].mean(axis=0)
             self.traces[name] = np.vstack([arr[keep], new_row[None, :]])
@@ -546,12 +556,13 @@ class ComponentStore:
             self.events = self.events.take(keep).append(self._detect_row(self.n - 1))
         if self.qc is not None:
             self.qc = _rf().append(_rf().take(self.qc, keep), self._qc_row(self.n - 1))
-        self.invalidate_corr()
+        self._derived = self._derived_after(old, keep, merged=True)
         return self.n - 1
 
     def delete(self, indices):
         self._push_undo("delete")
         keep = [j for j in range(self.n) if j not in set(indices)]
+        old, self._derived = self._derived, {}
         self._A     = self._A[:, keep]
         for name, arr in self.traces.items():
             self.traces[name] = arr[keep]
@@ -569,7 +580,32 @@ class ComponentStore:
             self.events = self.events.take(keep)
         if self.qc is not None:
             self.qc = _rf().take(self.qc, keep)
-        self.invalidate_corr()
+        self._derived = self._derived_after(old, keep, merged=False)
+
+    def _derived_after(self, old: dict, keep, merged: bool) -> dict:
+        """Carry cached corr / centroids / peaks over a delete (rows `keep`)
+        or a merge (rows `keep` + one new last row) without recomputing
+        the K×K matrices.  Distances and the pixel lookup are rebuilt."""
+        keep = np.asarray(keep, dtype=np.int64)
+        new  = {}
+        if old.get("corr") is not None:
+            sub = old["corr"][np.ix_(keep, keep)]
+            if merged:
+                k   = self.n - 1
+                row = _active_pearson_row(self.C, k)
+                mat = np.empty((k + 1, k + 1), dtype=np.float32)
+                mat[:k, :k] = sub
+                mat[k, :] = row; mat[:, k] = row
+                sub = mat
+            new["corr"] = sub
+        for key, fn in (("centroids", _centroids),
+                        ("peaks", lambda A, d: A.max(axis=0).toarray().ravel())):
+            if old.get(key) is not None:
+                v = old[key][keep]
+                if merged:
+                    v = np.concatenate([v, fn(self._A[:, -1:], self.dims)])
+                new[key] = v
+        return new
 
     # ── ROI filter ────────────────────────────────────────────────────────────
 
@@ -749,7 +785,7 @@ class ComponentStore:
         K   = self.n
 
         # Spatial / temporal
-        est.A  = scipy.sparse.csc_matrix(self._A)
+        est.A  = self._A.copy()
         est.C  = self.C
         est.nr = K
 
@@ -818,10 +854,32 @@ class ComponentStore:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _to_dense(A) -> np.ndarray:
-    if scipy.sparse.issparse(A):
-        return np.asarray(A.todense(), dtype=np.float32)
-    return np.asarray(A, dtype=np.float32)
+def _to_sparse(A) -> scipy.sparse.csc_matrix:
+    """(d, K) footprints as canonical CSC float32 (sorted, no explicit 0)."""
+    A = scipy.sparse.csc_matrix(A, dtype=np.float32)
+    A.eliminate_zeros()
+    A.sort_indices()
+    return A
+
+
+def _centroids(A, dims) -> np.ndarray:
+    """(K, 2) footprint-weighted (row, col) of CSC footprints (Fortran
+    pixel order); the FOV centre for an empty footprint."""
+    d1, d2 = int(dims[0]), int(dims[1])
+    p = np.arange(A.shape[0])
+    total = np.asarray(A.sum(axis=0)).ravel().astype(np.float64)
+    cy = np.asarray(A.T @ (p % d1).astype(np.float64)).ravel()
+    cx = np.asarray(A.T @ (p // d1).astype(np.float64)).ravel()
+    ok = total > 1e-9
+    out = np.empty((A.shape[1], 2), dtype=np.float32)
+    out[:, 0] = np.where(ok, cy / np.where(ok, total, 1), d1 / 2.0)
+    out[:, 1] = np.where(ok, cx / np.where(ok, total, 1), d2 / 2.0)
+    return out
+
+
+def _hex_rgb(hex_c: str) -> tuple:
+    h = hex_c.lstrip('#')
+    return tuple(int(h[k:k + 2], 16) / 255.0 for k in (0, 2, 4))
 
 def _ed():
     """``caiman.utils.event_detection``, imported lazily.
@@ -1218,32 +1276,53 @@ def _active_pearson_corr(C: np.ndarray,
     -------
     (K, K) float32 symmetric matrix; diagonal is NaN.
     """
-    K, T = C.shape
-    mat  = np.full((K, K), np.nan, dtype=np.float32)
-    if K == 0 or T < 3:
-        return mat
+    return _masked_pearson(C, C, active_thr)
 
-    active = (C > active_thr)   # (K, T) bool
 
-    for i in range(K):
-        mat[i, i] = np.nan
-        for j in range(i + 1, K):
-            mask = active[i] | active[j]
-            n    = int(mask.sum())
-            if n < 3:
-                continue
-            a = C[i][mask].astype(np.float64)
-            b = C[j][mask].astype(np.float64)
-            a -= a.mean();  b -= b.mean()
-            na = np.linalg.norm(a);  nb = np.linalg.norm(b)
-            if na < 1e-12 or nb < 1e-12:
-                continue
-            r = float(np.dot(a, b) / (na * nb))
-            r = float(np.clip(r, -1.0, 1.0))
-            mat[i, j] = r
-            mat[j, i] = r
+def _masked_pearson(X: np.ndarray, Y: np.ndarray,
+                    active_thr: float = 0.0) -> np.ndarray:
+    """(Kx, Ky) Pearson r of X[i] vs Y[j] over frames where either is
+    active (> active_thr); NaN with < 3 such frames or a flat trace.
 
-    return mat
+    Every masked sum splits into frames where x is active plus frames
+    where only y is (Σₘ xy = (xa)·y + (x − xa)·(yb)), so the whole matrix
+    is seven matrix products instead of a K² Python loop.  When X is Y the
+    diagonal is NaN.
+    """
+    Kx, T = X.shape
+    Ky    = Y.shape[0]
+    if Kx == 0 or Ky == 0 or T < 3:
+        return np.full((Kx, Ky), np.nan, dtype=np.float32)
+    x  = np.asarray(X, dtype=np.float64);  y  = np.asarray(Y, dtype=np.float64)
+    a  = (X > active_thr).astype(np.float64)
+    b  = (Y > active_thr).astype(np.float64)
+    xa, ya = x * a, y * b                        # x on its own active frames
+    xo, yo = x - xa, y - ya                      # … and off them
+    # Σ over a ∨ b of p_i·q_j  = Σ_a p·q + Σ_(b∖a) p·q, each one product
+    n   = a.sum(1)[:, None] + (1 - a) @ b.T
+    sx  = xa.sum(1)[:, None] + xo @ b.T          # Σₘ x_i
+    sy  = ya.sum(1)[None, :] + a @ yo.T          # Σₘ y_j
+    sxx = (xa * x).sum(1)[:, None] + (xo * x) @ b.T
+    syy = (ya * y).sum(1)[None, :] + a @ (yo * y).T
+    sxy = xa @ y.T + xo @ ya.T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vx  = sxx - sx * sx / n
+        vy  = syy - sy * sy / n
+        cov = sxy - sx * sy / n
+        r   = cov / np.sqrt(vx * vy)
+    bad = (n < 2.5) | (vx < 1e-24) | (vy < 1e-24) | ~np.isfinite(r)
+    r = np.clip(np.where(bad, np.nan, r), -1.0, 1.0).astype(np.float32)
+    if X is Y and Kx == Ky:
+        np.fill_diagonal(r, np.nan)
+    return r
+
+
+def _active_pearson_row(C: np.ndarray, k: int,
+                        active_thr: float = 0.0) -> np.ndarray:
+    """Row k of :func:`_active_pearson_corr` (same masking), NaN at k."""
+    row = _masked_pearson(C[k:k + 1], C, active_thr)[0]
+    row[k] = np.nan
+    return row
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
@@ -1270,7 +1349,7 @@ def load_from_hdf5(path: str, all_components: bool = True) -> ComponentStore:
     est  = cnm.estimates
     dims = cnm.dims if (cnm.dims and all(d > 0 for d in cnm.dims)) else est.dims
 
-    A = _to_dense(est.A)
+    A = _to_sparse(est.A)
     C = est.C
     K = A.shape[1]
 
@@ -1309,7 +1388,8 @@ def load_from_hdf5(path: str, all_components: bool = True) -> ComponentStore:
         traces["S (deconvolved)"] = S
 
     _Cn = getattr(est, "Cn", None)
-    Cn  = _Cn if _Cn is not None else A.max(axis=1).reshape(dims, order="F")
+    Cn  = (_Cn if _Cn is not None else
+           A.max(axis=1).toarray().ravel().reshape(dims, order="F"))
     pdata = getattr(getattr(cnm, "params", None), "data", None) or {}
     store = ComponentStore(A, C, Cn, dims,
                            SNR_comp=snr, r_values=rval, cnn_preds=cnn,
@@ -1673,39 +1753,39 @@ def _os_dirname(path: str) -> str:
 
 # ── RGBA overlay builder ──────────────────────────────────────────────────────
 
+def _paint_fp(out: np.ndarray, store: 'ComponentStore', i: int,
+              rgb: tuple, alpha: float) -> None:
+    """Max-composite footprint i (normalised to its peak) into the
+    (d1, d2, 4) float RGBA image `out`, touching only its own pixels."""
+    idx, val = store.fp_pixels(i)
+    if idx.size == 0:
+        return
+    peak = float(val.max())
+    if peak < 1e-9:
+        return
+    d1 = store.dims[0]
+    rr, cc = idx % d1, idx // d1
+    am = (val / peak) * alpha
+    for ch, v in enumerate((rgb[0] * am, rgb[1] * am, rgb[2] * am, am)):
+        cur = out[rr, cc, ch]
+        out[rr, cc, ch] = np.maximum(cur, v)
+
+
 def _build_overlay(store: ComponentStore,
                    sel: list, pair) -> np.ndarray:
-    """Return (d1, d2, 4) RGBA float32 composite of all footprints."""
+    """(d1, d2, 4) RGBA float32 composite of the selected / pair footprints."""
     d1, d2  = store.dims
     out     = np.zeros((d1, d2, 4), dtype=np.float32)
-    sel_set = set(sel)
     pair_set = set(pair) if pair else set()
-
-    for i in range(store.n):
-        if not store.is_visible(i):
+    alpha = OVERLAY_ALPHA["selected"]
+    for i in dict.fromkeys(list(sel) + list(pair_set)):   # ordered, unique
+        if not (0 <= i < store.n) or not store.is_visible(i):
             continue
-        fp   = store.footprint(i)
-        peak = fp.max()
-        if peak < 1e-9:
-            continue
-        norm = fp / peak
-
-        if pair and i in pair_set:
+        if i in pair_set:
             hex_c = CORR_A if i == pair[0] else CORR_B
-            alpha = OVERLAY_ALPHA["selected"]
-        elif i in sel_set:
-            hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
-            alpha = OVERLAY_ALPHA["selected"]
         else:
-            continue   # only draw overlay for selected / pair components
-
-        _h = hex_c.lstrip('#'); r = int(_h[0:2],16)/255.0; g = int(_h[2:4],16)/255.0; b = int(_h[4:6],16)/255.0
-        a_mask  = norm * alpha
-        out[..., 0] = np.maximum(out[..., 0], r * a_mask)
-        out[..., 1] = np.maximum(out[..., 1], g * a_mask)
-        out[..., 2] = np.maximum(out[..., 2], b * a_mask)
-        out[..., 3] = np.maximum(out[..., 3], a_mask)
-
+            hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
+        _paint_fp(out, store, i, _hex_rgb(hex_c), alpha)
     return np.clip(out, 0, 1)
 
 
@@ -1720,31 +1800,16 @@ def _build_roi_overlay(store: ComponentStore,
     """
     d1, d2 = store.dims
     out    = np.zeros((d1, d2, 4), dtype=np.float32)
-
-    def _rgb(hex_c):
-        _h = hex_c.lstrip('#')
-        return tuple(int(_h[k:k + 2], 16) / 255.0 for k in (0, 2, 4))
-
-    inc_rgb, exc_rgb = _rgb(CYAN), _rgb(EXCLUDED)
+    inc_rgb, exc_rgb = _hex_rgb(CYAN), _hex_rgb(EXCLUDED)
     use_appr = store.has_approval         # events or roi_filter seeded Incl
-
     for i in range(store.n):
         if not store.is_visible(i):
             continue
         excluded = use_appr and not store.approved[i]
         if excluded and hide_excluded:
             continue
-        r, g, b = exc_rgb if excluded else inc_rgb
-        fp   = store.footprint(i)
-        peak = fp.max()
-        if peak < 1e-9:
-            continue
-        a_mask = (fp / peak) * OVERLAY_ALPHA["excluded" if excluded else "all"]
-        out[..., 0] = np.maximum(out[..., 0], r * a_mask)
-        out[..., 1] = np.maximum(out[..., 1], g * a_mask)
-        out[..., 2] = np.maximum(out[..., 2], b * a_mask)
-        out[..., 3] = np.maximum(out[..., 3], a_mask)
-
+        _paint_fp(out, store, i, exc_rgb if excluded else inc_rgb,
+                  OVERLAY_ALPHA["excluded" if excluded else "all"])
     return np.clip(out, 0, 1)
 
 
@@ -1921,16 +1986,13 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
         best_idx   = None
         best_value = 0.0
-        for i in range(s.n):
+        peaks = s.peaks
+        for i, val in zip(*s.components_at(row, col)):
+            i = int(i)
             if not s.is_visible(i):            # hidden ROIs are not clickable
                 continue
-            fp   = s.footprint(i)
-            peak = fp.max()
-            if peak < 1e-9:
-                continue
-            val = float(fp[row, col])
-            if val >= peak * 0.10 and val > best_value:
-                best_value = val
+            if peaks[i] >= 1e-9 and val >= peaks[i] * 0.10 and val > best_value:
+                best_value = float(val)
                 best_idx   = i
 
         if best_idx is None:
@@ -1943,26 +2005,8 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
     def _get_centroids(self):
         s = self.store
-        if self._centroids is not None and len(self._centroids) == s.n:
-            return self._centroids
-
-        d1, d2 = s.dims
-        p      = np.arange(d1 * d2)
-        rows   = (p % d1).astype(np.float32)
-        cols   = (p // d1).astype(np.float32)
-
-        centroids = []
-        for i in range(s.n):
-            fp    = s._A[:, i]
-            total = fp.sum()
-            if total > 1e-9:
-                cy = float((fp * rows).sum() / total)
-                cx = float((fp * cols).sum() / total)
-            else:
-                cy, cx = d1 / 2.0, d2 / 2.0
-            centroids.append((cy, cx))
-
-        self._centroids = centroids
+        if self._centroids is None or len(self._centroids) != s.n:
+            self._centroids = [tuple(map(float, c)) for c in s.centroids]
         return self._centroids
 
     def _get_cross_params(self):
@@ -1974,15 +2018,16 @@ class CellViewer(pg.GraphicsLayoutWidget):
 
         centroids = self._get_centroids()
         params    = []
+        d1 = s.dims[0]
         for i in range(s.n):
             cy, cx = centroids[i]
-            fp     = s.footprint(i)
-            peak   = fp.max()
+            idx, val = s.fp_pixels(i)
+            peak   = float(val.max()) if val.size else 0.0
             if peak < 1e-9:
                 params.append((cy, cx, CROSS_MIN_ARM))
                 continue
-            mask     = fp > peak * 0.2
-            ry, cx_ = np.where(mask)
+            on      = idx[val > peak * 0.2]
+            ry, cx_ = on % d1, on // d1
             if ry.size == 0:
                 params.append((cy, cx, CROSS_MIN_ARM))
                 continue
@@ -2531,16 +2576,20 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self.setBackground(PT["bg"])
 
     def refresh(self):
+        """Re-render after the component set changed; clears the highlight."""
         self._highlight = None
-        for item in self._hl_items:
-            self.vb.removeItem(item)
-        self._hl_items = []
         self._render()
+
+    def clear_highlight(self):
+        """Remove the pair highlight (no matrix recompute)."""
+        if self._highlight is not None or self._hl_items:
+            self._highlight = None
+            self._draw_highlight()
 
     def highlight_pair(self, i: int, j: int):
         """Highlight (i, j) without emitting pair_clicked (avoids signal loop)."""
         self._highlight = (i, j)
-        self._render()
+        self._draw_highlight()
 
     def _levels(self, mat: np.ndarray):
         raise NotImplementedError
@@ -2557,17 +2606,18 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         self._img.setLookupTable(self._cmap.getLookupTable(nPts=256))
         self._img.setLevels((vmin, vmax))
         self._cbar.setLevels((vmin, vmax))
+        self._draw_highlight()
 
-        # Highlight pair.
+    def _draw_highlight(self):
         # Each pixel [row, col] is placed at corner (col, row) by ImageItem
         # and spans to (col+1, row+1), so its centre is at (col+0.5, row+0.5).
         # All highlight coordinates are offset by +0.5 accordingly.
+        for item in self._hl_items:
+            self.vb.removeItem(item)
+        self._hl_items = []
         if self._highlight:
             hi, hj = self._highlight
-            for item in self._hl_items:
-                self.vb.removeItem(item)
-            self._hl_items = []
-            K = mat.shape[0]
+            K = self.store.n
             for band, col in [(hi, CORR_A), (hj, CORR_B)]:
                 c = band + 0.5   # centre of the band-th row/col
                 lh = pg.PlotDataItem(
@@ -2589,11 +2639,6 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
                 self.vb.addItem(box)
                 self._hl_items.append(box)
 
-        # Tick labels (thin out for large K)
-        n    = self.store.n
-        step = max(1, n // 12)
-        tks  = list(range(0, n, step))
-
     def _on_scene_click(self, event):
         # Require Ctrl+Left-click for pair selection so plain left-drag
         # is free for panning (handled by ViewBox natively).
@@ -2607,7 +2652,7 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         n  = self.store.n
         if 0 <= i < n and 0 <= j < n and i != j:
             self._highlight = (i, j)
-            self._render()
+            self._draw_highlight()
             self.pair_clicked.emit(i, j)
 
 
@@ -2646,7 +2691,7 @@ class DistMatrix(_MatrixWidget):
             self._render()
 
     def _matrix(self) -> np.ndarray:
-        dist = DistMatrix._compute_dist(self.store)
+        dist = self.store.dist
         if self._log:
             with np.errstate(divide="ignore", invalid="ignore"):
                 return np.where(dist > 0, np.log10(dist), np.nan)
@@ -2667,28 +2712,8 @@ class DistMatrix(_MatrixWidget):
 
     @staticmethod
     def _compute_dist(store: 'ComponentStore') -> np.ndarray:
-        K   = store.n
-        mat = np.full((K, K), np.nan, dtype=np.float32)
-        if K == 0:
-            return mat
-        d1, d2 = store.dims
-        p      = np.arange(d1 * d2, dtype=np.float32)
-        rows   = p % d1
-        cols   = p // d1
-        cy_cx  = np.empty((K, 2), dtype=np.float32)
-        for i in range(K):
-            fp    = store._A[:, i]
-            total = fp.sum()
-            if total > 1e-9:
-                cy_cx[i, 0] = (fp * rows).sum() / total
-                cy_cx[i, 1] = (fp * cols).sum() / total
-            else:
-                cy_cx[i] = [d1 / 2.0, d2 / 2.0]
-        for i in range(K):
-            for j in range(i + 1, K):
-                d = float(np.sqrt(((cy_cx[i] - cy_cx[j]) ** 2).sum()))
-                mat[i, j] = mat[j, i] = d
-        return mat
+        """Pairwise centroid distance (cached on the store)."""
+        return store.dist
 
 
 
@@ -4127,8 +4152,8 @@ class InspectorWindow(QMainWindow):
                 self.corr_view.highlight_pair(sel[0], sel[1])
                 self.dist_view.highlight_pair(sel[0], sel[1])
             else:
-                self.corr_view.refresh()
-                self.dist_view.refresh()
+                self.corr_view.clear_highlight()
+                self.dist_view.clear_highlight()
         finally:
             self._in_table_sel = False
 
