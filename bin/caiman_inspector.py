@@ -21,6 +21,10 @@ Usage
 
 Controls
 --------
+    Rows         — every component of the file is loaded and saved.  Eval
+                   shows CaImAn's verdict (✓ idx_components / census active,
+                   ✗ rejected / census inactive); View ▸ Hide rejected /
+                   inactive ROIs hides them (they are still saved).
     Table        — click to select; Ctrl/Shift for multi-select;
                    click a column header to sort; right-click it (or
                    View ▸ Columns) to show / hide columns.  ROI-filter columns
@@ -210,10 +214,21 @@ class ComponentStore:
     def __init__(self, A, C, Cn, dims,
                  SNR_comp=None, r_values=None, cnn_preds=None,
                  cnm_obj=None, fpath=None, traces=None,
-                 orig_idx=None, fr=None, decay_time=None):
+                 orig_idx=None, fr=None, decay_time=None, accepted=None):
         self._A = _to_dense(A)
         self.dims = dims
         K = self._A.shape[1]
+
+        # ── CaImAn evaluation (census: active / inactive) ────────────────────
+        # accepted   : row was in estimates.idx_components (census: active);
+        #              rejected rows (idx_components_bad, census: inactive)
+        #              are loaded, shown and saved like any other row
+        # eval_known : the file carried idx_components (else all accepted)
+        # hide_rejected : view option — hide rejected rows (still saved)
+        self.eval_known = accepted is not None
+        self.accepted = (np.ones(K, dtype=bool) if accepted is None
+                         else np.asarray(accepted, dtype=bool).copy())
+        self.hide_rejected = False
 
         # ── Event detection / curation (SLab stroh_results) ──────────────────
         # events   : EventResults aligned to rows, or None until detected/loaded
@@ -339,6 +354,14 @@ class ComponentStore:
     def is_hidden(self, i) -> bool:
         return bool(self.hidden[i])
 
+    def is_visible(self, i) -> bool:
+        """Drawn / clickable: not hidden, and not a hidden-away rejected row."""
+        return not (self.hidden[i] or (self.hide_rejected and not self.accepted[i]))
+
+    @property
+    def n_accepted(self) -> int:
+        return int(self.accepted.sum())
+
     def toggle_hidden(self, indices):
         for i in indices:
             self.hidden[i] = not self.hidden[i]
@@ -385,6 +408,7 @@ class ComponentStore:
             "cnn_preds": self.cnn_preds.copy() if self.cnn_preds is not None else None,
             "events":    self.events.copy() if self.events is not None else None,
             "approved":  self.approved.copy(),
+            "accepted":  self.accepted.copy(),
             "orig_idx":  self.orig_idx.copy(),
             "qc":        ({k: v.copy() for k, v in self.qc.items()}
                           if self.qc is not None else None),
@@ -403,6 +427,7 @@ class ComponentStore:
         self.cnn_preds = snap["cnn_preds"]
         self.events    = snap["events"]
         self.approved  = snap["approved"]
+        self.accepted  = snap.get("accepted", np.ones(self._A.shape[1], dtype=bool))
         self.orig_idx  = snap["orig_idx"]
         self.qc        = snap.get("qc")
         self.invalidate_corr()
@@ -514,6 +539,8 @@ class ComponentStore:
         # Merged component is included if any constituent was; it has no
         # source row.  Its events are re-detected on the merged traces.
         self.approved = np.append(self.approved[keep], bool(self.approved[idx].any()))
+        # accepted (census: active) if any constituent was
+        self.accepted = np.append(self.accepted[keep], bool(self.accepted[idx].any()))
         self.orig_idx = np.append(self.orig_idx[keep], -1)
         if self.events is not None:
             self.events = self.events.take(keep).append(self._detect_row(self.n - 1))
@@ -536,6 +563,7 @@ class ComponentStore:
             if arr is not None:
                 setattr(self, attr, arr[keep])
         self.approved = self.approved[keep]
+        self.accepted = self.accepted[keep]
         self.orig_idx = self.orig_idx[keep]
         if self.events is not None:
             self.events = self.events.take(keep)
@@ -709,7 +737,9 @@ class ComponentStore:
 
         Derived per-component fields (S, YrA, F_dff, etc.) are nulled out
         because they are invalid after manual edits and must be recomputed.
-        idx_components is reset to 0..K-1.  A provenance entry is appended.
+        Every row is written; idx_components / idx_components_bad keep the
+        accepted / rejected split (census: active / inactive, and the census
+        dict is updated).  A provenance entry is appended.
         """
         import time as _time
         if self.cnm_obj is None:
@@ -741,9 +771,19 @@ class ComponentStore:
         est.r_values  = self.r_values
         est.cnn_preds = self.cnn_preds
 
-        # Reset accepted component index so file is self-consistent
-        est.idx_components     = np.arange(K, dtype=int)
-        est.idx_components_bad = np.array([], dtype=int)
+        # Every row is written; the accepted / rejected split (census:
+        # active / inactive) is kept in idx_components / idx_components_bad.
+        acc = self.accepted if self.eval_known else np.ones(K, dtype=bool)
+        est.idx_components     = np.flatnonzero(acc).astype(int)
+        est.idx_components_bad = np.flatnonzero(~acc).astype(int)
+        if isinstance(getattr(est, "census", None), dict):
+            est.census = {
+                "n_total":      K,
+                "n_active":     int(acc.sum()),
+                "n_inactive":   int((~acc).sum()),
+                "idx_active":   np.flatnonzero(acc).tolist(),
+                "idx_inactive": np.flatnonzero(~acc).tolist(),
+            }
 
         # Append provenance record
         if hasattr(self.cnm_obj, "provenance"):
@@ -752,6 +792,7 @@ class ComponentStore:
                 "time":         int(_time.time()),
                 "description":  "Manual curation via cnmf_inspector",
                 "n_components": K,
+                "n_accepted":   int(acc.sum()),
                 "n_approved":   self.n_approved,
                 "n_merged_dff_rows": int((self.orig_idx < 0).sum()),
                 "source_file":  self.fpath or "",
@@ -1207,10 +1248,14 @@ def _active_pearson_corr(C: np.ndarray,
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-def load_from_hdf5(path: str, all_components: bool = False) -> ComponentStore:
-    """Load a CNMF results file.  By default only ``idx_components`` are
-    shown; ``all_components`` shows every row (as SLabAnalysisApp does —
-    used by blinded review so ratings index the file's full estimates)."""
+def load_from_hdf5(path: str, all_components: bool = True) -> ComponentStore:
+    """Load a CNMF results file — every row of the estimates.
+
+    Rows outside ``idx_components`` (CaImAn-rejected; in census mode the
+    inactive cells) are loaded too and flagged ``accepted = False`` (Eval
+    column), so Save never drops them.  ``all_components`` is kept for
+    callers; loading a subset is no longer supported because saving it
+    would lose the other rows."""
     import os as _os
     # Ensure CAIMAN_TEMP is set to a writable directory before load_CNMF
     # calls fn_relocated.  If the current value is missing or unwritable,
@@ -1227,27 +1272,26 @@ def load_from_hdf5(path: str, all_components: bool = False) -> ComponentStore:
 
     A = _to_dense(est.A)
     C = est.C
+    K = A.shape[1]
 
-    idx = None if all_components else getattr(est, "idx_components", None)
+    # accepted / rejected (census: active / inactive) from idx_components
+    accepted = None
+    idx = getattr(est, "idx_components", None)
+    if idx is not None:
+        idx = np.asarray(idx, dtype=np.int64).ravel()
+        accepted = np.zeros(K, dtype=bool)
+        accepted[idx[(idx >= 0) & (idx < K)]] = True
 
     def _sel_rows(arr):
-        """Slice an optional (K, T) trace array by idx_components."""
+        """An optional (K, T) trace array as float32, or None."""
         if arr is None:
             return None
         arr = np.asarray(arr, dtype=np.float32)
-        if arr.size == 0:
-            return None
-        return arr[idx] if (idx is not None and len(idx) > 0) else arr
+        return None if arr.size == 0 else arr
 
-    if idx is not None and len(idx) > 0:
-        A = A[:, idx];  C = C[idx]
-        snr  = est.SNR_comp[idx]  if est.SNR_comp  is not None else None
-        rval = est.r_values[idx]  if est.r_values  is not None else None
-        cnn  = est.cnn_preds[idx] if est.cnn_preds is not None else None
-    else:
-        snr  = getattr(est, "SNR_comp",  None)
-        rval = getattr(est, "r_values",  None)
-        cnn  = getattr(est, "cnn_preds", None)
+    snr  = getattr(est, "SNR_comp",  None)
+    rval = getattr(est, "r_values",  None)
+    cnn  = getattr(est, "cnn_preds", None)
 
     # Build the trace registry: denoised C is canonical; add ΔF/F, the
     # residual-added raw trace, and deconvolved spikes when available and
@@ -1266,13 +1310,11 @@ def load_from_hdf5(path: str, all_components: bool = False) -> ComponentStore:
 
     _Cn = getattr(est, "Cn", None)
     Cn  = _Cn if _Cn is not None else A.max(axis=1).reshape(dims, order="F")
-    orig_idx = (np.asarray(idx, dtype=np.int64)
-                if idx is not None and len(idx) > 0 else np.arange(Cd.shape[0]))
     pdata = getattr(getattr(cnm, "params", None), "data", None) or {}
     store = ComponentStore(A, C, Cn, dims,
                            SNR_comp=snr, r_values=rval, cnn_preds=cnn,
                            cnm_obj=cnm, fpath=path, traces=traces,
-                           orig_idx=orig_idx,
+                           orig_idx=np.arange(K), accepted=accepted,
                            fr=_opt_float(pdata.get("fr")),
                            decay_time=_opt_float(pdata.get("decay_time")))
     _attach_roi_filter(store, path)        # seeds Incl from `passed` …
@@ -1640,7 +1682,7 @@ def _build_overlay(store: ComponentStore,
     pair_set = set(pair) if pair else set()
 
     for i in range(store.n):
-        if store.hidden[i]:
+        if not store.is_visible(i):
             continue
         fp   = store.footprint(i)
         peak = fp.max()
@@ -1687,7 +1729,7 @@ def _build_roi_overlay(store: ComponentStore,
     use_appr = store.has_approval         # events or roi_filter seeded Incl
 
     for i in range(store.n):
-        if store.hidden[i]:
+        if not store.is_visible(i):
             continue
         excluded = use_appr and not store.approved[i]
         if excluded and hide_excluded:
@@ -1880,6 +1922,8 @@ class CellViewer(pg.GraphicsLayoutWidget):
         best_idx   = None
         best_value = 0.0
         for i in range(s.n):
+            if not s.is_visible(i):            # hidden ROIs are not clickable
+                continue
             fp   = s.footprint(i)
             peak = fp.max()
             if peak < 1e-9:
@@ -1992,7 +2036,7 @@ class CellViewer(pg.GraphicsLayoutWidget):
         sel_set  = set(self._sel)
         pair_set = set(self._pair) if self._pair else set()
         active   = {i for i in (sel_set | pair_set)
-                    if not self.store.hidden[i]}
+                    if self.store.is_visible(i)}
         if not active:
             return
 
@@ -2940,6 +2984,8 @@ class ComponentTable(QTableWidget):
         for label, attr in self._OPTIONAL:
             if getattr(self.store, attr, None) is not None:
                 cols.append(label)
+        if self.store.eval_known:
+            cols.append("Eval")
         qc = self.store.qc
         if qc is not None:
             cols += [h for h, fld, _k, _t in self._QC_COLS if fld in qc]
@@ -2967,6 +3013,9 @@ class ComponentTable(QTableWidget):
         tips = {h: t for h, _f, _k, t in self._QC_COLS}
         tips["Incl"] = ("Include flag (I toggles). Starts from the ROI filter's "
                         "QC verdict, or from event auto-approval")
+        tips["Eval"] = ("CaImAn evaluation: ✓ accepted (idx_components; census: "
+                        "active), ✗ rejected (census: inactive). Rejected rows are "
+                        "kept and saved; View ▸ Hide rejected / inactive ROIs")
         for c, h in enumerate(cols):
             if h in tips:
                 self.horizontalHeaderItem(c).setToolTip(tips[h])
@@ -2980,6 +3029,8 @@ class ComponentTable(QTableWidget):
                 if getattr(s, attr, None) is not None:
                     v = getattr(s, attr)[i]
                     vals.append((f"{v:.3f}", _num_key(v)))
+            if s.eval_known:
+                vals.append(_qc_cell(s.accepted[i], "bool"))
             if s.qc is not None:
                 for _h, fld, kind, _t in self._QC_COLS:
                     if fld in s.qc:
@@ -3033,6 +3084,7 @@ class ComponentTable(QTableWidget):
             row = self.row_of(comp)
             if row < 0:
                 continue
+            self.setRowHidden(row, bool(s.hide_rejected and not s.accepted[comp]))
             if s.is_hidden(comp):
                 fg = grey
             elif has_ev and not s.approved[comp]:
@@ -3424,7 +3476,10 @@ results file, stack or folder; <code>--demo</code> opens synthetic data.
 File ▸ Open… starts in the last folder used.</p>
 
 <h3>Reviewing</h3>
-<p>Select components in the table, the cell viewer or the correlation /
+<p>Every component of the file is loaded and saved.  The Eval column shows
+CaImAn's verdict (✓ accepted / census active, ✗ rejected / census inactive);
+View ▸ Hide rejected / inactive ROIs hides the rejected ones without
+dropping them.  Select components in the table, the cell viewer or the correlation /
 distance matrices; each selected component keeps one colour in the table,
 the footprint overlay and the traces.  The trace dropdown switches between
 denoised C, ΔF/F, C+residual and deconvolved S (display only); the BG
@@ -3598,6 +3653,14 @@ class InspectorWindow(QMainWindow):
         a.triggered.connect(self._full_refresh)
         vm.addAction(a)
         vm.addSeparator()
+        self.act_hide_rejected = QAction("Hide &rejected / inactive ROIs", self)
+        self.act_hide_rejected.setCheckable(True)
+        self.act_hide_rejected.setToolTip(
+            "Hide components outside idx_components (CaImAn-rejected; census: "
+            "inactive) from the table and the cell viewer.  They stay in the "
+            "data and are always saved.")
+        self.act_hide_rejected.triggered.connect(self._set_hide_rejected)
+        vm.addAction(self.act_hide_rejected)
         self._columns_menu = vm.addMenu("&Columns")
         self._columns_menu.setToolTip("Show / hide table columns "
                                       "(also: right-click the table header)")
@@ -3952,7 +4015,8 @@ class InspectorWindow(QMainWindow):
         ui["hidden_columns"] = self.table.hidden_columns()
         st = self.table.sort_state()
         ui["sort"] = {"column": st[0], "order": st[1]} if st else None
-        ui["view"] = {"invert_bg":     self.act_invert_bg.isChecked(),
+        ui["view"] = {"hide_rejected": self.act_hide_rejected.isChecked(),
+                      "invert_bg":     self.act_invert_bg.isChecked(),
                       "show_rois":     self.act_show_rois.isChecked(),
                       "hide_excluded": self.act_hide_excl.isChecked(),
                       "dist_log":      self.act_dist_log.isChecked()}
@@ -3987,7 +4051,8 @@ class InspectorWindow(QMainWindow):
         if isinstance(srt, dict) and srt.get("column"):
             self.table.sort_by_name(srt["column"], srt.get("order", "asc"))
         view = ui.get("view") or {}
-        for key, act in (("invert_bg", self.act_invert_bg),
+        for key, act in (("hide_rejected", self.act_hide_rejected),
+                         ("invert_bg", self.act_invert_bg),
                          ("show_rois", self.act_show_rois),
                          ("hide_excluded", self.act_hide_excl),
                          ("dist_log", self.act_dist_log)):
@@ -3995,6 +4060,16 @@ class InspectorWindow(QMainWindow):
             if want is not None and bool(want) != act.isChecked():
                 act.trigger()                 # runs the toggle's handler
         self._apply_view_prefs()
+
+    def _set_hide_rejected(self, flag: bool) -> None:
+        self.store.hide_rejected = bool(flag)
+        self.table.mark_hidden()
+        self.cell_view.refresh_visibility()
+        s = self.store
+        if s.eval_known:
+            self.statusBar().showMessage(
+                f"{s.n - s.n_accepted} rejected / inactive ROIs "
+                + ("hidden (still saved)" if flag else "shown"))
 
     def _apply_view_prefs(self) -> None:
         """Re-select the remembered background / trace if this file has them."""
@@ -4400,6 +4475,7 @@ class InspectorWindow(QMainWindow):
         self._refresh_bg_combo()
         self._refresh_trace_combo()
         self._apply_view_prefs()
+        new_store.hide_rejected = self.act_hide_rejected.isChecked()
         self.movie_bar.set_store(new_store)
         self.cell_view.refresh_background()
         self._full_refresh()
@@ -4551,6 +4627,10 @@ class InspectorWindow(QMainWindow):
         lines = [
             f"File:  {name}",
             f"Components:  {s.n}   (hidden {s.n_hidden})",
+            ("CaImAn evaluation:  "
+             f"{s.n_accepted} accepted / {s.n - s.n_accepted} rejected "
+             "(census: active / inactive)") if s.eval_known
+            else "CaImAn evaluation:  n/a",
             f"Recording length:  {dur}",
             "SNR min / mean / max:  " + (
                 f"{snr.min():.2f} / {snr.mean():.2f} / {snr.max():.2f}"
@@ -4755,10 +4835,13 @@ class InspectorWindow(QMainWindow):
         self.act_include.setEnabled(False)
         self.act_export.setEnabled(self.store.events is not None)
         self._sel_lbl.setText(f"  0 selected  |  {self.store.n} total")
+        s = self.store
         self.statusBar().showMessage(
-            f"{self.store.n} components"
+            f"{s.n} components"
+            + (f" ({s.n_accepted} accepted / {s.n - s.n_accepted} rejected)"
+               if s.eval_known else "")
             + ("  —  no ROI-filter fields: Analysis ▸ Run ROI filter… adds them"
-               if self.store.qc is None and self._blind is None else ""))
+               if s.qc is None and self._blind is None else ""))
         self._update_history_actions()
         if self._blind is not None:          # undo/redo/save are edit ops
             for a in (self.act_undo, self.act_undo_tb,
