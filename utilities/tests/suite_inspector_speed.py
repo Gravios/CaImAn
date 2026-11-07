@@ -181,8 +181,25 @@ try:
     w._on_cell_click(4, False); app.processEvents()
     assert not renders, renders
     assert w.corr_view._highlight is None and not w.corr_view._hl_items
-    w.close()
     ok("selecting / clearing a pair redraws only the highlight (matrices not recomputed)")
+
+    # distance matrix, log scale: levels span log10 of the distances
+    dv = w.dist_view
+    dv._log = True; dv._render()
+    lo, hi = dv._img.getLevels()
+    dd = s.dist[~np.isnan(s.dist)]
+    dd = np.log10(dd[dd > 0])
+    assert abs(lo - dd.min()) < 1e-4 and abs(hi - np.percentile(dd, 99)) < 1e-4, (lo, hi, dd.min())
+    w.close()
+    ok("log distance levels are log10(distance), not log10(log10(distance))")
+
+    # blocked correlation equals one block and the pair loop
+    Cb = np.maximum(rng.standard_normal((70, 300)).astype(np.float32) - 0.5, 0)
+    one = insp.store._masked_pearson(Cb, Cb)
+    many = insp.store._masked_pearson(Cb, Cb, block_bytes=1)       # 16-row blocks
+    assert np.array_equal(np.isnan(one), np.isnan(many)) and np.allclose(one, many, equal_nan=True, atol=1e-6)
+    assert np.allclose(many, ref_corr(Cb), equal_nan=True, atol=1e-6)
+    ok("blocked correlation (16-row blocks) equals one block and the pair loop")
     print("ALL OK")
 finally:
     pass

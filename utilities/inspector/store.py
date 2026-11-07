@@ -170,6 +170,10 @@ class ComponentStore:
         """Drawn / clickable: not hidden, and not a hidden-away rejected row."""
         return not (self.hidden[i] or (self.hide_rejected and not self.accepted[i]))
 
+    def visible_mask(self) -> np.ndarray:
+        """(K,) bool — :meth:`is_visible` for every row."""
+        return ~(self.hidden | (self.hide_rejected & ~self.accepted))
+
     @property
     def n_accepted(self) -> int:
         return int(self.accepted.sum())
@@ -792,41 +796,62 @@ def _active_pearson_corr(C: np.ndarray,
 
 
 def _masked_pearson(X: np.ndarray, Y: np.ndarray,
-                    active_thr: float = 0.0) -> np.ndarray:
+                    active_thr: float = 0.0,
+                    block_bytes: float = 64e6) -> np.ndarray:
     """(Kx, Ky) Pearson r of X[i] vs Y[j] over frames where either is
     active (> active_thr); NaN with < 3 such frames or a flat trace.
 
     Every masked sum splits into frames where x is active plus frames
-    where only y is (Σₘ xy = (xa)·y + (x − xa)·(yb)), so the whole matrix
-    is seven matrix products instead of a K² Python loop.  When X is Y the
-    diagonal is NaN.
+    where only y is (Σₘ xy = (xa)·y + (x − xa)·(yb)), so a block of the
+    matrix is seven matrix products instead of a Python pair loop.  Rows
+    are processed in blocks so the float64 work arrays stay near
+    ``block_bytes`` whatever K × T is; when X is Y only the upper block
+    triangle is computed and the diagonal is NaN.
     """
     Kx, T = X.shape
     Ky    = Y.shape[0]
+    out   = np.full((Kx, Ky), np.nan, dtype=np.float32)
     if Kx == 0 or Ky == 0 or T < 3:
-        return np.full((Kx, Ky), np.nan, dtype=np.float32)
-    x  = np.asarray(X, dtype=np.float64);  y  = np.asarray(Y, dtype=np.float64)
-    a  = (X > active_thr).astype(np.float64)
-    b  = (Y > active_thr).astype(np.float64)
-    xa, ya = x * a, y * b                        # x on its own active frames
-    xo, yo = x - xa, y - ya                      # … and off them
-    # Σ over a ∨ b of p_i·q_j  = Σ_a p·q + Σ_(b∖a) p·q, each one product
-    n   = a.sum(1)[:, None] + (1 - a) @ b.T
-    sx  = xa.sum(1)[:, None] + xo @ b.T          # Σₘ x_i
-    sy  = ya.sum(1)[None, :] + a @ yo.T          # Σₘ y_j
-    sxx = (xa * x).sum(1)[:, None] + (xo * x) @ b.T
-    syy = (ya * y).sum(1)[None, :] + a @ (yo * y).T
-    sxy = xa @ y.T + xo @ ya.T
-    with np.errstate(divide="ignore", invalid="ignore"):
-        vx  = sxx - sx * sx / n
-        vy  = syy - sy * sy / n
-        cov = sxy - sx * sy / n
-        r   = cov / np.sqrt(vx * vy)
-    bad = (n < 2.5) | (vx < 1e-24) | (vy < 1e-24) | ~np.isfinite(r)
-    r = np.clip(np.where(bad, np.nan, r), -1.0, 1.0).astype(np.float32)
-    if X is Y and Kx == Ky:
-        np.fill_diagonal(r, np.nan)
-    return r
+        return out
+    same = X is Y
+    step = int(max(16, block_bytes // (6 * 8 * T)))   # ~6 (rows × T) f64 arrays
+
+    def parts(M, lo, hi):
+        """Per-block work arrays: mask, values on / off it, squares."""
+        m  = np.asarray(M[lo:hi], dtype=np.float64)
+        a  = (M[lo:hi] > active_thr).astype(np.float64)
+        on = m * a
+        off = m - on
+        return a, on, off, (on * m).sum(1), off * m, on.sum(1), m
+
+    for ylo in range(0, Ky, step):
+        yhi = min(ylo + step, Ky)
+        b, ya, yo, syy_on, yo2, sy_on, y = parts(Y, ylo, yhi)
+        for xlo in range(0, (yhi if same else Kx), step):
+            xhi = min(xlo + step, Kx)
+            if same and xlo == ylo:
+                a, xa, xo, sxx_on, xo2, sx_on, x = b, ya, yo, syy_on, yo2, sy_on, y
+            else:
+                a, xa, xo, sxx_on, xo2, sx_on, x = parts(X, xlo, xhi)
+            # Σ over a ∨ b = Σ over a  +  Σ over b where a is off
+            n   = a.sum(1)[:, None] + (1 - a) @ b.T
+            sx  = sx_on[:, None] + xo @ b.T
+            sy  = sy_on[None, :] + a @ yo.T
+            sxx = sxx_on[:, None] + xo2 @ b.T
+            syy = syy_on[None, :] + a @ yo2.T
+            sxy = xa @ y.T + xo @ ya.T
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vx  = sxx - sx * sx / n
+                vy  = syy - sy * sy / n
+                r   = (sxy - sx * sy / n) / np.sqrt(vx * vy)
+            bad = (n < 2.5) | (vx < 1e-24) | (vy < 1e-24) | ~np.isfinite(r)
+            r = np.clip(np.where(bad, np.nan, r), -1.0, 1.0).astype(np.float32)
+            out[xlo:xhi, ylo:yhi] = r
+            if same:
+                out[ylo:yhi, xlo:xhi] = r.T
+    if same and Kx == Ky:
+        np.fill_diagonal(out, np.nan)
+    return out
 
 
 def _active_pearson_row(C: np.ndarray, k: int,

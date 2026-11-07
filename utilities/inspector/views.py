@@ -811,8 +811,20 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
     def _matrix(self) -> np.ndarray:
         raise NotImplementedError
 
+    def redraw(self):
+        """Re-render from the cached matrix (visibility changed); keeps the
+        highlight unless it involves a now-invisible component."""
+        if self._highlight and not all(self.store.is_visible(k) for k in self._highlight):
+            self._highlight = None
+        self._render()
+
     def _render(self):
         mat    = self._matrix()          # (K, K) float32, diag=NaN
+        vis    = self.store.visible_mask()
+        if not vis.all():                # hidden / hidden-rejected rows: neutral, not
+            mat = mat.copy()             # in the colour levels, not clickable
+            mat[~vis, :] = np.nan
+            mat[:, ~vis] = np.nan
         vmin, vmax = self._levels(mat)
         # NaN → midpoint colour so diagonal is neutral
         display = np.where(np.isnan(mat), (vmin + vmax) / 2.0, mat)
@@ -864,7 +876,8 @@ class _MatrixWidget(pg.GraphicsLayoutWidget):
         j  = int(pt.x())   # floor: pixel [r,c] occupies [c, c+1)
         i  = int(pt.y())   # floor: pixel [r,c] occupies [r, r+1)
         n  = self.store.n
-        if 0 <= i < n and 0 <= j < n and i != j:
+        if (0 <= i < n and 0 <= j < n and i != j
+                and self.store.is_visible(i) and self.store.is_visible(j)):
             self._highlight = (i, j)
             self._draw_highlight()
             self.pair_clicked.emit(i, j)
@@ -915,10 +928,7 @@ class DistMatrix(_MatrixWidget):
         off = mat[~np.isnan(mat)]
         if off.size == 0:
             return 0.0, 1.0
-        if self._log:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                off = np.where(off > 0, np.log10(off), np.nan)
-            off = off[~np.isnan(off)]
+        # in log mode `mat` is already log10(distance) (see _matrix)
         vmax = float(np.clip(np.percentile(off, 99), 1e-3, None)) \
                if off.size > 0 else 1.0
         vmin = float(off.min()) if self._log and off.size > 0 else 0.0

@@ -29,6 +29,7 @@ mc = types.ModuleType("caiman.source_extraction.cnmf.cnmf"); mc.load_CNMF = load
 sys.modules["caiman.source_extraction.cnmf.cnmf"] = mc
 
 insp = load_inspector()
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 app = QApplication.instance() or QApplication([])
 
@@ -120,7 +121,24 @@ try:
         fp = w.store.footprint(i); pk = np.unravel_index(np.argmax(fp), fp.shape); return float(img[pk][3])
     assert all(alpha_at(i) == 0 for i in inactive) and all(alpha_at(i) > 0 for i in active)
     assert not w.store.is_visible(int(inactive[0])) and w.store.is_visible(int(active[0]))
-    ok("Hide rejected: rows hidden, footprints dropped from the overlay, not clickable")
+    for v in (w.corr_view, w.dist_view):
+        shown = np.asarray(v._img.image)
+        mid = sum(v._img.getLevels()) / 2
+        for i in inactive:
+            assert np.allclose(shown[i, :], mid) and np.allclose(shown[:, i], mid), type(v).__name__
+        pairs = []
+        v.pair_clicked.connect(lambda i, j: pairs.append((i, j)))
+        class Ev:
+            def __init__(self, i, j): self.p = (i, j)
+            def button(self): return Qt.MouseButton.LeftButton
+            def modifiers(self): return Qt.KeyboardModifier.ControlModifier
+            def scenePos(self): return self.p
+        v.vb.mapSceneToView = lambda p: types.SimpleNamespace(x=lambda: p[1] + 0.5, y=lambda: p[0] + 0.5)
+        v._on_scene_click(Ev(int(inactive[0]), int(active[1])))
+        v._on_scene_click(Ev(int(active[0]), int(active[1])))
+        assert pairs == [(int(active[0]), int(active[1]))], pairs
+    ok("Hide rejected: rows hidden, footprints dropped from the overlay, not clickable; "
+       "matrix rows neutral and Ctrl+click ignores them")
 
     w.close(); app.processEvents()
     prefs = json.loads(Path(os.environ["CAIMAN_INSPECTOR_PREFS"]).read_text())

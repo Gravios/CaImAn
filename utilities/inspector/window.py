@@ -512,6 +512,8 @@ class InspectorWindow(QMainWindow):
         self.store.hide_rejected = bool(flag)
         self.table.mark_hidden()
         self.cell_view.refresh_visibility()
+        self.corr_view.redraw()
+        self.dist_view.redraw()
         s = self.store
         if s.eval_known:
             self.statusBar().showMessage(
@@ -881,6 +883,8 @@ class InspectorWindow(QMainWindow):
             return
         self.store.toggle_hidden(sel)
         self.cell_view.refresh_visibility()
+        self.corr_view.redraw()
+        self.dist_view.redraw()
         self.table.mark_hidden()
         self.statusBar().showMessage(
             f"{self.store.n_hidden} hidden  |  {self.store.n} total")
@@ -891,6 +895,8 @@ class InspectorWindow(QMainWindow):
             return
         self.store.show_all()
         self.cell_view.refresh_visibility()
+        self.corr_view.redraw()
+        self.dist_view.redraw()
         self.table.mark_hidden()
         self.statusBar().showMessage(f"All {self.store.n} components visible")
 
