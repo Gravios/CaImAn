@@ -31,7 +31,8 @@ Controls
                    recomputes them, e.g. for sessions processed before the
                    pipeline step existed; thresholds live in Edit ▸
                    Preferences… (Ctrl+,), ~/.config/caiman/inspector_prefs.json
-    P / H        — Preferences (theme, plot background, font size, ROI-filter
+    P / H        — Preferences (theme, plot background, font size, ROI overlay
+                   opacity, ROI-filter
                    thresholds) / Help with every shortcut and a usage guide
                    (also Ctrl+, and F1).
     Layout       — window and pane sizes, hidden columns, sort, view toggles,
@@ -113,9 +114,12 @@ CORR_B   = "#FF00FF"   # magenta – second
 CYAN     = "#00FFFF"   # default (unselected) footprint colour
 EXCLUDED = "#FF3B3B"   # footprints of components not approved (events mode)
 
-ALPHA_SEL    = 0.55   # overlay alpha for selected components
-ALPHA_DEF    = 0.12   # overlay alpha for unselected components
-ALPHA_EXCL   = 0.22   # excluded components: a little stronger, so red reads
+# Footprint overlay opacity (0–1), read at draw time; set from the
+# Appearance preferences (percent) by set_theme().
+OVERLAY_ALPHA_DEFAULTS = {"selected": 0.55,   # selected / matrix-pair components
+                          "all":      0.12,   # the all-ROIs layer
+                          "excluded": 0.22}   # excluded: a little stronger, so red reads
+OVERLAY_ALPHA = dict(OVERLAY_ALPHA_DEFAULTS)
 CROSS_MIN_ARM = 25    # minimum cross arm half-length in pixels
 
 BG_DARK  = "#111111"
@@ -168,10 +172,10 @@ def _build_overlay(store: 'ComponentStore',
     for i in range(store.n):
         if pair and i in pair_set:
             hex_c = CORR_A if i == pair[0] else CORR_B
-            alpha = ALPHA_SEL
+            alpha = OVERLAY_ALPHA["selected"]
         elif i in sel_set:
             hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
-            alpha = ALPHA_SEL
+            alpha = OVERLAY_ALPHA["selected"]
         else:
             continue
 
@@ -927,6 +931,12 @@ _APPEARANCE_PREF_FIELDS = (
      "selection colours; light plots use a darker palette."),
     ("Theme", "font_size", "Font size (pt)", "int", (6, 32, 1, 0), "default",
      "Base font size of the whole inspector."),
+    ("ROI overlay", "alpha_selected", "Selected ROIs (%)", "int", (0, 100, 5, 0), None,
+     "Opacity of selected and matrix-pair footprints in the cell viewer."),
+    ("ROI overlay", "alpha_all", "All other ROIs (%)", "int", (0, 100, 2, 0), None,
+     "Opacity of the all-ROIs layer (toolbar: All ROIs)."),
+    ("ROI overlay", "alpha_excluded", "Excluded ROIs (%)", "int", (0, 100, 2, 0), None,
+     "Opacity of excluded (red) footprints in the all-ROIs layer."),
 )
 
 # section key → (tab title, field specs, defaults loader)
@@ -1640,10 +1650,10 @@ def _build_overlay(store: ComponentStore,
 
         if pair and i in pair_set:
             hex_c = CORR_A if i == pair[0] else CORR_B
-            alpha = ALPHA_SEL
+            alpha = OVERLAY_ALPHA["selected"]
         elif i in sel_set:
             hex_c = PALETTE_HEX[sel.index(i) % len(PALETTE_HEX)]
-            alpha = ALPHA_SEL
+            alpha = OVERLAY_ALPHA["selected"]
         else:
             continue   # only draw overlay for selected / pair components
 
@@ -1687,7 +1697,7 @@ def _build_roi_overlay(store: ComponentStore,
         peak = fp.max()
         if peak < 1e-9:
             continue
-        a_mask = (fp / peak) * (ALPHA_EXCL if excluded else ALPHA_DEF)
+        a_mask = (fp / peak) * OVERLAY_ALPHA["excluded" if excluded else "all"]
         out[..., 0] = np.maximum(out[..., 0], r * a_mask)
         out[..., 1] = np.maximum(out[..., 1], g * a_mask)
         out[..., 2] = np.maximum(out[..., 2], b * a_mask)
@@ -3450,8 +3460,8 @@ found next to the results, or opened with View ▸ Open movie….  Picking a BG
 image returns to the static background.</p>
 
 <h3>Preferences &amp; layout</h3>
-<p>Edit ▸ Preferences… (P) sets the theme, plot background, font size and
-ROI-filter thresholds.  Window and pane sizes, hidden columns, sort, view
+<p>Edit ▸ Preferences… (P) sets the theme, plot background, font size,
+ROI overlay opacity (selected / all / excluded) and ROI-filter thresholds.  Window and pane sizes, hidden columns, sort, view
 toggles, background / trace choice and the last folder are remembered;
 View ▸ Reset layout restores the defaults.  Everything is stored in
 <code>{prefs}</code>.</p>
@@ -4195,12 +4205,15 @@ class InspectorWindow(QMainWindow):
 
     def apply_theme(self, appearance: dict = None) -> None:
         """Activate the (saved) appearance and re-style every live view."""
-        before = (dict(UI), dict(PT))
+        before = (dict(UI), dict(PT), dict(OVERLAY_ALPHA))
         set_theme(appearance)
         self.movie_bar.lbl.setStyleSheet(f"color: {UI['muted']}; font-family: monospace;")
         self._sel_lbl.setStyleSheet(f"color: {UI['muted']}; font-size: 9pt;")
-        if before == (UI, PT):
-            return                             # colours unchanged (font only)
+        if before[:2] == (UI, PT):
+            if before[2] != OVERLAY_ALPHA:     # only the overlay opacity changed
+                self.cell_view.refresh_rois()
+                self.cell_view._redraw()
+            return
         sel = self._selected_rows()
         for v in (self.cell_view, self.trace_view, self.event_view,
                   self.corr_view, self.dist_view):
@@ -4805,7 +4818,10 @@ PLOT_THEMES = {
         palette=PALETTE_LIGHT_BG),
 }
 
-APPEARANCE_DEFAULTS = {"theme": "dark", "plot_background": "auto", "font_size": None}
+APPEARANCE_DEFAULTS = {"theme": "dark", "plot_background": "auto", "font_size": None,
+                       "alpha_selected": 55, "alpha_all": 12, "alpha_excluded": 22}
+_ALPHA_KEYS = {"alpha_selected": "selected", "alpha_all": "all",
+               "alpha_excluded": "excluded"}
 
 UI = dict(UI_THEMES["dark"])                 # active tables (mutated in place)
 PT = dict(PLOT_THEMES["dark"])
@@ -4860,6 +4876,12 @@ def set_theme(appearance: dict = None) -> tuple:
     UI.clear(); UI.update(UI_THEMES[ui])
     PT.clear(); PT.update(PLOT_THEMES[plot])
     PALETTE_HEX[:] = PT["palette"]
+    for key, slot in _ALPHA_KEYS.items():          # percent → 0–1, clamped
+        try:
+            v = float(appearance.get(key))
+        except (TypeError, ValueError):
+            v = OVERLAY_ALPHA_DEFAULTS[slot] * 100
+        OVERLAY_ALPHA[slot] = min(max(v, 0.0), 100.0) / 100.0
     _THEME_STATE["ui"], _THEME_STATE["plot"] = ui, plot
     if app is None:
         return ui, plot
