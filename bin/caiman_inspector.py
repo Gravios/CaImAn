@@ -25,7 +25,11 @@ Controls
                    click a column header to sort.  ROI-filter columns
                    (QC, Active, Fail, Area, Solid, Ecc, Edge, Rate,
                    Pk ΔF/F, Skew, Act %) appear when the results file has a
-                   roi_filter group; Incl then starts from the QC verdict
+                   roi_filter group; Incl then starts from the QC verdict.
+                   Analysis ▸ Run ROI filter… (Ctrl+Shift+F) adds or
+                   recomputes them, e.g. for sessions processed before the
+                   pipeline step existed; thresholds live in Edit ▸
+                   Preferences… (Ctrl+,), ~/.config/caiman/inspector_prefs.json
     Movie bar    — under the cell viewer: play / scrub the raw stack
                    (<session>.tif / .msr next to the results is found;
                    View > Open movie… / Ctrl+M for another).  With the
@@ -60,6 +64,7 @@ Event detection & curation (ported from SLabAnalysisPackage)
 import sys
 import os
 import re
+import json
 import argparse
 from collections import deque
 import numpy as np
@@ -79,6 +84,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QInputDialog, QProgressDialog,
     QWidget, QHBoxLayout, QVBoxLayout, QSlider, QSpinBox, QToolButton,
+    QCheckBox, QGroupBox, QPushButton, QScrollArea, QTabWidget,
 )
 from PyQt6.QtCore  import Qt, pyqtSignal, QSize, QItemSelectionModel, QTimer
 from PyQt6.QtGui   import (
@@ -554,6 +560,38 @@ class ComponentStore:
                 row[k] = np.array([fill], dtype=v.dtype)
         return row
 
+    def run_roi_filter(self, cfg: dict, set_incl: bool = False) -> dict:
+        """Evaluate every row with the ROI filter (undoable).
+
+        ``cfg`` is a roi_filter section (preferences); nulls are filled from
+        the loaded run's CaImAn params, then from the store (fr, decay
+        time).  ``set_incl`` resets the include flags to the QC verdict.
+        Returns the summary."""
+        rf = _rf()
+        p  = self.resolve_filter_params(cfg)
+        fields = rf.evaluate(self._A, self.dims,
+                             SNR_comp=self.SNR_comp, r_values=self.r_values,
+                             cnn_preds=self.cnn_preds, F_dff=self.dff, C=self.C,
+                             params=p)
+        self._push_undo("ROI filter")
+        self.qc, self.qc_params = fields, p
+        if set_incl:
+            self.approved = np.asarray(fields["passed"], bool).copy()
+        return rf.summarize(fields)
+
+    def resolve_filter_params(self, cfg: dict) -> dict:
+        rf = _rf()
+        cfg = dict(cfg)
+        g = cfg.get("gSig")
+        if g is not None and np.ndim(g) == 0:
+            cfg["gSig"] = [float(g), float(g)]
+        p = rf.resolve_params(cfg, getattr(self.cnm_obj, "params", None))
+        if p.get("fr") is None and self.fr:
+            p["fr"] = float(self.fr)
+        if p.get("decay_time") is None and self.decay_time:
+            p["decay_time"] = float(self.decay_time)
+        return p
+
     @property
     def has_approval(self) -> bool:
         """Include flags exist once events are detected or a roi_filter
@@ -777,6 +815,104 @@ def _rf():
         spec.loader.exec_module(mod)
     sys.modules["_inspector_roi_filter"] = mod
     return mod
+
+
+# ── Preferences (JSON, per user) ─────────────────────────────────────────────
+
+def prefs_path() -> str:
+    """``$CAIMAN_INSPECTOR_PREFS``, else ``$XDG_CONFIG_HOME/caiman/
+    inspector_prefs.json`` (``~/.config`` when XDG is unset)."""
+    p = os.environ.get("CAIMAN_INSPECTOR_PREFS")
+    if p:
+        return p
+    base = (os.environ.get("XDG_CONFIG_HOME")
+            or os.path.join(os.path.expanduser("~"), ".config"))
+    return os.path.join(base, "caiman", "inspector_prefs.json")
+
+
+def load_prefs() -> dict:
+    try:
+        with open(prefs_path()) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[prefs] ignoring unreadable {prefs_path()}: {exc}", file=sys.stderr)
+        return {}
+
+
+def save_prefs(prefs: dict) -> str:
+    path = prefs_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(prefs, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def roi_filter_prefs(prefs: dict = None) -> dict:
+    """roi_filter DEFAULTS (+ gSig override) overlaid with the saved section;
+    unknown keys are dropped."""
+    d = dict(_rf().DEFAULTS)
+    d["gSig"] = None
+    sec = (load_prefs() if prefs is None else prefs).get("roi_filter", {})
+    for k, v in (sec if isinstance(sec, dict) else {}).items():
+        if k in d:
+            d[k] = v
+    return d
+
+
+# Field specs for the preference editor, one list per section:
+#   (group, key, label, kind, (min, max, step, decimals), null_text, tooltip)
+# kind: "float" | "int" | "bool" | "tristate";  null_text=None → not nullable,
+# else the checkbox-off meaning ("off", "from run", …).
+_RF_PREF_FIELDS = (
+    ("Footprint", "footprint_thr", "Mask threshold (× peak)", "float", (0.01, 1.0, 0.05, 2), None,
+     "Footprint mask = connected pixels ≥ this fraction of the footprint's peak."),
+    ("Footprint", "gSig", "Expected cell radius gSig (px)", "float", (0.5, 200.0, 0.5, 1), "from run",
+     "Sets the expected area π·gSig² for the area fractions.  Off: the run's init.gSig."),
+    ("Footprint", "min_area_frac", "Min area (× π·gSig²)", "float", (0.0, 100.0, 0.1, 2), "off",
+     "Fail footprints smaller than this multiple of the expected area."),
+    ("Footprint", "max_area_frac", "Max area (× π·gSig²)", "float", (0.0, 1000.0, 0.5, 1), "off",
+     "Fail footprints larger than this multiple of the expected area."),
+    ("Footprint", "min_area_px", "Min area (px)", "int", (0, 10_000_000, 1, 0), "off",
+     "Absolute limit; overrides the fraction."),
+    ("Footprint", "max_area_px", "Max area (px)", "int", (0, 10_000_000, 10, 0), "off",
+     "Absolute limit; overrides the fraction."),
+    ("Footprint", "min_solidity", "Min solidity", "float", (0.0, 1.0, 0.05, 2), "off",
+     "Area / convex-hull area; low for ragged or ring-shaped footprints."),
+    ("Footprint", "max_eccentricity", "Max eccentricity", "float", (0.0, 1.0, 0.01, 2), "off",
+     "0 = circle, → 1 = line (dendrites, scan artefacts)."),
+    ("Edge", "edge_px", "Min distance to border (px)", "float", (0.0, 10_000.0, 1.0, 0), "off",
+     "Fail ROIs whose centroid is closer than this to the FOV border."),
+    ("CaImAn quality", "use_caiman_quality", "Apply CaImAn quality rule", "bool", None, None,
+     "Pass any upper threshold and no *_lowest floor (CaImAn's evaluate_components)."),
+    ("CaImAn quality", "min_SNR", "min_SNR", "float", (0.0, 1000.0, 0.1, 2), "from run", ""),
+    ("CaImAn quality", "SNR_lowest", "SNR_lowest", "float", (0.0, 1000.0, 0.1, 2), "from run", ""),
+    ("CaImAn quality", "rval_thr", "rval_thr", "float", (-1.0, 1.0, 0.05, 2), "from run", ""),
+    ("CaImAn quality", "rval_lowest", "rval_lowest", "float", (-1.0, 1.0, 0.05, 2), "from run", ""),
+    ("CaImAn quality", "use_cnn", "use_cnn", "tristate", None, "from run", ""),
+    ("CaImAn quality", "min_cnn_thr", "min_cnn_thr", "float", (0.0, 1.0, 0.05, 2), "from run", ""),
+    ("CaImAn quality", "cnn_lowest", "cnn_lowest", "float", (0.0, 1.0, 0.05, 2), "from run", ""),
+    ("Activity", "event_threshold", "Event cutoff (ΔF/F)", "float", (0.001, 10.0, 0.05, 3), None,
+     "SLab detection cap: threshold = min(10·noise, this)."),
+    ("Activity", "lowpass_hz", "Low-pass cutoff (Hz)", "float", (0.1, 1000.0, 1.0, 1), "SLab default",
+     "Off: SLab's normalised cutoff."),
+    ("Activity", "min_events", "Min events", "int", (0, 1_000_000, 1, 0), "off",
+     "Active ⇔ every set minimum is met."),
+    ("Activity", "min_event_rate", "Min event rate (/min)", "float", (0.0, 1000.0, 0.1, 2), "off", ""),
+    ("Activity", "min_peak_dff", "Min peak ΔF/F", "float", (0.0, 100.0, 0.05, 2), "off", ""),
+    ("Activity", "min_skewness", "Min skewness", "float", (-100.0, 100.0, 0.1, 2), "off", ""),
+    ("Verdict", "require_activity", "Inactive ROIs fail QC", "bool", None, None,
+     "Off: activity is reported separately and silent cells can pass."),
+)
+
+# section key → (tab title, field specs, defaults loader)
+PREF_SECTIONS = {
+    "roi_filter": ("ROI filter", _RF_PREF_FIELDS, lambda: roi_filter_prefs({})),
+}
 
 
 def _opt_arr(x):
@@ -2782,6 +2918,308 @@ class ComponentTable(QTableWidget):
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
+# ── Preference editor ─────────────────────────────────────────────────────────
+
+def _fmt_num(v) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, (list, tuple)):
+        return "×".join(_fmt_num(x) for x in v)
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{f:g}"
+
+
+class _PrefField(QWidget):
+    """One preference value.  Nullable numbers get a checkbox: unchecked =
+    null (shown as ``null_text``, plus the run's value when known)."""
+
+    def __init__(self, kind, rng, null_text, hint=None, parent=None):
+        super().__init__(parent)
+        self.kind, self.null_text = kind, null_text
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.chk = self.spin = self.box = self.combo = self.hint = None
+        if kind == "bool":
+            self.box = QCheckBox(self)
+            lay.addWidget(self.box)
+        elif kind == "tristate":
+            self.combo = QComboBox(self)
+            first = null_text + (f" ({_fmt_num(hint)})" if hint is not None else "")
+            self.combo.addItems([first, "on", "off"])
+            lay.addWidget(self.combo)
+        else:
+            lo, hi, step, dec = rng
+            if kind == "int":
+                self.spin = QSpinBox(self)
+                self.spin.setRange(int(lo), int(hi))
+                self.spin.setSingleStep(int(step))
+            else:
+                self.spin = QDoubleSpinBox(self)
+                self.spin.setRange(float(lo), float(hi))
+                self.spin.setDecimals(int(dec))
+                self.spin.setSingleStep(float(step))
+            self.spin.setMinimumWidth(110)
+            if null_text is not None:
+                self.chk = QCheckBox(self)
+                self.chk.setToolTip(f"Unchecked: {null_text}")
+                self.hint = QLabel(null_text + (f": {_fmt_num(hint)}" if hint is not None else ""), self)
+                self.hint.setStyleSheet("color: #888888;")
+                self.chk.toggled.connect(self._sync)
+                lay.addWidget(self.chk)
+            lay.addWidget(self.spin)
+            if self.hint is not None:
+                lay.addWidget(self.hint)
+            if hint is not None and not isinstance(hint, (list, tuple, bool)):
+                try:
+                    self.spin.setValue(float(hint))
+                except (TypeError, ValueError):
+                    pass
+            elif isinstance(hint, (list, tuple)) and hint:
+                self.spin.setValue(float(hint[0]))
+        lay.addStretch(1)
+
+    def _sync(self):
+        on = self.chk.isChecked()
+        self.spin.setEnabled(on)
+        self.hint.setVisible(not on)
+
+    def value(self):
+        if self.box is not None:
+            return bool(self.box.isChecked())
+        if self.combo is not None:
+            return {0: None, 1: True, 2: False}[self.combo.currentIndex()]
+        if self.chk is not None and not self.chk.isChecked():
+            return None
+        v = self.spin.value()
+        return int(v) if self.kind == "int" else float(v)
+
+    def set_value(self, v):
+        if self.box is not None:
+            self.box.setChecked(bool(v))
+            return
+        if self.combo is not None:
+            self.combo.setCurrentIndex(0 if v is None else 1 if v else 2)
+            return
+        if isinstance(v, (list, tuple)):
+            v = v[0] if len(v) else None
+        if self.chk is not None:
+            self.chk.setChecked(v is not None)
+            self._sync()
+        if v is not None:
+            self.spin.setValue(int(v) if self.kind == "int" else float(v))
+
+
+class PreferencesDialog(QDialog):
+    """Edit ▸ Preferences — one tab per entry in PREF_SECTIONS, saved as JSON
+    (see prefs_path).  The ROI-filter tab can load the defaults, the
+    ``roi_filter`` section of a pipeline JSON, or this file's stored
+    filter parameters."""
+
+    def __init__(self, prefs: dict, run_hints: dict = None,
+                 file_params: dict = None, section: str = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.resize(560, 720)
+        self._prefs  = {k: (dict(v) if isinstance(v, dict) else v) for k, v in prefs.items()}
+        self._fields = {}
+        self._file_params = file_params
+        self.tabs = QTabWidget(self)
+        for sec, (title, specs, defaults) in PREF_SECTIONS.items():
+            page = QWidget()
+            v = QVBoxLayout(page)
+            forms = {}
+            for grp, key, label, kind, rng, null_text, tip in specs:
+                if grp not in forms:
+                    gb = QGroupBox(grp, page)
+                    forms[grp] = QFormLayout(gb)
+                    v.addWidget(gb)
+                hint = (run_hints or {}).get(key) if null_text == "from run" else None
+                w = _PrefField(kind, rng, null_text, hint, page)
+                lbl = QLabel(label, page)
+                if tip:
+                    w.setToolTip(tip)
+                    lbl.setToolTip(tip)
+                forms[grp].addRow(lbl, w)
+                self._fields.setdefault(sec, {})[key] = w
+            if sec == "roi_filter":
+                row = QHBoxLayout()
+                b_def  = QPushButton("Defaults", page)
+                b_json = QPushButton("From pipeline JSON…", page)
+                b_file = QPushButton("From this file", page)
+                b_def.setToolTip("roi_filter defaults (same as template_pipeline.json)")
+                b_json.setToolTip("Load the roi_filter section of a _pipeline.json / template")
+                b_file.setToolTip("The parameters stored in this results file's roi_filter group")
+                b_file.setEnabled(bool(file_params))
+                b_def.clicked.connect(lambda: self._apply("roi_filter", defaults()))
+                b_json.clicked.connect(self._from_json)
+                b_file.clicked.connect(lambda: self._apply("roi_filter", self._file_params or {}))
+                for b in (b_def, b_json, b_file):
+                    row.addWidget(b)
+                row.addStretch(1)
+                v.addLayout(row)
+            v.addStretch(1)
+            scroll = QScrollArea(self)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self.tabs.addTab(scroll, title)
+            cur = defaults()
+            cur.update({k: x for k, x in (self._prefs.get(sec) or {}).items() if k in cur})
+            self._apply(sec, cur)
+            if sec == section:
+                self.tabs.setCurrentIndex(self.tabs.count() - 1)
+
+        where = QLabel(f"Saved to {prefs_path()}", self)
+        where.setStyleSheet("color: #888888;")
+        where.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel, self)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.tabs, 1)
+        lay.addWidget(where)
+        lay.addWidget(bb)
+
+    def _apply(self, sec: str, values: dict):
+        for k, w in self._fields.get(sec, {}).items():
+            if k in values:
+                w.set_value(values[k])
+
+    def _from_json(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pipeline JSON", "", "JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path) as fh:
+                text = re.sub(r"(?m)^\s*//.*$", "", fh.read())
+            sec = json.loads(text).get("roi_filter")
+        except Exception as exc:
+            QMessageBox.warning(self, "Preferences", f"Cannot read {path}:\n{exc}")
+            return
+        if not isinstance(sec, dict):
+            QMessageBox.information(self, "Preferences",
+                                    f"{os.path.basename(path)} has no roi_filter section.")
+            return
+        self._apply("roi_filter", sec)
+
+    def section_values(self, sec: str) -> dict:
+        return {k: w.value() for k, w in self._fields.get(sec, {}).items()}
+
+    def values(self) -> dict:
+        """All preferences: edited sections merged over what was loaded
+        (keys the editor does not show, e.g. roi_filter.enabled, are kept)."""
+        out = dict(self._prefs)
+        for sec in self._fields:
+            cur = dict(out.get(sec) or {})
+            cur.update(self.section_values(sec))
+            out[sec] = cur
+        return out
+
+
+class RunFilterDialog(QDialog):
+    """Analysis ▸ Run ROI filter — shows the resolved thresholds (preferences
+    + the run's CaImAn params), what will be skipped, and whether Incl is
+    reset to the verdict."""
+
+    def __init__(self, window: 'InspectorWindow', store: 'ComponentStore'):
+        super().__init__(window)
+        self.setWindowTitle("Run ROI filter")
+        self.window_, self.store = window, store
+        lay = QVBoxLayout(self)
+        intro = (f"Evaluate the {store.n} shown components with the ROI-filter "
+                 "preferences.  ")
+        intro += ("This replaces the file's current ROI-filter fields (undoable)."
+                  if store.qc is not None else
+                  "This file has no ROI-filter fields yet.")
+        intro += "  Save to keep the result."
+        lbl = QLabel(intro, self)
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+        self.summary = QLabel(self)
+        self.summary.setStyleSheet("font-family: monospace;")
+        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.summary)
+        self.warn = QLabel(self)
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #e0a030;")
+        lay.addWidget(self.warn)
+        self.chk_incl = QCheckBox("Set Incl from the new QC verdict", self)
+        self.chk_incl.setChecked(not store.has_approval)
+        self.chk_incl.setToolTip(
+            "Replace the include flags with `passed`."
+            + ("  Replaces event approvals." if store.events is not None else ""))
+        lay.addWidget(self.chk_incl)
+        bb = QDialogButtonBox(self)
+        b_run = bb.addButton("Run", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
+        b_edit = bb.addButton("Edit parameters…", QDialogButtonBox.ButtonRole.ActionRole)
+        b_edit.clicked.connect(self._edit)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        b_run.setDefault(True)
+        lay.addWidget(bb)
+        self._refresh()
+
+    @property
+    def set_incl(self) -> bool:
+        return self.chk_incl.isChecked()
+
+    def _edit(self):
+        if self.window_._edit_prefs("roi_filter"):
+            self._refresh()
+
+    def _refresh(self):
+        s, rf = self.store, _rf()
+        p = s.resolve_filter_params(roi_filter_prefs())
+        lo, hi = rf.area_limits(p)
+        n = _fmt_num
+        area = ("off" if lo is None and hi is None else
+                f"{n(round(lo)) if lo is not None else '0'}–{n(round(hi)) if hi is not None else '∞'} px")
+        def lim(key, op):
+            return "off" if p.get(key) is None else f"{op} {n(p[key])}"
+        lines = [
+            f"Footprint   mask ≥ {n(p.get('footprint_thr'))}×peak, area {area}"
+            + (f" (gSig {n(p.get('gSig'))})" if p.get("gSig") is not None else ""),
+            f"            solidity {lim('min_solidity', '≥')}, eccentricity {lim('max_eccentricity', '≤')}",
+            f"Edge        centroid {lim('edge_px', '≥')} px from the border",
+        ]
+        have_q = any(a is not None for a in (s.SNR_comp, s.r_values, s.cnn_preds))
+        if not p.get("use_caiman_quality", True):
+            lines.append("Quality     off")
+        else:
+            lines.append(
+                f"Quality     SNR ≥ {n(p.get('min_SNR'))} (floor {n(p.get('SNR_lowest'))}), "
+                f"r ≥ {n(p.get('rval_thr'))} (floor {n(p.get('rval_lowest'))}), "
+                + (f"CNN ≥ {n(p.get('min_cnn_thr'))} (floor {n(p.get('cnn_lowest'))})"
+                   if p.get("use_cnn") else "CNN off"))
+        acts = [f"{lab} ≥ {n(p[k])}" for k, lab in (
+            ("min_events", "events"), ("min_event_rate", "rate"),
+            ("min_peak_dff", "peak ΔF/F"), ("min_skewness", "skew")) if p.get(k) is not None]
+        lines.append(f"Activity    {', '.join(acts) or 'no thresholds'}; cutoff "
+                     f"{n(p.get('event_threshold'))}, fr {n(p.get('fr'))} Hz, "
+                     f"decay {n(p.get('decay_time'))} s")
+        lines.append(f"QC          {'requires' if p.get('require_activity') else 'ignores'} activity")
+        self.summary.setText("\n".join(lines))
+        warns = []
+        if lo is None and hi is None and (p.get("min_area_frac") is not None
+                                          or p.get("max_area_frac") is not None):
+            warns.append("No gSig known: set it in the preferences or the area check is skipped.")
+        if p.get("use_caiman_quality", True) and not have_q:
+            warns.append("No SNR / r / CNN scores in this file: CaImAn quality is skipped.")
+        if s.dff is None:
+            warns.append("No ΔF/F traces in this file: activity fields are skipped.")
+        elif not (p.get("fr") and p.get("decay_time")):
+            warns.append("Frame rate or decay time unknown: activity fields are skipped.")
+        self.warn.setText("\n".join(warns))
+        self.warn.setVisible(bool(warns))
+
+
 class InspectorWindow(QMainWindow):
 
     def __init__(self, store: ComponentStore):
@@ -2859,6 +3297,13 @@ class InspectorWindow(QMainWindow):
         self.act_redo.setEnabled(False)
         self.act_redo.triggered.connect(self._do_redo)
         em.addAction(self.act_redo)
+        em.addSeparator()
+        a = QAction("&Preferences…", self)
+        a.setShortcut(QKeySequence("Ctrl+,"))
+        a.setMenuRole(QAction.MenuRole.PreferencesRole)
+        a.setToolTip("ROI-filter thresholds and other inspector settings")
+        a.triggered.connect(lambda: self._edit_prefs())
+        em.addAction(a)
 
         am = mb.addMenu("&Analysis")
         self.act_detect = QAction("&Detect events…", self)
@@ -2875,6 +3320,14 @@ class InspectorWindow(QMainWindow):
             "components (.xlsx, or .csv without openpyxl).")
         self.act_export.triggered.connect(self._export_events)
         am.addAction(self.act_export)
+        am.addSeparator()
+        self.act_filter = QAction("Run &ROI filter…", self)
+        self.act_filter.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.act_filter.setToolTip(
+            "Footprint / edge / CaImAn-quality / activity filter with the\n"
+            "preference thresholds; adds or replaces the ROI-filter columns.")
+        self.act_filter.triggered.connect(self._run_filter_dialog)
+        am.addAction(self.act_filter)
         am.addSeparator()
         a = QAction("&Batch detect events in folder…", self)
         a.setToolTip("Run event detection on every results file under a folder "
@@ -3275,6 +3728,51 @@ class InspectorWindow(QMainWindow):
             act.setToolTip(s.redo_description)
 
     # ── File I/O ──────────────────────────────────────────────────────────────
+
+    # ── Preferences / ROI filter ──────────────────────────────────────────────
+
+    def _edit_prefs(self, section: str = None) -> bool:
+        """Open the preference editor; True if saved."""
+        s = self.store
+        try:
+            hints = s.resolve_filter_params({})       # the run's own values
+        except Exception:
+            hints = {}
+        dlg = PreferencesDialog(load_prefs(), hints,
+                                s.qc_params if s.qc is not None else None,
+                                section, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        try:
+            path = save_prefs(dlg.values())
+        except OSError as exc:
+            QMessageBox.critical(self, "Preferences", f"Could not save:\n{exc}")
+            return False
+        self.statusBar().showMessage(f"Preferences saved to {path}", 6000)
+        return True
+
+    def _run_filter_dialog(self):
+        if self._blind_block():
+            return
+        s = self.store
+        dlg = RunFilterDialog(self, s)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sel = self._selected_rows()
+        try:
+            summ = s.run_roi_filter(roi_filter_prefs(), set_incl=dlg.set_incl)
+        except Exception as exc:
+            QMessageBox.critical(self, "Run ROI filter", str(exc))
+            return
+        self._full_refresh()
+        self._reselect(sel)
+        msg = f"ROI filter: {summ.get('n_passed', 0)}/{summ['n_total']} passed"
+        if "n_active" in summ:
+            msg += f", {summ['n_active']} active"
+        fails = {k: v for k, v in summ.get("n_fail", {}).items() if v}
+        if fails:
+            msg += "  (fails: " + ", ".join(f"{k} {v}" for k, v in fails.items()) + ")"
+        self.statusBar().showMessage(msg + "  —  Save to keep")
 
     def _blind_block(self) -> bool:
         if self._blind is not None:
@@ -3772,7 +4270,10 @@ class InspectorWindow(QMainWindow):
         self.act_include.setEnabled(False)
         self.act_export.setEnabled(self.store.events is not None)
         self._sel_lbl.setText(f"  0 selected  |  {self.store.n} total")
-        self.statusBar().showMessage(f"{self.store.n} components")
+        self.statusBar().showMessage(
+            f"{self.store.n} components"
+            + ("  —  no ROI-filter fields: Analysis ▸ Run ROI filter… adds them"
+               if self.store.qc is None and self._blind is None else ""))
         self._update_history_actions()
         if self._blind is not None:          # undo/redo/save are edit ops
             for a in (self.act_undo, self.act_undo_tb,
