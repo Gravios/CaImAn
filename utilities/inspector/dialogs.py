@@ -438,8 +438,11 @@ rescaled to ΔF/F; ΔF/F when the file has no residual): fit of the expected
 transient (shape r), fitted decay τ, raw rise time and amplitude over the
 raw noise.  Columns Ev ok / Ev ok % / Shape r / τ fit, the event panel (blue
 fitted templates; dashed peaks fail) and the export (kin_*) show it;
-Preferences ▸ Event kinetics sets τ and the criteria.  Approval is not
-changed.  If the file has no residual and its ΔF/F is just C rescaled, the
+Preferences ▸ Event kinetics sets τ and the criteria.  Approval is SLab's
+unless you opt in (Preferences ▸ Event kinetics ▸ Require valid kinetics, or
+the checkbox in Detect events): auto-approval then also needs kinetically
+valid events, and stroh_results records the rule next to SLab's own verdict.
+If the file has no residual and its ΔF/F is just C rescaled, the
 check would be circular and the status bar says so.</p>
 
 <h3>ROI filter</h3>

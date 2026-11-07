@@ -21,6 +21,9 @@ Algorithm (per component, unchanged from SLab unless noted under *Fixes*)
    the peak — not 0/1, despite the SLab name.
 6. events/min = n_events / (T / fr / 60).
 7. Auto-reject if ``find_peaks`` returned nothing or CNN < ``min_cnn`` (0.15).
+   Opt-in (``kinetics=``, ``--require-kinetics``): also require kinetically
+   valid events on the raw trace (:mod:`caiman.utils.event_kinetics`); the
+   rule and SLab's own verdict are recorded in ``stroh_results``.
 
 Fixes relative to SLab 7.4
 --------------------------
@@ -79,6 +82,9 @@ class EventResults:
     threshold: float = 0.2
     params: dict = field(default_factory=dict)
     version: float = SLAB_VERSION
+    # SLab's own auto-approval when an opt-in rule (event_kinetics) narrowed
+    # auto_approved; None otherwise.  Row-aligned like the rest.
+    auto_slab: Optional[np.ndarray] = None
 
     @property
     def n(self) -> int:
@@ -96,7 +102,8 @@ class EventResults:
             peaks=[self.peaks[r] for r in rows],
             auto_approved=self.auto_approved[rows],
             fr=self.fr, decay_time=self.decay_time, threshold=self.threshold,
-            params=dict(self.params), version=self.version)
+            params=dict(self.params), version=self.version,
+            auto_slab=None if self.auto_slab is None else self.auto_slab[rows])
 
     def append(self, other: "EventResults") -> "EventResults":
         return EventResults(
@@ -107,7 +114,11 @@ class EventResults:
             peaks=list(self.peaks) + list(other.peaks),
             auto_approved=np.concatenate([self.auto_approved, other.auto_approved]),
             fr=self.fr, decay_time=self.decay_time, threshold=self.threshold,
-            params=dict(self.params), version=self.version)
+            params=dict(self.params), version=self.version,
+            auto_slab=(None if self.auto_slab is None and other.auto_slab is None else
+                       np.concatenate([
+                           self.auto_approved if self.auto_slab is None else self.auto_slab,
+                           other.auto_approved if other.auto_slab is None else other.auto_slab])))
 
     def copy(self) -> "EventResults":
         return self.take(range(self.n))
@@ -268,6 +279,15 @@ def write_stroh_results(parent, res: EventResults, approved,
     g.attrs["generator"] = "caiman.utils.event_detection"
     g.attrs["lowpass_hz"] = ("slab-normalised" if res.params.get("lowpass_hz") is None
                              else float(res.params["lowpass_hz"]))
+    # approval rule: "slab" (SLab-identical) or "slab+kinetics" (opt-in);
+    # SLab's own verdict is kept next to the narrowed auto_approved
+    g.attrs["approval_rule"] = res.params.get("approval_rule", "slab")
+    if res.auto_slab is not None:
+        g.create_dataset("auto_approved_slab",
+                         data=np.flatnonzero(res.auto_slab).astype(np.int64))
+    if res.params.get("kinetics"):
+        import json
+        g.attrs["kinetics_params"] = json.dumps(res.params["kinetics"])
     for k, v in (extra_attrs or {}).items():
         g.attrs[k] = v
     return g
@@ -311,6 +331,24 @@ def read_stroh_results(g):
     appr[idx[(idx >= 0) & (idx < K)]] = True
     thr = (np.asarray(g["thersholds"][()], dtype=np.float32) if "thersholds" in g
            else np.zeros(K, np.float32))
+    params, auto_slab = {}, None
+    rule = g.attrs.get("approval_rule")
+    if isinstance(rule, bytes):
+        rule = rule.decode()
+    if rule == "slab+kinetics":
+        import json
+        params["approval_rule"] = rule
+        try:
+            params["kinetics"] = json.loads(g.attrs.get("kinetics_params", "{}"))
+        except (TypeError, ValueError):
+            params["kinetics"] = {}
+        if "auto_approved_slab" in g:
+            auto_slab = np.zeros(K, dtype=bool)
+            idx = np.asarray(g["auto_approved_slab"][()], dtype=np.int64).ravel()
+            auto_slab[idx[(idx >= 0) & (idx < K)]] = True
+    lp = g.attrs.get("lowpass_hz")
+    if lp is not None and not isinstance(lp, (str, bytes)):
+        params["lowpass_hz"] = float(lp)
     res = EventResults(
         binary=binary,
         filtered=np.asarray(g["filtered_dff"][()], dtype=np.float32),
@@ -320,7 +358,8 @@ def read_stroh_results(g):
         fr=float(_scalar(g, "imaging_frequency", np.nan)),
         decay_time=float(_scalar(g, "decay_time", np.nan)),
         threshold=float(_scalar(g, "detection_cutoff", 0.2)),
-        version=float(_scalar(g, "version", SLAB_VERSION)))
+        version=float(_scalar(g, "version", SLAB_VERSION)),
+        params=params, auto_slab=auto_slab)
     return res, appr
 
 
@@ -338,15 +377,38 @@ def _h5_get(f, path):
     return v
 
 
+def _kinetics_module():
+    """``caiman.utils.event_kinetics``, or the sibling file when the
+    ``caiman`` package can't be imported."""
+    import sys
+    mod = sys.modules.get("_inspector_event_kinetics")
+    if mod is not None:
+        return mod
+    try:
+        from caiman.utils import event_kinetics as mod
+    except Exception:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_kinetics.py")
+        spec = importlib.util.spec_from_file_location("_inspector_event_kinetics", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules["_inspector_event_kinetics"] = mod
+    return mod
+
+
 def detect_events_in_hdf5(path: str, *, overwrite: bool = False,
                           threshold: float = 0.2, min_snr: float = 3.0,
                           min_cnn: float = 0.15, lowpass_hz=None,
                           fr: Optional[float] = None,
-                          decay_time: Optional[float] = None) -> str:
+                          decay_time: Optional[float] = None,
+                          kinetics: Optional[dict] = None) -> str:
     """Detect events on every row of ``estimates/F_dff`` in a CaImAn results
     file and write ``stroh_results`` *into that file* (SLab behaviour; nothing
     else in the file is touched).  Rows index the full estimates (not
-    ``idx_components``), exactly as SLab does.  Returns a status string."""
+    ``idx_components``), exactly as SLab does.  ``kinetics`` (event_kinetics
+    params with ``approve_on_kinetics``) narrows auto-approval to components
+    with kinetically valid events on the raw trace (C + YrA; ΔF/F without
+    YrA — skipped when that ΔF/F is C rescaled).  Returns a status string."""
     import h5py
     with h5py.File(path, "r") as f:
         if "stroh_results" in f and not overwrite:
@@ -357,6 +419,7 @@ def detect_events_in_hdf5(path: str, *, overwrite: bool = False,
             return "skipped (no estimates/F_dff — run detrend_df_f first)"
         snr = _h5_get(f, "estimates/SNR_comp")
         cnn = _h5_get(f, "estimates/cnn_preds")
+        yra = _h5_get(f, "estimates/YrA")
         fr = fr if fr is not None else _h5_get(f, "params/data/fr")
         decay_time = (decay_time if decay_time is not None
                       else _h5_get(f, "params/data/decay_time"))
@@ -365,9 +428,20 @@ def detect_events_in_hdf5(path: str, *, overwrite: bool = False,
     res = detect_events(F, C, float(fr), float(decay_time), snr, cnn,
                         threshold=threshold, min_snr=min_snr, min_cnn=min_cnn,
                         lowpass_hz=lowpass_hz)
+    note = ""
+    if kinetics and kinetics.get("approve_on_kinetics"):
+        ek = _kinetics_module()
+        trace, source, circular = ek.source_trace(C, yra, F)
+        if circular:
+            note = "; kinetics rule skipped (no YrA and ΔF/F ≈ C: circular)"
+        else:
+            n_slab = int(res.auto_approved.sum())
+            ek.apply_approval(res, trace, kinetics)
+            note = (f" (SLab {n_slab}; kinetics on "
+                    f"{'C + YrA' if source == 'raw' else 'ΔF/F'})")
     with h5py.File(path, "a") as f:
         write_stroh_results(f, res, res.auto_approved)
-    return (f"{int(res.auto_approved.sum())}/{res.n} auto-approved, "
+    return (f"{int(res.auto_approved.sum())}/{res.n} auto-approved{note}, "
             f"{sum(len(p) for p in res.peaks)} events")
 
 
@@ -396,7 +470,17 @@ def main(argv=None):
                     help="physical cutoff; default = SLab's 0.974·Nyquist")
     ap.add_argument("--fr", type=float, default=None)
     ap.add_argument("--decay-time", type=float, default=None)
+    ap.add_argument("--require-kinetics", action="store_true",
+                    help="auto-approve only components with kinetically valid "
+                         "events on the raw trace (caiman.utils.event_kinetics; "
+                         "default criteria)")
+    ap.add_argument("--min-valid-events", type=int, default=1,
+                    help="with --require-kinetics (default 1)")
+    ap.add_argument("--min-valid-frac", type=float, default=None,
+                    help="with --require-kinetics: valid / testable events ≥ this")
     a = ap.parse_args(argv)
+    kin = ({"approve_on_kinetics": True, "min_valid_events": a.min_valid_events,
+            "min_valid_frac": a.min_valid_frac} if a.require_kinetics else None)
     files = []
     for p in a.paths:
         files += find_results_files(p) if os.path.isdir(p) else [p]
@@ -405,7 +489,7 @@ def main(argv=None):
             msg = detect_events_in_hdf5(
                 p, overwrite=a.overwrite, threshold=a.threshold,
                 min_snr=a.min_snr, min_cnn=a.min_cnn, lowpass_hz=a.lowpass_hz,
-                fr=a.fr, decay_time=a.decay_time)
+                fr=a.fr, decay_time=a.decay_time, kinetics=kin)
         except Exception as exc:                       # keep the batch going
             msg = f"ERROR {exc}"
         print(f"{p}: {msg}")

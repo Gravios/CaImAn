@@ -121,6 +121,18 @@ _KIN_PREF_FIELDS = (
     ("Criteria (an event is valid when all set ones hold)", "min_amp_snr",
      "Min amplitude / noise", "float", (0.0, 1000.0, 0.5, 2), "off",
      "Fitted amplitude over 1.4826·MAD of the raw ΔF/F outside events."),
+    ("Approval (opt-in; off = SLab auto-approval)", "approve_on_kinetics",
+     "Require valid kinetics", "bool", None, None,
+     "Detect events (and Batch detect) auto-approve a component only if SLab "
+     "does and it has enough kinetically valid events.  The rule and SLab's own "
+     "verdict are written to stroh_results.  Not applied when the check would "
+     "be circular (no residual and ΔF/F ≈ C)."),
+    ("Approval (opt-in; off = SLab auto-approval)", "min_valid_events",
+     "Min valid events", "int", (0, 1_000_000, 1, 0), None,
+     "With the rule on: at least this many kinetically valid events."),
+    ("Approval (opt-in; off = SLab auto-approval)", "min_valid_frac",
+     "Min valid share", "float", (0.0, 1.0, 0.05, 2), "off",
+     "With the rule on: valid / testable events at least this."),
 )
 
 

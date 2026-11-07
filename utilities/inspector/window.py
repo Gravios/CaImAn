@@ -9,6 +9,7 @@ from PyQt6.QtCore import QByteArray, Qt
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -27,7 +28,7 @@ from PyQt6.QtWidgets import (
 
 from .constants import OVERLAY_ALPHA
 from .theme import PT, UI, set_theme
-from .deps import _ed, _rf
+from .deps import _ed, _ek, _rf
 from .prefs import kinetics_prefs, load_prefs, prefs_path, roi_filter_prefs, save_prefs
 from .store import ComponentStore
 from .loading import (
@@ -979,9 +980,15 @@ class InspectorWindow(QMainWindow):
         self._full_refresh()
         self._reselect(sel)
         ev = self.store.events
+        rule = ""
+        if ev.auto_slab is not None:
+            rule = f" (SLab {int(ev.auto_slab.sum())}; kinetics rule)"
+        elif self.store.kinetics_rule_skipped:
+            rule = (" — ⚠ kinetics rule not applied: no residual and ΔF/F ≈ C, "
+                    "the check would be circular")
         self.statusBar().showMessage(
             f"Events: {sum(len(p) for p in ev.peaks)} in {ev.n} components; "
-            f"{int(ev.auto_approved.sum())} auto-approved / included")
+            f"{int(ev.auto_approved.sum())} auto-approved / included{rule}")
 
     def _detect_events_dialog(self):
         if self._blind_block():                # the rating must use the file's events
@@ -1020,6 +1027,13 @@ class InspectorWindow(QMainWindow):
         sp_cnn = spin(prm.get("min_cnn", 0.15), 0.0, 1.0, 0.05, 2)
         sp_lp  = spin(prm.get("lowpass_hz") or 0.0, 0.0, 500.0, 0.5, 2, " Hz")
         sp_lp.setSpecialValueText("SLab (0.974·Nyquist)")
+        kin_cfg = kinetics_prefs()
+        cb_kin = QCheckBox("Require valid kinetics", dlg)
+        cb_kin.setChecked(bool(kin_cfg.get("approve_on_kinetics")))
+        cb_kin.setToolTip(
+            "Auto-approve only components SLab approves that also have "
+            f"≥ {kin_cfg.get('min_valid_events', 1)} kinetically valid event(s) on "
+            "the raw trace (criteria: Preferences ▸ Event kinetics).  Off = SLab.")
         for label, w, tip in (
                 ("Imaging frequency", sp_fr, "Frame rate; sets refractory "
                  "distance and events/min."),
@@ -1035,6 +1049,7 @@ class InspectorWindow(QMainWindow):
                  "(bit-identical to SLabAnalysisApp).")):
             w.setToolTip(tip)
             form.addRow(label, w)
+        form.addRow("Approval", cb_kin)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept)
@@ -1053,7 +1068,8 @@ class InspectorWindow(QMainWindow):
             self.run_detection(sp_fr.value(), sp_dec.value(), progress=cb,
                                threshold=sp_thr.value(), min_snr=sp_snr.value(),
                                min_cnn=sp_cnn.value(),
-                               lowpass_hz=sp_lp.value() or None)
+                               lowpass_hz=sp_lp.value() or None,
+                               kinetics=dict(kin_cfg, approve_on_kinetics=cb_kin.isChecked()))
         except Exception as exc:
             QMessageBox.critical(self, "Detect events", str(exc))
         finally:
@@ -1129,6 +1145,9 @@ class InspectorWindow(QMainWindow):
                 else "ΔF/F ≈ C (no residual) — circular, every event passes"
                 if s.kinetics_circular else "ΔF/F (file has no residual YrA)"))
         if ev is not None:
+            lines.append("Approval rule:  " + _ek().describe_rule(ev.params))
+            if ev.auto_slab is not None:
+                lines.append(f"SLab auto-approved:  {int(ev.auto_slab.sum())}")
             lines += [
                 f"Auto-approved:  {int(ev.auto_approved.sum())}",
                 f"Included (manual):  {s.n_approved}",
@@ -1163,6 +1182,9 @@ class InspectorWindow(QMainWindow):
             self, "Batch detect events",
             f"{len(files)} files:\n\n{listing}\n\n"
             "stroh_results is written into each file (estimates untouched).\n"
+            + ("Auto-approval requires valid kinetics (Preferences ▸ Event "
+               "kinetics).\n" if kinetics_prefs().get("approve_on_kinetics") else "")
+            +
             "Overwrite files that already have results?\n"
             "Yes = overwrite · No = skip those · Cancel = abort",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -1170,6 +1192,8 @@ class InspectorWindow(QMainWindow):
             QMessageBox.StandardButton.No)
         if ans == QMessageBox.StandardButton.Cancel:
             return
+        kin = kinetics_prefs()
+        kin = kin if kin.get("approve_on_kinetics") else None
         prog = QProgressDialog("Detecting events…", "Cancel", 0, len(files), self)
         prog.setWindowModality(Qt.WindowModality.WindowModal)
         log = []
@@ -1180,7 +1204,7 @@ class InspectorWindow(QMainWindow):
             QApplication.processEvents()
             try:
                 msg = ed.detect_events_in_hdf5(
-                    f, overwrite=(ans == QMessageBox.StandardButton.Yes))
+                    f, overwrite=(ans == QMessageBox.StandardButton.Yes), kinetics=kin)
             except Exception as exc:
                 msg = f"ERROR {exc}"
             log.append(f"{os.path.relpath(f, folder)}: {msg}")

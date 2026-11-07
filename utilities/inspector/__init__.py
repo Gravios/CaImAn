@@ -90,7 +90,8 @@ Event detection & curation (ported from SLabAnalysisPackage)
                                 expected transient on the raw trace, dashed
                                 peak: fails the kinetic check
     Ev ok / Shape r / τ fit   — raw-trace kinetics per component
-                                (Preferences > Event kinetics; diagnostic)
+                                (Preferences > Event kinetics); opt-in:
+                                auto-approval also requires valid kinetics
     Analysis > Export         — Ctrl+E — <session>_PeakStats / _ROIStats
     Analysis > Batch detect   — stroh_results into every file of a folder
     Analysis > Blinded review — Ctrl+R — shuffled, name-blind rating that

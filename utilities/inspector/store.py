@@ -31,6 +31,7 @@ class ComponentStore:
         K = self._A.shape[1]
         self._derived = {}      # corr / centroids / peaks / pixel lookup / kinetics
         self.kinetics_params = None   # event_kinetics params (None → defaults)
+        self.kinetics_rule_skipped = False   # last detection: rule asked, circular
 
         # ── CaImAn evaluation (census: active / inactive) ────────────────────
         # accepted   : row was in estimates.idx_components (census: active);
@@ -621,10 +622,14 @@ class ComponentStore:
     def can_detect(self) -> bool:
         return self.dff is not None
 
-    def detect_events(self, fr, decay_time, progress=None, **kw):
+    def detect_events(self, fr, decay_time, progress=None, kinetics=None, **kw):
         """Run SLab event detection on every row; approval := auto-approval
         (undoable).  Rows with an unknown (NaN) SNR / CNN — merged
-        components — are detected without that criterion."""
+        components — are detected without that criterion.  ``kinetics``
+        (event_kinetics params) with ``approve_on_kinetics`` narrows
+        auto-approval to components with kinetically valid events on the
+        kinetics trace — unless that check would be circular, in which case
+        ``kinetics_rule_skipped`` is set and SLab's approval stands."""
         if not self.can_detect:
             raise RuntimeError("No ΔF/F traces (estimates.F_dff) in this file — "
                                "run cnm.estimates.detrend_df_f() first.")
@@ -642,6 +647,12 @@ class ComponentStore:
             for f in ("binary", "filtered", "thresholds", "frequencies", "auto_approved"):
                 getattr(res, f)[r] = getattr(one, f)[0]
             res.peaks[r] = one.peaks[0]
+        self.kinetics_rule_skipped = False
+        if kinetics and kinetics.get("approve_on_kinetics"):
+            if self.kinetics_circular:
+                self.kinetics_rule_skipped = True
+            else:
+                _ek().apply_approval(res, self.kinetics_trace, kinetics)
         self._push_undo("detect events")
         self._derived.pop("kinetics", None)
         self.events = res
@@ -659,7 +670,12 @@ class ComponentStore:
                 self._metric_row("SNR_comp", i), self._metric_row("cnn_preds", i),
                 threshold=ev.threshold, min_snr=p.get("min_snr", 3.0),
                 min_cnn=p.get("min_cnn", 0.15), lowpass_hz=p.get("lowpass_hz"))
-            one.params = dict(p)
+            one.params = {k: v for k, v in p.items()
+                          if k not in ("approval_rule", "kinetics")}
+            if p.get("approval_rule") == "slab+kinetics":   # same rule as the rest
+                _ek().apply_approval(one, self.kinetics_trace[i:i + 1],
+                                     dict(p.get("kinetics") or {},
+                                          approve_on_kinetics=True))
             return one
         blank = ev.take([0]) if ev.n else ev
         blank.binary[:] = 0; blank.filtered[:] = 0

@@ -31,7 +31,16 @@ and reports
 An event whose decay window is cut short (< 4 samples before the next
 event or the end of the recording) is *untestable*: ``valid`` is False and
 ``fail`` carries ``short``; per-component fractions use testable events
-only.  Detection and approval are not changed by this module.
+only.
+
+Approval (opt-in)
+-----------------
+By default nothing here changes detection or approval.  With
+``approve_on_kinetics`` set, :func:`apply_approval` narrows an
+``EventResults``' auto-approval to components that also have at least
+``min_valid_events`` kinetically valid events (and, if set, a valid share
+≥ ``min_valid_frac``).  SLab's own verdict is kept in ``auto_slab`` and the
+rule in ``params`` so ``stroh_results`` records both.
 """
 from __future__ import annotations
 
@@ -46,7 +55,15 @@ DEFAULTS = {
     "max_rise_s":    0.15,   # raw rise (20 % → peak) in seconds
     "min_amp_snr":   3.0,    # amplitude / robust noise of the raw ΔF/F
     "decay_time":    None,   # s; None → the events' / file's decay time
+    # approval rule (opt-in; off = SLab auto-approval unchanged)
+    "approve_on_kinetics": False,
+    "min_valid_events":    1,    # ≥ this many valid events …
+    "min_valid_frac":      None, # … and (if set) valid / testable ≥ this
 }
+CRITERIA = ("decay_time", "min_shape_r", "tau_min_frac", "tau_max_frac",
+            "max_rise_s", "min_amp_snr")
+RULE = ("approve_on_kinetics", "min_valid_events", "min_valid_frac")
+CIRCULAR_R = 0.99                    # dff_tracks_C above this → circular
 FAIL = {"shape": 1, "tau": 2, "rise": 4, "amplitude": 8, "short": 16}
 EVENT_FIELDS = ("shape_r", "tau_s", "rise_s", "amp", "amp_snr", "baseline",
                 "start", "end", "fail", "valid")
@@ -329,6 +346,60 @@ def summary_table(rows: list) -> dict:
         fill = 0 if dt is np.int64 else np.nan
         out[f] = np.array([x[f] if x is not None else fill for x in s], dtype=dt)
     return out
+
+
+def source_trace(C, YrA, F_dff):
+    """(trace, source, circular) the check should run on: C + YrA on the
+    ΔF/F scale when the residual exists (``"raw"``), else ΔF/F (``"dff"``),
+    flagged ``circular`` when that ΔF/F is C rescaled."""
+    if YrA is not None and np.size(YrA):
+        return raw_dff(C, YrA, F_dff), "raw", False
+    return (np.asarray(F_dff, dtype=np.float64), "dff",
+            bool(dff_tracks_C(F_dff, C) > CIRCULAR_R))
+
+
+def rule_passes(rows: list, params: Optional[dict] = None) -> np.ndarray:
+    """(K,) bool — the kinetic part of the approval rule per component
+    (rows not computed → False)."""
+    p = resolve_params(params)
+    s = summary_table(rows)
+    ok = s["n_valid"] >= int(p.get("min_valid_events") or 0)
+    if p.get("min_valid_frac") is not None:
+        with np.errstate(invalid="ignore"):
+            ok &= s["frac_valid"] >= float(p["min_valid_frac"])   # NaN → False
+    return ok & np.array([r is not None for r in rows])
+
+
+def apply_approval(res, trace, params: Optional[dict] = None, rows=None):
+    """Narrow ``res.auto_approved`` (in place) to components that also pass
+    the kinetic rule, if ``approve_on_kinetics`` is set; SLab's verdict is
+    kept in ``res.auto_slab``, the rule and criteria in ``res.params``.
+    ``rows`` limits the update (a re-detected merged row).  Returns the
+    :func:`validate` rows, or None when the rule is off."""
+    p = resolve_params(params)
+    if not p.get("approve_on_kinetics"):
+        return None
+    kin = validate(trace, res, p, rows)
+    idx = np.arange(res.n) if rows is None else np.asarray(list(rows), dtype=np.int64)
+    if res.auto_slab is None:
+        res.auto_slab = res.auto_approved.copy()
+    ok = rule_passes(kin, p)
+    res.auto_approved[idx] = res.auto_slab[idx] & ok[idx]
+    res.params["approval_rule"] = "slab+kinetics"
+    res.params["kinetics"] = {k: p[k] for k in CRITERIA + RULE}
+    return kin
+
+
+def describe_rule(params: Optional[dict]) -> str:
+    """One line for a results' approval rule (``EventResults.params``)."""
+    params = params or {}
+    if params.get("approval_rule") != "slab+kinetics":
+        return "SLab (peaks found and CNN ≥ min)"
+    k = params.get("kinetics") or {}
+    s = f"SLab + ≥ {k.get('min_valid_events', 1)} kinetically valid event(s)"
+    if k.get("min_valid_frac") is not None:
+        s += f", valid share ≥ {float(k['min_valid_frac']):.0%}"
+    return s
 
 
 def event_table(rows: list, which) -> dict:

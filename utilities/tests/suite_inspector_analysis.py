@@ -275,6 +275,59 @@ try:
     w.close()
     ok("kinetics run on raw C + YrA when loaded; ΔF/F ≈ C without residual is flagged")
 
+    # ── opt-in kinetics approval rule ────────────────────────────────────────
+    rule = dict(insp.kinetics_prefs(), approve_on_kinetics=True)
+    s3.detect_events(FR, 0.4)
+    slab = s3.events.auto_approved.copy()
+    s3.detect_events(FR, 0.4, kinetics=rule)
+    ev = s3.events
+    passes = ek.rule_passes(ek.validate(s3.kinetics_trace, ev, rule), rule)
+    assert np.array_equal(ev.auto_slab, slab) and np.array_equal(ev.auto_approved, slab & passes)
+    assert np.array_equal(s3.approved, ev.auto_approved) and not s3.kinetics_rule_skipped
+    s3.undo()
+    assert s3.events.auto_slab is None and np.array_equal(s3.approved, slab)
+    s3.redo()
+    m = s3.merge([0, 1])
+    ev = s3.events
+    one = ek.validate(s3.kinetics_trace[m:m + 1], ev.take([m]), rule)
+    assert ev.auto_slab.size == s3.n and ev.params["approval_rule"] == "slab+kinetics"
+    assert ev.auto_approved[m] == (ev.auto_slab[m] and ek.rule_passes(one, rule)[0])
+    ok("Detect events with the rule: auto = SLab ∧ kinetics (SLab kept); undoable; "
+       "a merged row is judged by the same rule")
+
+    s4.detect_events(FR, 0.4)
+    w = insp.InspectorWindow(s4); w.show(); app.processEvents()
+    w.run_detection(FR, 0.4, kinetics=rule)
+    assert s4.kinetics_rule_skipped and s4.events.auto_slab is None
+    assert "kinetics rule not applied" in w.statusBar().currentMessage()
+    w._session_info(); assert "Approval rule:  SLab (" in shown[-1], shown[-1]
+    w.close()
+    ok("circular case: rule not applied, SLab approval kept, status bar says why")
+
+    # dialog checkbox follows Preferences ▸ Event kinetics
+    from PyQt6.QtWidgets import QCheckBox
+    insp.save_prefs({"kinetics": {"approve_on_kinetics": True, "min_valid_events": 2}})
+    w = insp.InspectorWindow(s3); w.show(); app.processEvents()
+    seen, kw_seen = [], []
+    orig_exec = QDialog.exec
+    def fake_exec(dlg):
+        cb = [c for c in dlg.findChildren(QCheckBox) if c.text() == "Require valid kinetics"]
+        seen.append(cb[0].isChecked() if cb else None)
+        return QDialog.DialogCode.Accepted
+    QDialog.exec = fake_exec
+    w.run_detection = lambda *a, **k: kw_seen.append(k)
+    w._detect_events_dialog()
+    QDialog.exec = orig_exec
+    assert seen == [True] and kw_seen[0]["kinetics"]["approve_on_kinetics"] \
+        and kw_seen[0]["kinetics"]["min_valid_events"] == 2
+    w._session_info()
+    assert "Approval rule:  SLab + ≥ 1 kinetically valid" in shown[-1] and \
+        "SLab auto-approved:" in shown[-1], shown[-1]
+    insp.save_prefs({})
+    w.close()
+    ok("Detect events dialog: 'Require valid kinetics' seeded from Preferences; session "
+       "info states the rule and SLab's count")
+
     # Save keeps the residual (merged row: β-weighted), so C + YrA survives
     e2 = Est()
     e2.A = scipy.sparse.csc_matrix(A); e2.C = C; e2.dims = (d1, d2)
