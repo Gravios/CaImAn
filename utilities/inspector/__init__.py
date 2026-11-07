@@ -68,9 +68,11 @@ Controls
                    cursor in the trace view to seek.
     Matrices     — Ctrl+click an off-diagonal cell of the correlation or
                    distance matrix to select that pair (orange / magenta)
-    ⊕ Merge      — merge ≥ 2 selected (footprint = pixel max, trace = mean)
+    ⊕ Merge      — merge ≥ 2 selected (rank-1 refit of the parts' summed
+                   signal; merged SNR / r / CNN unknown)
     ✕ Delete     — permanently remove selected
-    ↩ Undo       — Ctrl+Z  — undo the last merge, delete or ROI-filter run
+    ↩ Undo       — Ctrl+Z  — undo the last merge, delete, ROI-filter run or
+                             event detection
                              (up to 5 steps)
     ↪ Redo       — Ctrl+Y  — redo last undone operation
     File > Save  — write every component (A / C, Eval split, events,
@@ -87,8 +89,10 @@ Event detection & curation (ported from SLabAnalysisPackage)
                                 of the last-selected component
     Analysis > Export         — Ctrl+E — <session>_PeakStats / _ROIStats
     Analysis > Batch detect   — stroh_results into every file of a folder
-    Analysis > Blinded review — Ctrl+R — shuffled, name-blind rating;
-                                Ctrl+Return saves SLabRandomization/<RATER>
+    Analysis > Blinded review — Ctrl+R — shuffled, name-blind rating that
+                                starts from auto-approval, without Eval /
+                                ROI-filter columns; Ctrl+Return saves
+                                SLabRandomization/<RATER>
     Events and include flags are saved as an SLab-compatible stroh_results
     group, so SLabAnalysisApp.py opens curated files.
 """

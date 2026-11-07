@@ -374,31 +374,41 @@ class ComponentStore:
 
     def merge(self, indices):
         """
-        Merge components at `indices`.
-        Footprint = pixel-wise max. Trace = mean. Appended at end.
+        Merge components at `indices` into one, appended at the end.
+
+        Footprint and denoised trace are a rank-1 non-negative fit of the
+        constituents' summed signal Σᵢ aᵢcᵢᵀ (:func:`_merge_fit`), so the
+        merged unit reproduces what the parts explained together.  Other
+        linear traces combine with the same weights; ΔF/F is rebuilt from
+        the merged signal over the merged baseline (:func:`_merge_dff`).
+        SNR / r-value / CNN can't be recomputed here and become NaN
+        (unknown); event detection and the ROI filter skip unknown metrics.
         Returns the new component's index.
         """
         self._push_undo("merge")
         idx = sorted(indices)
-        new_a = self._A[:, idx].max(axis=1)              # pixel-wise max
+        new_a, beta = _merge_fit(self._A[:, idx], self.C[idx])
         new_label = "+".join(self.labels[i] for i in idx)
 
         keep = [j for j in range(self.n) if j not in set(idx)]
         old, self._derived = self._derived, {}
+        A_parts = self._A[:, idx]
         self._A     = _to_sparse(scipy.sparse.hstack([self._A[:, keep], new_a]))
         for name, arr in self.traces.items():
-            new_row = arr[idx].mean(axis=0)
-            self.traces[name] = np.vstack([arr[keep], new_row[None, :]])
+            if name == TRACE_DFF:
+                new_row = _merge_dff(arr[idx], self.C[idx], A_parts, new_a, beta)
+            else:
+                new_row = beta @ arr[idx]
+            self.traces[name] = np.vstack([arr[keep], new_row[None, :].astype(arr.dtype)])
         self.C      = self.traces[TRACE_DENOISED]
         self.labels = [self.labels[j] for j in keep] + [new_label]
         # Merged component is hidden only if every constituent was hidden.
         self.hidden = np.append(self.hidden[keep], bool(self.hidden[idx].all()))
 
-        for attr in ("SNR_comp", "r_values", "cnn_preds"):
+        for attr in ("SNR_comp", "r_values", "cnn_preds"):   # unknown for a merge
             arr = getattr(self, attr)
             if arr is not None:
-                setattr(self, attr,
-                        np.append(arr[keep], float(arr[idx].mean())))
+                setattr(self, attr, np.append(arr[keep], np.nan))
         # Merged component is included if any constituent was; it has no
         # source row.  Its events are re-detected on the merged traces.
         self.approved = np.append(self.approved[keep], bool(self.approved[idx].any()))
@@ -470,9 +480,9 @@ class ComponentStore:
         try:
             one = rf.evaluate(
                 self._A[:, i:i + 1], self.dims,
-                SNR_comp=None if self.SNR_comp is None else self.SNR_comp[i:i + 1],
-                r_values=None if self.r_values is None else self.r_values[i:i + 1],
-                cnn_preds=None if self.cnn_preds is None else self.cnn_preds[i:i + 1],
+                SNR_comp=self._metric_row("SNR_comp", i),
+                r_values=self._metric_row("r_values", i),
+                cnn_preds=self._metric_row("cnn_preds", i),
                 F_dff=None if self.dff is None else self.dff[i:i + 1],
                 C=self.C[i:i + 1],
                 params=rf.resolve_params(self.qc_params))
@@ -488,6 +498,14 @@ class ComponentStore:
                         else False if v.dtype == np.bool_ else 0)
                 row[k] = np.array([fill], dtype=v.dtype)
         return row
+
+    def _metric_row(self, attr: str, i: int):
+        """``attr[i:i+1]``, or None when absent or NaN (a merged row) so the
+        criterion is skipped instead of failing."""
+        arr = getattr(self, attr)
+        if arr is None or not np.isfinite(arr[i]):
+            return None
+        return arr[i:i + 1]
 
     def run_roi_filter(self, cfg: dict, set_incl: bool = False) -> dict:
         """Evaluate every row with the ROI filter (undoable).
@@ -539,13 +557,28 @@ class ComponentStore:
         return self.dff is not None
 
     def detect_events(self, fr, decay_time, progress=None, **kw):
-        """Run SLab event detection on every row; approval := auto-approval."""
+        """Run SLab event detection on every row; approval := auto-approval
+        (undoable).  Rows with an unknown (NaN) SNR / CNN — merged
+        components — are detected without that criterion."""
         if not self.can_detect:
             raise RuntimeError("No ΔF/F traces (estimates.F_dff) in this file — "
                                "run cnm.estimates.detrend_df_f() first.")
-        self.events = _ed().detect_events(self.dff, self.C, fr, decay_time,
-                                          self.SNR_comp, self.cnn_preds,
-                                          progress=progress, **kw)
+        ed = _ed()
+        res = ed.detect_events(self.dff, self.C, fr, decay_time,
+                               self.SNR_comp, self.cnn_preds, progress=progress, **kw)
+        unknown = np.zeros(self.n, bool)
+        for arr in (self.SNR_comp, self.cnn_preds):
+            if arr is not None:
+                unknown |= ~np.isfinite(arr)
+        for r in np.flatnonzero(unknown):           # re-run without NaN criteria
+            one = ed.detect_events(
+                self.dff[r:r + 1], self.C[r:r + 1], fr, decay_time,
+                self._metric_row("SNR_comp", r), self._metric_row("cnn_preds", r), **kw)
+            for f in ("binary", "filtered", "thresholds", "frequencies", "auto_approved"):
+                getattr(res, f)[r] = getattr(one, f)[0]
+            res.peaks[r] = one.peaks[0]
+        self._push_undo("detect events")
+        self.events = res
         self.approved = self.events.auto_approved.copy()
         self.fr, self.decay_time = float(fr), float(decay_time)
 
@@ -557,8 +590,7 @@ class ComponentStore:
             p = ev.params
             one = _ed().detect_events(
                 self.dff[i:i + 1], self.C[i:i + 1], ev.fr, ev.decay_time,
-                None if self.SNR_comp is None else self.SNR_comp[i:i + 1],
-                None if self.cnn_preds is None else self.cnn_preds[i:i + 1],
+                self._metric_row("SNR_comp", i), self._metric_row("cnn_preds", i),
                 threshold=ev.threshold, min_snr=p.get("min_snr", 3.0),
                 min_cnn=p.get("min_cnn", 0.15), lowpass_hz=p.get("lowpass_hz"))
             one.params = dict(p)
@@ -712,6 +744,73 @@ def _to_sparse(A) -> scipy.sparse.csc_matrix:
     A.eliminate_zeros()
     A.sort_indices()
     return A
+
+
+def _merge_fit(A_parts, C_parts, n_iter: int = 30):
+    """Rank-1 non-negative fit a·cᵀ of Y = Σᵢ aᵢcᵢᵀ (never formed).
+
+    Returns ``(a, beta)``: the merged footprint (d × 1 sparse), scaled to the
+    largest constituent's norm, and weights with c = beta @ C_parts
+    (betaᵢ = a·aᵢ / ‖a‖²) — exact for the final trace update.  Falls back to
+    the pixel-wise max footprint and the mean trace when the parts carry
+    no signal.
+    """
+    A_parts = scipy.sparse.csc_matrix(A_parts, dtype=np.float64)
+    Cp = np.asarray(C_parts, dtype=np.float64)
+    m = A_parts.shape[1]
+    norms = np.sqrt(np.asarray(A_parts.multiply(A_parts).sum(axis=0)).ravel())
+    cmax = np.maximum(Cp.max(axis=1), 0)
+    if not (norms.max() > 0 and cmax.max() > 0):
+        return A_parts.max(axis=1).astype(np.float32), np.full(m, 1.0 / m)
+    G = (A_parts.T @ A_parts).toarray()             # m × m footprint Gram
+    w = cmax.copy()                                 # a = A_parts @ w
+    for _ in range(n_iter):
+        aa = w @ G @ w
+        beta = (G @ w) / aa                         # c = beta @ Cp
+        c = np.maximum(beta @ Cp, 0)
+        cc = c @ c
+        if cc <= 0:
+            break
+        w_new = (Cp @ c) / cc                       # a = A_parts @ w_new (≥ 0)
+        if np.allclose(w_new, w, rtol=1e-10, atol=0):
+            w = w_new
+            break
+        w = w_new
+    a = np.asarray(A_parts @ w).ravel()
+    a = np.maximum(a, 0)
+    scale = norms.max() / np.linalg.norm(a)         # footprint at constituent scale
+    a *= scale
+    beta = (A_parts.T @ a) / (a @ a)                # c = beta @ Cp for this a
+    return scipy.sparse.csc_matrix(a[:, None].astype(np.float32)), np.asarray(beta).ravel()
+
+
+def _merge_dff(dff_parts, C_parts, A_parts, a_new, beta) -> np.ndarray:
+    """ΔF/F of a merged unit from its parts.
+
+    Each part's baseline F0ᵢ is fitted from ΔF/Fᵢ ≈ cᵢ / F0ᵢ, turned into a
+    per-pixel background b0ᵢ = F0ᵢ‖aᵢ‖² / Σaᵢ (CaImAn's projection of a
+    locally flat background), and the merged baseline is the projection of
+    that background onto the merged footprint.  The merged signal
+    Σᵢ βᵢ F0ᵢ ΔF/Fᵢ keeps each part's residual.  Parts without a usable
+    baseline fall back to the β-weighted mean of their ΔF/F.
+    """
+    D  = np.asarray(dff_parts, dtype=np.float64)
+    Cp = np.asarray(C_parts, dtype=np.float64)
+    A_parts = scipy.sparse.csc_matrix(A_parts, dtype=np.float64)
+    a = np.asarray(a_new.toarray() if scipy.sparse.issparse(a_new) else a_new,
+                   dtype=np.float64).ravel()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        F0 = (Cp * Cp).sum(1) / (Cp * D).sum(1)
+    sum_a = np.asarray(A_parts.sum(axis=0)).ravel()
+    nrm2  = np.asarray(A_parts.multiply(A_parts).sum(axis=0)).ravel()
+    ok = np.isfinite(F0) & (F0 > 0) & (sum_a > 0) & (a @ a > 0)
+    if not ok.all():
+        wb = np.where(beta > 0, beta, 0)
+        return (wb @ D) / wb.sum() if wb.sum() > 0 else D.mean(0)
+    b0 = F0 * nrm2 / sum_a                          # per-pixel background
+    b0_bar = (b0 * sum_a).sum() / sum_a.sum()
+    F0_new = b0_bar * a.sum() / (a @ a)
+    return (beta * F0) @ D / F0_new
 
 
 def _centroids(A, dims) -> np.ndarray:

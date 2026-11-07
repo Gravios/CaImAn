@@ -225,10 +225,10 @@ class InspectorWindow(QMainWindow):
 
         self.act_merge = QAction("⊕  Merge selected", self)
         self.act_merge.setToolTip(
-            "Merge ≥ 2 selected components.\n"
-            "Spatial footprint = pixel-wise maximum.\n"
-            "Temporal trace    = mean of selected traces.\n"
-            "Merged component is appended at end of the list.")
+            "Merge ≥ 2 selected components into one, appended at the end.\n"
+            "Footprint and trace: rank-1 fit of the parts' summed signal.\n"
+            "ΔF/F: merged signal over the merged baseline.\n"
+            "SNR / r-value / CNN become unknown (—).")
         self.act_merge.setEnabled(False)
         self.act_merge.triggered.connect(self._do_merge)
         tb.addAction(self.act_merge)
@@ -977,6 +977,8 @@ class InspectorWindow(QMainWindow):
             f"{int(ev.auto_approved.sum())} auto-approved / included")
 
     def _detect_events_dialog(self):
+        if self._blind_block():                # the rating must use the file's events
+            return
         s = self.store
         if not s.can_detect:
             QMessageBox.warning(
@@ -986,10 +988,12 @@ class InspectorWindow(QMainWindow):
             return
         if s.has_approval and QMessageBox.question(
                 self, "Detect events",
-                ("Existing events and include flags will be replaced."
+                ("Existing events and include flags will be replaced "
+                 "(Edit ▸ Undo restores them)."
                  if s.events is not None else
                  "Include flags (seeded from the ROI filter) will be replaced "
-                 "by event auto-approval.") + "\nContinue?"
+                 "by event auto-approval (Edit ▸ Undo restores them).")
+                + "\nContinue?"
                 ) != QMessageBox.StandardButton.Yes:
             return
         ev, prm = s.events, (s.events.params if s.events else {})
@@ -1084,8 +1088,8 @@ class InspectorWindow(QMainWindow):
             f"Components:  {s.n}   (hidden {s.n_hidden})",
             ("CaImAn evaluation:  "
              f"{s.n_accepted} accepted / {s.n - s.n_accepted} rejected "
-             "(census: active / inactive)") if s.eval_known
-            else "CaImAn evaluation:  n/a",
+             "(census: active / inactive)") if s.eval_known and self._blind is None
+            else "CaImAn evaluation:  " + ("hidden" if self._blind else "n/a"),
             f"Recording length:  {dur}",
             "SNR min / mean / max:  " + (
                 f"{snr.min():.2f} / {snr.mean():.2f} / {snr.max():.2f}"
@@ -1094,7 +1098,7 @@ class InspectorWindow(QMainWindow):
             f"Indicator decay time:  "
             f"{(ev.decay_time if ev is not None else s.decay_time) or 'n/a'}",
         ]
-        if s.qc is not None:
+        if s.qc is not None and self._blind is None:
             qc = s.qc
             line = "ROI filter:  "
             if "passed" in qc:
@@ -1185,6 +1189,7 @@ class InspectorWindow(QMainWindow):
         """Begin a blinded review of ``files`` (already filtered/shuffled)."""
         self._blind = dict(rater=rater, files=list(files), i=0)
         self.act_hide_rejected.setEnabled(False)   # every row is rated
+        self.table.blinded = True                  # no QC / Eval columns
         self.act_blind_next.setVisible(True)
         self.act_blind_end.setEnabled(True)
         self.act_blind.setEnabled(False)
@@ -1228,6 +1233,9 @@ class InspectorWindow(QMainWindow):
             try:
                 store = load_from_hdf5(b["files"][i], all_components=True)
                 if store.events is not None:
+                    # Start from the algorithm's verdict, not whatever manual
+                    # curation the file carries (manually_approved).
+                    store.approved = store.events.auto_approved.copy()
                     break
                 err = "events could not be mapped"
             except Exception as exc:
@@ -1267,6 +1275,7 @@ class InspectorWindow(QMainWindow):
 
     def _end_blinded(self):
         self._blind = None
+        self.table.blinded = False
         self.act_hide_rejected.setEnabled(True)
         self.store.hide_rejected = self.act_hide_rejected.isChecked()
         self.corr_view.redraw(); self.dist_view.redraw()
@@ -1298,7 +1307,7 @@ class InspectorWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{s.n} components"
             + (f" ({s.n_accepted} accepted / {s.n - s.n_accepted} rejected)"
-               if s.eval_known else "")
+               if s.eval_known and self._blind is None else "")
             + ("  —  no ROI-filter fields: Analysis ▸ Run ROI filter… adds them"
                if s.qc is None and self._blind is None else ""))
         self._update_history_actions()

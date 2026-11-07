@@ -374,7 +374,7 @@ _HELP_DESCRIPTIONS = {
     "Save As…": "Save the curated results under another name",
     "Quit":     "Close the inspector (layout is remembered)",
     "Refresh":  "Rebuild the table and redraw every view",
-    "Undo":     "Undo the last merge, delete or ROI-filter run",
+    "Undo":     "Undo the last merge, delete, ROI-filter run or event detection",
     "Redo":     "Redo the last undone step",
 }
 
@@ -414,19 +414,22 @@ dropdown and View ▸ Load background image… choose the image behind the
 footprints.</p>
 
 <h3>Curating</h3>
-<p><b>Merge</b> (≥ 2 selected: footprint = pixel max, trace = mean) and
+<p><b>Merge</b> (≥ 2 selected: footprint and trace refitted to the parts'
+summed signal; SNR / r / CNN become unknown) and
 <b>Delete</b> change the components; <b>Hide / show</b> (V) only affects
 the display; <b>Include / exclude</b> (I) is the non-destructive curation flag
 (excluded footprints are red; “Hide excluded” hides them).  Undo / redo keep
-the last 5 merges, deletes or ROI-filter runs.  <b>Save</b> writes <code>&lt;name&gt;_curated.hdf5</code> next to
+the last 5 merges, deletes, ROI-filter runs or event detections.  <b>Save</b> writes <code>&lt;name&gt;_curated.hdf5</code> next to
 the original, with events, include flags and ROI-filter fields.</p>
 
 <h3>Events</h3>
 <p>Analysis ▸ Detect events… runs SLab peak detection on ΔF/F (include flags
 become the automatic approval); the event panel shows filtered ΔF/F,
 threshold, peaks and binary trace.  Export event stats writes PeakStats and
-ROIStats for the included components; Batch detect and Blinded review work
-on a whole folder.</p>
+ROIStats for the included components (with each row's source component and,
+when known, CaImAn's verdict); Batch detect and Blinded review work on a whole
+folder.  A blinded rater starts from the automatic approval and does not see
+the Eval or ROI-filter columns.</p>
 
 <h3>ROI filter</h3>
 <p>Results processed by the pipeline carry a <code>roi_filter</code> group

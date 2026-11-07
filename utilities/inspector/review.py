@@ -16,6 +16,10 @@ if TYPE_CHECKING:                      # annotations only
 def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
     """Write SLab PeakStats + ROIStats tables for the *included* components.
 
+    Both tables carry ``component`` (row in the loaded file's estimates, -1
+    for a merged component) and, when the file has idx_components,
+    ``eval_accepted`` (1 = CaImAn accepted / census active).
+
     ``peak_path`` names the PeakStats file (.xlsx or .csv); ROIStats goes
     next to it with ``PeakStats`` → ``ROIStats`` in the name.  ``.xlsx``
     needs pandas + openpyxl and falls back to ``.csv``.  ROIStats lists every
@@ -29,11 +33,19 @@ def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
     rows  = np.flatnonzero(store.approved)
     peaks = ev.peak_table(rows)
     peaks["label"] = np.array([store.labels[r] for r in peaks["roi"]], dtype=object)
+    # ``roi`` is the inspector row; ``component`` the row of the loaded
+    # file's estimates (-1: made by a merge) — rows match the file only
+    # until the first merge / delete, or the curated file once saved.
+    peaks["component"] = store.orig_idx[peaks["roi"]].astype(np.int64)
     rois  = ed.roi_stats(ev, store.approved, ev.binary.shape[1],
                          labels=store.labels, SNR_comp=store.SNR_comp,
                          cnn_preds=store.cnn_preds)
+    rr = np.asarray(rois["ROI"], dtype=np.int64)
+    rois["component"] = store.orig_idx[rr].astype(np.int64)
+    if store.eval_known:                     # CaImAn: 1 accepted / census active
+        rois["eval_accepted"] = store.accepted[rr].astype(int)
+        peaks["eval_accepted"] = store.accepted[peaks["roi"]].astype(int)
     if store.qc is not None:                 # ROI-filter fields, same rows
-        rr = np.asarray(rois["ROI"], dtype=np.int64)
         for k, v in store.qc.items():
             col = np.asarray(v)[rr]
             rois[f"qc_{k}"] = col.astype(int) if col.dtype == np.bool_ else col

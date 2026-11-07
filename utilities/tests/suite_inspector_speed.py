@@ -153,7 +153,8 @@ try:
     m = [3, 10, 25]
     s.merge(m)
     keep = [j for j in range(Ad.shape[1]) if j not in m]
-    Ad = np.column_stack([Ad[:, keep], Ad[:, m].max(axis=1)]); Cd = np.vstack([Cd[keep], Cd[m].mean(0)])
+    a_new, beta = insp.store._merge_fit(Ad[:, m], Cd[m])          # merge semantics: see census suite
+    Ad = np.column_stack([Ad[:, keep], a_new.toarray().ravel()]); Cd = np.vstack([Cd[keep], beta @ Cd[m]])
     _ = s.corr
     assert not calls, "corr updated incrementally (no K×K recompute)"
     insp.store._active_pearson_corr = orig

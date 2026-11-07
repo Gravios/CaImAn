@@ -303,15 +303,24 @@ class ComponentTable(QTableWidget):
 
     # ── Private ───────────────────────────────────────────────────────────────
 
+    # A blinded rater must not see the algorithmic verdicts.
+    blinded = False
+
+    def _show_eval(self) -> bool:
+        return self.store.eval_known and not self.blinded
+
+    def _show_qc(self) -> bool:
+        return self.store.qc is not None and not self.blinded
+
     def _col_names(self):
         cols = list(self._FIXED)
         for label, attr in self._OPTIONAL:
             if getattr(self.store, attr, None) is not None:
                 cols.append(label)
-        if self.store.eval_known:
+        if self._show_eval():
             cols.append("Eval")
         qc = self.store.qc
-        if qc is not None:
+        if self._show_qc():
             cols += [h for h, fld, _k, _t in self._QC_COLS if fld in qc]
         if self.store.events is not None:
             cols.append("Ev/min")
@@ -351,11 +360,10 @@ class ComponentTable(QTableWidget):
                     (f"{s.peak_df(i):.1f}", _num_key(s.peak_df(i)))]
             for _, attr in self._OPTIONAL:
                 if getattr(s, attr, None) is not None:
-                    v = getattr(s, attr)[i]
-                    vals.append((f"{v:.3f}", _num_key(v)))
-            if s.eval_known:
+                    vals.append(_qc_cell(getattr(s, attr)[i], "f3"))
+            if self._show_eval():
                 vals.append(_qc_cell(s.accepted[i], "bool"))
-            if s.qc is not None:
+            if self._show_qc():
                 for _h, fld, kind, _t in self._QC_COLS:
                     if fld in s.qc:
                         vals.append(_qc_cell(s.qc[fld][i], kind))
