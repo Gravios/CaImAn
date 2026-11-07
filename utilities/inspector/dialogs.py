@@ -442,7 +442,8 @@ Preferences ▸ Event kinetics sets τ and the criteria.  Approval is SLab's
 unless you opt in (Preferences ▸ Event kinetics ▸ Require valid kinetics, or
 the checkbox in Detect events): auto-approval then also needs kinetically
 valid events, and stroh_results records the rule next to SLab's own verdict.
-If the file has no residual and its ΔF/F is just C rescaled, the
+View ▸ Event markers draws a line at each event (all, or only kinetically
+valid ones) on the traces, in each trace's colour.  If the file has no residual and its ΔF/F is just C rescaled, the
 check would be circular and the status bar says so.</p>
 
 <h3>ROI filter</h3>

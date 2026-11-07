@@ -89,6 +89,8 @@ Event detection & curation (ported from SLabAnalysisPackage)
                                 of the last-selected component; blue: fitted
                                 expected transient on the raw trace, dashed
                                 peak: fails the kinetic check
+    View > Event markers      — event lines on the traces: off / all /
+                                kinetically valid only
     Ev ok / Shape r / τ fit   — raw-trace kinetics per component
                                 (Preferences > Event kinetics); opt-in:
                                 auto-approval also requires valid kinetics

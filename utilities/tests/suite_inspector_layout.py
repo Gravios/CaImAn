@@ -69,7 +69,7 @@ try:
     w.close(); app.processEvents()
     ui = json.loads(PREFS.read_text())["ui"]
     assert ui["sort"] == {"column": "QC", "order": "desc"}
-    assert ui["view"] == {"hide_rejected": False, "invert_bg": True, "show_rois": False, "hide_excluded": False, "dist_log": True}
+    assert ui["view"] == {"hide_rejected": False, "invert_bg": True, "show_rois": False, "hide_excluded": False, "dist_log": True, "event_markers": "off"}
     assert ui["background"] == "footprint max" and ui["trace"] == insp.TRACE_DFF
     assert ui["last_dir"] == str(root / "dayA") and ui["geometry"] and len(ui["splitters"]) == 5
     ok("close saves geometry, panes, hidden columns, sort, toggles, BG/trace, last folder")

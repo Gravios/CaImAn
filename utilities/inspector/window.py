@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 from PyQt6.QtCore import QByteArray, Qt
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -110,6 +110,22 @@ class InspectorWindow(QMainWindow):
             "data and are always saved.")
         self.act_hide_rejected.triggered.connect(self._set_hide_rejected)
         vm.addAction(self.act_hide_rejected)
+        mm = vm.addMenu("&Event markers")
+        mm.setToolTipsVisible(True)
+        grp = QActionGroup(self)
+        self.act_markers = {}
+        for mode, text, tip in (
+                ("off", "&Off", "No event markers on the traces"),
+                ("all", "&All events", "A line at every detected event peak"),
+                ("valid", "&Kinetically valid only",
+                 "Only events whose raw trace has the expected fast rise and "
+                 "exponential decay (Preferences ▸ Event kinetics)")):
+            a = QAction(text, self, checkable=True)
+            a.setToolTip(tip)
+            a.triggered.connect(lambda _c, m=mode: self._set_event_markers(m))
+            grp.addAction(a); mm.addAction(a)
+            self.act_markers[mode] = a
+        self.act_markers["off"].setChecked(True)
         self._columns_menu = vm.addMenu("&Columns")
         self._columns_menu.setToolTip("Show / hide table columns "
                                       "(also: right-click the table header)")
@@ -468,7 +484,8 @@ class InspectorWindow(QMainWindow):
                       "invert_bg":     self.act_invert_bg.isChecked(),
                       "show_rois":     self.act_show_rois.isChecked(),
                       "hide_excluded": self.act_hide_excl.isChecked(),
-                      "dist_log":      self.act_dist_log.isChecked()}
+                      "dist_log":      self.act_dist_log.isChecked(),
+                      "event_markers": self.trace_view.event_markers}
         return ui
 
     def _save_ui(self) -> None:
@@ -508,7 +525,13 @@ class InspectorWindow(QMainWindow):
             want = view.get(key)
             if want is not None and bool(want) != act.isChecked():
                 act.trigger()                 # runs the toggle's handler
+        if view.get("event_markers") in self.act_markers:
+            self._set_event_markers(view["event_markers"])
         self._apply_view_prefs()
+
+    def _set_event_markers(self, mode: str) -> None:
+        self.act_markers[mode].setChecked(True)
+        self.trace_view.set_event_markers(mode)
 
     def _set_hide_rejected(self, flag: bool) -> None:
         self.store.hide_rejected = bool(flag)
@@ -731,6 +754,7 @@ class InspectorWindow(QMainWindow):
             self.table.refresh()
             self._reselect(sel)
             self.event_view.refresh()
+            self.trace_view.refresh()          # kinetically valid markers
         self.statusBar().showMessage(f"Preferences saved to {path}", 6000)
         return True
 
@@ -1227,6 +1251,7 @@ class InspectorWindow(QMainWindow):
         self.act_hide_rejected.setEnabled(False)   # every row is rated
         self.table.blinded = True                  # no QC / Eval / kinetics
         self.event_view.blinded = True
+        self.trace_view.blinded = True
         self.act_blind_next.setVisible(True)
         self.act_blind_end.setEnabled(True)
         self.act_blind.setEnabled(False)
@@ -1314,6 +1339,7 @@ class InspectorWindow(QMainWindow):
         self._blind = None
         self.table.blinded = False
         self.event_view.blinded = False
+        self.trace_view.blinded = False
         self.act_hide_rejected.setEnabled(True)
         self.store.hide_rejected = self.act_hide_rejected.isChecked()
         self.corr_view.redraw(); self.dist_view.redraw()

@@ -574,9 +574,32 @@ class MovieBar(QWidget):
 class TraceViewer(pg.PlotWidget):
     """Bottom-left — stacked normalised traces for selected components.
     While a movie plays, a yellow frame cursor marks the shown frame; drag
-    it to seek."""
+    it to seek.  ``event_markers`` ("off" | "all" | "valid") draws a line
+    at each event peak across the component's band, in its trace colour —
+    "valid": only events passing the kinetic check (none during a blinded
+    review, which hides kinetics)."""
 
     cursor_dragged = pyqtSignal(int)
+    MARKER_MODES = ("off", "all", "valid")
+    event_markers = "off"
+    blinded = False
+
+    def set_event_markers(self, mode: str) -> None:
+        self.event_markers = mode if mode in self.MARKER_MODES else "off"
+        self._redraw()
+
+    def _marker_frames(self, i) -> np.ndarray:
+        """Peak frames of component i to mark under the current mode."""
+        s, ev = self.store, self.store.events
+        if self.event_markers == "off" or ev is None or i >= ev.n:
+            return np.zeros(0)
+        pk = np.asarray(ev.peaks[i], float).reshape(-1, 4)[:, 0]
+        if self.event_markers == "valid":
+            kin = None if self.blinded else s.kinetics
+            if kin is None or kin[i] is None:
+                return np.zeros(0)
+            pk = pk[np.asarray(kin[i]["valid"], bool)]
+        return pk
 
     def __init__(self, store: 'ComponentStore', parent=None):
         super().__init__(parent, background=PT["bg"])
@@ -653,6 +676,14 @@ class TraceViewer(pg.PlotWidget):
                 self.plot(t, (tr + offset).astype(np.float32),
                           pen=pg.mkPen(color, width=1),
                           name=s.labels[i])
+                pk = self._marker_frames(i)
+                if pk.size:                         # one item per component
+                    xs = np.repeat(pk, 2)
+                    ys = np.tile([offset - 0.12, offset + 1.08], pk.size)
+                    m = pg.PlotDataItem(xs, ys, connect="pairs",
+                                        pen=pg.mkPen(color, width=1.5))
+                    m.setZValue(-1)                 # behind the traces
+                    self.addItem(m)
                 offset += 1.3
             self.setXRange(0, T, padding=0)
             self.setYRange(-0.3, offset, padding=0)

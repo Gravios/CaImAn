@@ -304,6 +304,44 @@ try:
     w.close()
     ok("circular case: rule not applied, SLab approval kept, status bar says why")
 
+    # ── event markers on the trace view ──────────────────────────────────────
+    import pyqtgraph as pg
+    w = insp.InspectorWindow(s3); w.show(); app.processEvents()
+    tv = w.trace_view
+    sel = [i for i in range(s3.n) if s3.events.n_events(i)][:3]
+    w._on_cell_click(sel[0], False)
+    for i in sel[1:]:
+        w._on_cell_click(i, True)
+    app.processEvents()
+
+    def markers():
+        out = []
+        for it in tv.listDataItems():
+            if isinstance(it, pg.PlotDataItem) and it.opts.get("connect") == "pairs":
+                x, y = it.getData()
+                out.append((pg_color(it.opts["pen"]), np.asarray(x)[::2]))
+        return out
+    assert w.act_markers["off"].isChecked() and markers() == []
+    w.act_markers["all"].trigger(); app.processEvents()
+    mk = markers()
+    assert [m[0] for m in mk] == [insp.PALETTE_HEX[k].lower() for k in range(len(sel))]
+    for (_c, x), i in zip(mk, sel):
+        assert np.array_equal(x, s3.events.peaks[i][:, 0])
+    n_all = sum(x.size for _c, x in mk)
+    w.act_markers["valid"].trigger(); app.processEvents()
+    mk = markers()
+    for (_c, x), i in zip(mk, [i for i in sel if s3.kinetics[i]["valid"].any()]):
+        assert np.array_equal(x, s3.events.peaks[i][:, 0][s3.kinetics[i]["valid"]])
+    n_valid = sum(x.size for _c, x in mk)
+    assert n_valid == sum(int(s3.kinetics[i]["valid"].sum()) for i in sel) and n_valid < n_all
+    tv.blinded = True; tv.refresh(); assert markers() == []; tv.blinded = False; tv.refresh()
+    w.close(); app.processEvents()
+    w = insp.InspectorWindow(s3); w.show(); app.processEvents()
+    assert w.act_markers["valid"].isChecked() and w.trace_view.event_markers == "valid"
+    w.act_markers["off"].trigger(); w.close(); app.processEvents()
+    ok(f"View ▸ Event markers: all ({n_all}) / kinetically valid ({n_valid}) lines in each "
+       "trace's colour; none in a blinded review; remembered")
+
     # dialog checkbox follows Preferences ▸ Event kinetics
     from PyQt6.QtWidgets import QCheckBox
     insp.save_prefs({"kinetics": {"approve_on_kinetics": True, "min_valid_events": 2}})
