@@ -22,7 +22,10 @@ Usage
 Controls
 --------
     Table        — click to select; Ctrl/Shift for multi-select;
-                   click a column header to sort
+                   click a column header to sort.  ROI-filter columns
+                   (QC, Active, Fail, Area, Solid, Ecc, Edge, Rate,
+                   Pk ΔF/F, Skew, Act %) appear when the results file has a
+                   roi_filter group; Incl then starts from the QC verdict
     Movie bar    — under the cell viewer: play / scrub the raw stack
                    (<session>.tif / .msr next to the results is found;
                    View > Open movie… / Ctrl+M for another).  With the
@@ -202,6 +205,10 @@ class ComponentStore:
         #            used to map file-level stroh_results onto the shown subset
         self.events   = None
         self.approved = np.ones(K, dtype=bool)
+        # qc       : roi_filter fields {name: (K,) array} aligned to rows, or
+        #            None when the file has no roi_filter group
+        self.qc        = None
+        self.qc_params = {}
         self.orig_idx = (np.arange(K) if orig_idx is None
                          else np.asarray(orig_idx, dtype=np.int64))
         self.fr         = fr
@@ -361,6 +368,8 @@ class ComponentStore:
             "events":    self.events.copy() if self.events is not None else None,
             "approved":  self.approved.copy(),
             "orig_idx":  self.orig_idx.copy(),
+            "qc":        ({k: v.copy() for k, v in self.qc.items()}
+                          if self.qc is not None else None),
         }
 
     def _restore(self, snap: dict):
@@ -377,6 +386,7 @@ class ComponentStore:
         self.events    = snap["events"]
         self.approved  = snap["approved"]
         self.orig_idx  = snap["orig_idx"]
+        self.qc        = snap.get("qc")
         self.invalidate_corr()
 
     def _push_undo(self, op: str):
@@ -489,6 +499,8 @@ class ComponentStore:
         self.orig_idx = np.append(self.orig_idx[keep], -1)
         if self.events is not None:
             self.events = self.events.take(keep).append(self._detect_row(self.n - 1))
+        if self.qc is not None:
+            self.qc = _rf().append(_rf().take(self.qc, keep), self._qc_row(self.n - 1))
         self.invalidate_corr()
         return self.n - 1
 
@@ -509,7 +521,44 @@ class ComponentStore:
         self.orig_idx = self.orig_idx[keep]
         if self.events is not None:
             self.events = self.events.take(keep)
+        if self.qc is not None:
+            self.qc = _rf().take(self.qc, keep)
         self.invalidate_corr()
+
+    # ── ROI filter ────────────────────────────────────────────────────────────
+
+    def _qc_row(self, i):
+        """roi_filter fields for row i alone (a merged component), computed
+        with the file's filter parameters.  Fields the row's data cannot
+        provide are filled as unknown (NaN / 0 / False)."""
+        rf = _rf()
+        try:
+            one = rf.evaluate(
+                self._A[:, i:i + 1], self.dims,
+                SNR_comp=None if self.SNR_comp is None else self.SNR_comp[i:i + 1],
+                r_values=None if self.r_values is None else self.r_values[i:i + 1],
+                cnn_preds=None if self.cnn_preds is None else self.cnn_preds[i:i + 1],
+                F_dff=None if self.dff is None else self.dff[i:i + 1],
+                C=self.C[i:i + 1],
+                params=rf.resolve_params(self.qc_params))
+        except Exception as exc:
+            print(f"[roi_filter] merged row not evaluated: {exc}", file=sys.stderr)
+            one = {}
+        row = {}
+        for k, v in self.qc.items():
+            if k in one:
+                row[k] = np.asarray(one[k], dtype=v.dtype)
+            else:
+                fill = (np.nan if np.issubdtype(v.dtype, np.floating)
+                        else False if v.dtype == np.bool_ else 0)
+                row[k] = np.array([fill], dtype=v.dtype)
+        return row
+
+    @property
+    def has_approval(self) -> bool:
+        """Include flags exist once events are detected or a roi_filter
+        group seeded them."""
+        return self.events is not None or self.qc is not None
 
     # ── Events / approval ─────────────────────────────────────────────────────
 
@@ -664,11 +713,16 @@ class ComponentStore:
         self.fpath = path
         self.orig_idx = np.arange(K)          # rows now index the saved file
 
-        # Events + approvals as an SLab stroh_results group, rows = saved rows
-        if self.events is not None:
+        # Events + approvals as an SLab stroh_results group, rows = saved rows;
+        # roi_filter fields (merged rows re-evaluated) with the include flags
+        if self.events is not None or self.qc is not None:
             import h5py
             with h5py.File(path, "a") as f:
-                _ed().write_stroh_results(f, self.events, self.approved)
+                if self.events is not None:
+                    _ed().write_stroh_results(f, self.events, self.approved)
+                if self.qc is not None:
+                    _rf().write_group(f, self.qc, self.qc_params,
+                                      manually_approved=self.approved)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -704,6 +758,24 @@ def _ed():
             del sys.modules[name]
             raise
     sys.modules["_inspector_event_detection"] = mod
+    return mod
+
+
+def _rf():
+    """``caiman.utils.roi_filter``, imported lazily (same fallback as _ed)."""
+    mod = sys.modules.get("_inspector_roi_filter")
+    if mod is not None:
+        return mod
+    try:
+        from caiman.utils import roi_filter as mod
+    except Exception:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, "caiman", "utils", "roi_filter.py")
+        spec = importlib.util.spec_from_file_location("_inspector_roi_filter", p)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    sys.modules["_inspector_roi_filter"] = mod
     return mod
 
 
@@ -1035,7 +1107,8 @@ def load_from_hdf5(path: str, all_components: bool = False) -> ComponentStore:
                            orig_idx=orig_idx,
                            fr=_opt_float(pdata.get("fr")),
                            decay_time=_opt_float(pdata.get("decay_time")))
-    _attach_stroh_results(store, path)
+    _attach_roi_filter(store, path)        # seeds Incl from `passed` …
+    _attach_stroh_results(store, path)     # … unless event approvals exist
     _attach_sibling_backgrounds(store, path)
     return store
 
@@ -1046,6 +1119,36 @@ def _opt_float(x):
     except (TypeError, ValueError):
         return None
     return v if np.isfinite(v) and v > 0 else None
+
+
+def _attach_roi_filter(store: 'ComponentStore', path: str):
+    """Load a ``roi_filter`` group if present, mapped through orig_idx.
+
+    Include flags start from the group's saved manual approvals, else from
+    the filter's ``passed`` verdict.  Event approvals (stroh_results), read
+    afterwards, take precedence."""
+    try:
+        import h5py
+        with h5py.File(path, "r") as f:
+            if "roi_filter" not in f:
+                return
+            fields, params, appr = _rf().read_group(f["roi_filter"])
+    except Exception as exc:
+        print(f"[roi_filter] could not read roi_filter: {exc}", file=sys.stderr)
+        return
+    if not fields:
+        return
+    K  = int(next(iter(fields.values())).size)
+    oi = store.orig_idx
+    if not (oi.size and (oi >= 0).all() and oi.max() < K):
+        print(f"[roi_filter] {K} rows; cannot map onto {store.n} shown "
+              "components — ignored", file=sys.stderr)
+        return
+    store.qc        = _rf().take(fields, oi)
+    store.qc_params = params
+    base = appr if appr is not None else fields.get("passed")
+    if base is not None:
+        store.approved = np.asarray(base, bool)[oi].copy()
 
 
 def _attach_stroh_results(store: 'ComponentStore', path: str):
@@ -1272,6 +1375,15 @@ def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
     rois  = ed.roi_stats(ev, store.approved, ev.binary.shape[1],
                          labels=store.labels, SNR_comp=store.SNR_comp,
                          cnn_preds=store.cnn_preds)
+    if store.qc is not None:                 # ROI-filter fields, same rows
+        rr = np.asarray(rois["ROI"], dtype=np.int64)
+        for k, v in store.qc.items():
+            col = np.asarray(v)[rr]
+            rois[f"qc_{k}"] = col.astype(int) if col.dtype == np.bool_ else col
+        if "fail_reasons" in store.qc:
+            rois["qc_fail"] = np.array(
+                [",".join(_rf().decode_reasons(m)) for m in store.qc["fail_reasons"][rr]],
+                dtype=object)
     folder, base = os.path.split(peak_path)
     stem, ext = os.path.splitext(base)
     roi_stem = (stem.replace("PeakStats", "ROIStats") if "PeakStats" in stem
@@ -1404,7 +1516,7 @@ def _build_roi_overlay(store: ComponentStore,
         return tuple(int(_h[k:k + 2], 16) / 255.0 for k in (0, 2, 4))
 
     inc_rgb, exc_rgb = _rgb(CYAN), _rgb(EXCLUDED)
-    use_appr = store.events is not None   # approval only meaningful with events
+    use_appr = store.has_approval         # events or roi_filter seeded Incl
 
     for i in range(store.n):
         if store.hidden[i]:
@@ -2383,6 +2495,31 @@ class _SortItem(QTableWidgetItem):
         return a < b
 
 
+_QC_SHORT = {"empty": "empty", "area_small": "area<", "area_large": "area>",
+             "solidity": "solid", "eccentricity": "ecc", "edge": "edge",
+             "caiman_quality": "qual", "inactive": "inact"}
+
+
+def _qc_cell(v, kind: str) -> tuple:
+    """(text, sort key[, tooltip]) for one roi_filter value."""
+    if kind == "bool":
+        return ("✓" if v else "✗", (0 if v else 1,))
+    if kind == "reasons":
+        names = _rf().decode_reasons(int(v))
+        return (",".join(_QC_SHORT.get(n, n) for n in names) or "—",
+                (len(names), int(v)),
+                ", ".join(names) or "passes every criterion")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        f = float("nan")
+    if f != f:
+        return ("—", _num_key(f))
+    text = {"int": f"{int(f)}", "f0": f"{f:.0f}", "f2": f"{f:.2f}",
+            "pct": f"{100 * f:.1f}"}.get(kind, f"{f:.3f}")
+    return (text, _num_key(f))
+
+
 class ComponentTable(QTableWidget):
     """
     Left panel — one row per component with quality metrics.
@@ -2400,6 +2537,33 @@ class ComponentTable(QTableWidget):
     _OPTIONAL = (("SNR",   "SNR_comp"),
                  ("r_val", "r_values"),
                  ("CNN",   "cnn_preds"))
+
+    # roi_filter fields, each shown only when present in the results file:
+    # (header, field, display kind, header tooltip)
+    _QC_COLS = (
+        ("QC",      "passed",       "bool",
+         "ROI filter verdict: footprint ∧ edge ∧ CaImAn quality (∧ active if required)"),
+        ("Active",  "active",       "bool",
+         "ROI filter activity: event count / rate / peak / skew thresholds met"),
+        ("Fail",    "fail_reasons", "reasons",
+         "Failed ROI-filter criteria (hover a cell for the full names)"),
+        ("Area",    "area_px",      "int",
+         "Footprint area (px) at footprint_thr × peak"),
+        ("Solid",   "solidity",     "f2",
+         "Solidity = area / convex-hull area (low = ragged or ring-shaped)"),
+        ("Ecc",     "eccentricity", "f2",
+         "Eccentricity of the footprint (0 = circle, 1 = line)"),
+        ("Edge",    "edge_dist_px", "f0",
+         "Centroid distance to the FOV border (px)"),
+        ("Rate",    "event_rate",   "f2",
+         "ROI filter: events per minute on ΔF/F (no SNR gating)"),
+        ("Pk ΔF/F", "peak_dff",     "f2",
+         "Peak of the smoothed ΔF/F"),
+        ("Skew",    "skewness",     "f2",
+         "Skewness of ΔF/F"),
+        ("Act %",   "active_frac",  "pct",
+         "Percent of frames inside detected events"),
+    )
 
     def __init__(self, store: ComponentStore, parent=None):
         super().__init__(parent)
@@ -2500,8 +2664,13 @@ class ComponentTable(QTableWidget):
         for label, attr in self._OPTIONAL:
             if getattr(self.store, attr, None) is not None:
                 cols.append(label)
+        qc = self.store.qc
+        if qc is not None:
+            cols += [h for h, fld, _k, _t in self._QC_COLS if fld in qc]
         if self.store.events is not None:
-            cols += ["Ev/min", "Incl"]
+            cols.append("Ev/min")
+        if self.store.has_approval:
+            cols.append("Incl")
         return cols
 
     def _populate(self):
@@ -2515,6 +2684,12 @@ class ComponentTable(QTableWidget):
         self.clear()
         self.setColumnCount(len(cols))
         self.setHorizontalHeaderLabels(cols)
+        tips = {h: t for h, _f, _k, t in self._QC_COLS}
+        tips["Incl"] = ("Include flag (I toggles). Starts from the ROI filter's "
+                        "QC verdict, or from event auto-approval")
+        for c, h in enumerate(cols):
+            if h in tips:
+                self.horizontalHeaderItem(c).setToolTip(tips[h])
         self.setRowCount(s.n)
         dark = QColor(30, 30, 30)
         for i in range(s.n):
@@ -2525,13 +2700,20 @@ class ComponentTable(QTableWidget):
                 if getattr(s, attr, None) is not None:
                     v = getattr(s, attr)[i]
                     vals.append((f"{v:.3f}", _num_key(v)))
+            if s.qc is not None:
+                for _h, fld, kind, _t in self._QC_COLS:
+                    if fld in s.qc:
+                        vals.append(_qc_cell(s.qc[fld][i], kind))
             if s.events is not None:
                 fq = s.events.frequencies[i]
                 vals.append((f"{fq:.2f}", _num_key(fq)))
+            if s.has_approval:
                 vals.append(("✓" if s.approved[i] else "✗",
                              (0 if s.approved[i] else 1,)))
-            for c, (text, key) in enumerate(vals):
+            for c, (text, key, *tip) in enumerate(vals):
                 item = _SortItem(text)
+                if tip:
+                    item.setToolTip(tip[0])
                 item.setData(_COMP_ROLE, i)
                 item.setData(_SORT_ROLE, key)
                 item.setData(_MISS_ROLE, _is_missing(key))
@@ -2561,7 +2743,7 @@ class ComponentTable(QTableWidget):
         normal = QColor(220, 220, 220)
         excl   = QColor(255, 110, 110)
         s      = self.store
-        has_ev = s.events is not None and self.columnCount() and \
+        has_ev = s.has_approval and self.columnCount() and \
             self.horizontalHeaderItem(self.columnCount() - 1).text() == "Incl"
         # Changing the Incl key while sorted by it would re-sort mid-loop and
         # invalidate row_of; suspend sorting and re-apply it once at the end.
@@ -3261,9 +3443,9 @@ class InspectorWindow(QMainWindow):
         s, sel = self.store, self._selected_rows()
         if not sel:
             return
-        if s.events is None:
+        if not s.has_approval:
             self.statusBar().showMessage(
-                "Include flags belong to the event results — "
+                "Include flags come from event results or the ROI filter — "
                 "run Analysis ▸ Detect events first")
             return
         s.toggle_approved(sel)
@@ -3292,10 +3474,13 @@ class InspectorWindow(QMainWindow):
                 "This file has no ΔF/F traces (estimates.F_dff).\n"
                 "Run cnm.estimates.detrend_df_f() in the pipeline first.")
             return
-        if s.events is not None and QMessageBox.question(
+        if s.has_approval and QMessageBox.question(
                 self, "Detect events",
-                "Existing events and include flags will be replaced.\n"
-                "Continue?") != QMessageBox.StandardButton.Yes:
+                ("Existing events and include flags will be replaced."
+                 if s.events is not None else
+                 "Include flags (seeded from the ROI filter) will be replaced "
+                 "by event auto-approval.") + "\nContinue?"
+                ) != QMessageBox.StandardButton.Yes:
             return
         ev, prm = s.events, (s.events.params if s.events else {})
         dlg  = QDialog(self)
@@ -3395,6 +3580,24 @@ class InspectorWindow(QMainWindow):
             f"Indicator decay time:  "
             f"{(ev.decay_time if ev is not None else s.decay_time) or 'n/a'}",
         ]
+        if s.qc is not None:
+            qc = s.qc
+            line = "ROI filter:  "
+            if "passed" in qc:
+                line += f"{int(qc['passed'].sum())}/{s.n} passed"
+            if "active" in qc:
+                line += f",  {int(qc['active'].sum())} active"
+            lines.append(line)
+            if "fail_reasons" in qc:
+                rf = _rf()
+                fails = {n: int(((qc["fail_reasons"] & b) != 0).sum())
+                         for n, b in rf.REASONS.items()}
+                fails = {n: c for n, c in fails.items() if c}
+                if fails:
+                    lines.append("   fails:  " + ",  ".join(
+                        f"{n} {c}" for n, c in fails.items()))
+            if ev is None:
+                lines.append(f"Included:  {s.n_approved}")
         if ev is not None:
             lines += [
                 f"Auto-approved:  {int(ev.auto_approved.sum())}",
