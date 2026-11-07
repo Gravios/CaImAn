@@ -164,6 +164,29 @@ try:
     assert [t.isRowHidden(t.row_of(i)) for i in range(K)] == [i not in active for i in range(K)]
     w.close()
     ok("blinded review: every row shown and ratable; Hide rejected restored afterwards")
+
+    # companion images next to the results file become backgrounds
+    import tifffile
+    bg_dir = root / "bg"; bg_dir.mkdir()
+    sess = "sessA-001"
+    res_bg = bg_dir / f"{sess}_results.hdf5"; res_bg.write_bytes(b"")
+    np.save(bg_dir / f"{sess}_mean.npy", rng.random(dims))
+    np.save(bg_dir / f"{sess}_pnr.npy", rng.random(dims))
+    np.save(bg_dir / "other_projection.npy", rng.random(dims))
+    np.save(bg_dir / f"{sess}_vol.npy", rng.random((3, *dims)))        # 3-D: skipped
+    np.save(bg_dir / "wrongsize_max.npy", rng.random((10, 10)))         # wrong FOV
+    (bg_dir / "notes_mean.txt").write_text("x")                         # not an image
+    (bg_dir / f"{sess}_broken.npy").write_text("garbage")               # unreadable
+    tifffile.imwrite(bg_dir / f"{sess}.tif", (rng.random((20, *dims)) * 1000).astype(np.uint16))
+    for flat, active in ((True, "other_projection"), (False, "correlation")):
+        sb = insp.ComponentStore(A, C, np.zeros(dims) if flat else rng.random(dims), dims)
+        insp.loading._attach_sibling_backgrounds(sb, str(res_bg))
+        assert sorted(sb.backgrounds) == ["correlation", "footprint max", "mean", "other_projection",
+                                          "pnr", "stack max", "stack mean"], sorted(sb.backgrounds)
+        assert sb.bg_sources["stack mean"] == str((bg_dir / f"{sess}.tif").resolve())
+        assert sb.bg_key == active, (flat, sb.bg_key)
+    ok("companion images: session prefix / projection names, 2-D + FOV only, stack projected; "
+       "flat Cn → best-ranked projection shown")
     print("ALL OK")
 finally:
     shutil.rmtree(root)

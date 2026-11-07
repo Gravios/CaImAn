@@ -179,6 +179,47 @@ def discover_session(folder: str, results: str = None):
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
+def _ensure_caiman_temp(path: str) -> None:
+    """load_CNMF calls fn_relocated, which needs a writable CAIMAN_TEMP;
+    fall back to the results file's folder when it is unset / unusable."""
+    ct = os.environ.get("CAIMAN_TEMP", "")
+    if not (ct and os.path.isdir(ct) and os.access(ct, os.W_OK)):
+        os.environ["CAIMAN_TEMP"] = os.path.abspath(os.path.dirname(path)) or "."
+
+
+def _accepted_mask(est, K: int):
+    """(K,) bool from estimates.idx_components (CaImAn accepted; census:
+    active), or None when the file has no idx_components."""
+    idx = getattr(est, "idx_components", None)
+    if idx is None:
+        return None
+    idx = np.asarray(idx, dtype=np.int64).ravel()
+    accepted = np.zeros(K, dtype=bool)
+    accepted[idx[(idx >= 0) & (idx < K)]] = True
+    return accepted
+
+
+def _trace_registry(est, C) -> dict:
+    """Display traces: denoised C (canonical) plus ΔF/F, C + residual and
+    deconvolved spikes when present and shaped like C."""
+    def rows(arr):
+        if arr is None:
+            return None
+        arr = np.asarray(arr, dtype=np.float32)
+        return None if arr.size == 0 or arr.shape != Cd.shape else arr
+
+    Cd = np.asarray(C, dtype=np.float32)
+    traces = {TRACE_DENOISED: Cd}
+    F_dff, YrA, S = (rows(getattr(est, k, None)) for k in ("F_dff", "YrA", "S"))
+    if F_dff is not None:
+        traces[TRACE_DFF] = F_dff
+    if YrA is not None:
+        traces[ComponentStore.RAW_TRACE] = Cd + YrA
+    if S is not None and np.any(S):
+        traces["S (deconvolved)"] = S
+    return traces
+
+
 def load_from_hdf5(path: str, all_components: bool = True) -> ComponentStore:
     """Load a CNMF results file — every row of the estimates.
 
@@ -187,66 +228,24 @@ def load_from_hdf5(path: str, all_components: bool = True) -> ComponentStore:
     column), so Save never drops them.  ``all_components`` is kept for
     callers; loading a subset is no longer supported because saving it
     would lose the other rows."""
-    import os as _os
-    # Ensure CAIMAN_TEMP is set to a writable directory before load_CNMF
-    # calls fn_relocated.  If the current value is missing or unwritable,
-    # fall back to the directory that contains the HDF5 file.
-    _ct = _os.environ.get("CAIMAN_TEMP", "")
-    if not (_ct and _os.path.isdir(_ct) and _os.access(_ct, _os.W_OK)):
-        _fallback = _os.path.abspath(_os.path.dirname(path)) or "."
-        _os.environ["CAIMAN_TEMP"] = _fallback
-
+    _ensure_caiman_temp(path)
     from caiman.source_extraction.cnmf.cnmf import load_CNMF
     cnm  = load_CNMF(path)
     est  = cnm.estimates
     dims = cnm.dims if (cnm.dims and all(d > 0 for d in cnm.dims)) else est.dims
-
     A = _to_sparse(est.A)
-    C = est.C
     K = A.shape[1]
-
-    # accepted / rejected (census: active / inactive) from idx_components
-    accepted = None
-    idx = getattr(est, "idx_components", None)
-    if idx is not None:
-        idx = np.asarray(idx, dtype=np.int64).ravel()
-        accepted = np.zeros(K, dtype=bool)
-        accepted[idx[(idx >= 0) & (idx < K)]] = True
-
-    def _sel_rows(arr):
-        """An optional (K, T) trace array as float32, or None."""
-        if arr is None:
-            return None
-        arr = np.asarray(arr, dtype=np.float32)
-        return None if arr.size == 0 else arr
-
-    snr  = getattr(est, "SNR_comp",  None)
-    rval = getattr(est, "r_values",  None)
-    cnn  = getattr(est, "cnn_preds", None)
-
-    # Build the trace registry: denoised C is canonical; add ΔF/F, the
-    # residual-added raw trace, and deconvolved spikes when available and
-    # shape-compatible.  Display-only — the dropdown switches between them.
-    Cd     = np.asarray(C, dtype=np.float32)
-    traces = {TRACE_DENOISED: Cd}
-    F_dff  = _sel_rows(getattr(est, "F_dff", None))
-    YrA    = _sel_rows(getattr(est, "YrA",   None))
-    S      = _sel_rows(getattr(est, "S",     None))
-    if F_dff is not None and F_dff.shape == Cd.shape:
-        traces[TRACE_DFF] = F_dff
-    if YrA is not None and YrA.shape == Cd.shape:
-        traces["C + residual (raw)"] = Cd + YrA
-    if S is not None and S.shape == Cd.shape and np.any(S):
-        traces["S (deconvolved)"] = S
-
-    _Cn = getattr(est, "Cn", None)
-    Cn  = (_Cn if _Cn is not None else
-           A.max(axis=1).toarray().ravel().reshape(dims, order="F"))
+    Cn = getattr(est, "Cn", None)
+    if Cn is None:                          # footprint maximum as the image
+        Cn = A.max(axis=1).toarray().ravel().reshape(dims, order="F")
     pdata = getattr(getattr(cnm, "params", None), "data", None) or {}
-    store = ComponentStore(A, C, Cn, dims,
-                           SNR_comp=snr, r_values=rval, cnn_preds=cnn,
-                           cnm_obj=cnm, fpath=path, traces=traces,
-                           orig_idx=np.arange(K), accepted=accepted,
+    store = ComponentStore(A, est.C, Cn, dims,
+                           SNR_comp=getattr(est, "SNR_comp", None),
+                           r_values=getattr(est, "r_values", None),
+                           cnn_preds=getattr(est, "cnn_preds", None),
+                           cnm_obj=cnm, fpath=path,
+                           traces=_trace_registry(est, est.C),
+                           orig_idx=np.arange(K), accepted=_accepted_mask(est, K),
                            fr=_opt_float(pdata.get("fr")),
                            decay_time=_opt_float(pdata.get("decay_time")))
     _attach_roi_filter(store, path)        # seeds Incl from `passed` …
@@ -313,6 +312,53 @@ def _attach_stroh_results(store: 'ComponentStore', path: str):
               f"{store.n} shown components — ignored", file=sys.stderr)
 
 
+_BG_TOKENS = ("projection", "percentile", "mean", "median",
+              "max", "pnr", "summary", "anat", "template", "_cn")
+_BG_EXTS = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
+
+
+def _sibling_images(path: str):
+    """(file, lower-case name, stem, label) of companion images: same
+    session prefix as the results file, or a projection-like name."""
+    import glob
+    prefix = _session_prefix(path)
+    for f in sorted(glob.glob(os.path.join(_os_dirname(path), "*"))):
+        if os.path.abspath(f) == os.path.abspath(path):
+            continue
+        low  = os.path.basename(f).lower()
+        stem = os.path.splitext(os.path.basename(f))[0]
+        if not low.endswith(_BG_EXTS):
+            continue
+        shares_prefix = bool(prefix) and stem.lower().startswith(prefix.lower())
+        if not (shares_prefix or any(tok in low for tok in _BG_TOKENS)):
+            continue
+        label = (stem[len(prefix):].lstrip("._- ") or stem) if shares_prefix else stem
+        yield f, low, stem, label
+
+
+def _attach_session_stack(store: 'ComponentStore', f: str) -> list:
+    """Project the raw stack <session>.tif (SLab: the anatomical
+    reference) into backgrounds, unless it is huge.  Returns the
+    (label, rank key) pairs added."""
+    if os.path.getsize(f) > SIBLING_STACK_MAX_BYTES:
+        print(f"[bg] skipping {os.path.basename(f)} "
+              f"({os.path.getsize(f) / 2**30:.1f} GiB); "
+              f"pass it with --background or open the .tif", file=sys.stderr)
+        return []
+    added = []
+    for pname, img in _stack_projections(f).items():
+        store.add_background(pname, img)
+        store.bg_sources[pname] = os.path.abspath(f)
+        added.append((pname, "mean" if "mean" in pname else "max"))
+    return added
+
+
+def _bg_rank(item) -> int:
+    """Preference of a background by its name: earlier token wins."""
+    low = item[1]
+    return next((r for r, tok in enumerate(_BG_TOKENS) if tok in low), len(_BG_TOKENS))
+
+
 def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
     """Register data-projection images sitting next to the results file.
 
@@ -323,60 +369,22 @@ def _attach_sibling_backgrounds(store: 'ComponentStore', path: str):
     — e.g. denoised data saturates Cn — the best-ranked projection is
     auto-activated so the viewer shows the actual cells.
     """
-    import glob
-    folder = _os_dirname(path)
     prefix = _session_prefix(path)
-    tokens = ("projection", "percentile", "mean", "median",
-              "max", "pnr", "summary", "anat", "template", "_cn")
-    exts   = (".npy", ".npz", ".tif", ".tiff", ".png", ".jpg", ".jpeg")
-
-    found = []   # (label, lowername)
-    for f in sorted(glob.glob(os.path.join(folder, "*"))):
-        if os.path.abspath(f) == os.path.abspath(path):
-            continue
-        low       = os.path.basename(f).lower()
-        name_stem = os.path.splitext(os.path.basename(f))[0]
-        if not low.endswith(exts):
-            continue
-        shares_prefix = bool(prefix) and name_stem.lower().startswith(prefix.lower())
-        has_token     = any(tok in low for tok in tokens)
-        if not (shares_prefix or has_token):
-            continue
+    found = []   # (label, rank key)
+    for f, low, stem, label in _sibling_images(path):
         try:
-            label = name_stem
-            if shares_prefix:
-                label = name_stem[len(prefix):].lstrip("._- ") or name_stem
-            # SLab rule: the raw stack <session>.tif next to the results is the
-            # anatomical reference.  Project it (streamed) unless it is huge.
-            if (low.endswith(TIF_EXTS) and name_stem == prefix
-                    and len(_tif_shape(f)) > 2):
-                if os.path.getsize(f) > SIBLING_STACK_MAX_BYTES:
-                    print(f"[bg] skipping {os.path.basename(f)} "
-                          f"({os.path.getsize(f) / 2**30:.1f} GiB); "
-                          f"pass it with --background or open the .tif",
-                          file=sys.stderr)
-                    continue
-                for pname, img in _stack_projections(f).items():
-                    store.add_background(pname, img)
-                    store.bg_sources[pname] = os.path.abspath(f)
-                    found.append((pname, "mean" if "mean" in pname else "max"))
+            if low.endswith(TIF_EXTS) and stem == prefix and len(_tif_shape(f)) > 2:
+                found += _attach_session_stack(store, f)
                 continue
             img = _load_image_file(f)
             if np.asarray(img).squeeze().ndim != 2:   # other stacks: skip
                 continue
             store.add_background(label, img)           # coercion dim-checks
             found.append((label, low))
-        except Exception:
+        except Exception:                              # unreadable: skip
             continue
-
     if found and not _has_contrast(store.backgrounds.get("correlation")):
-        def _rank(item):
-            low = item[1]
-            for r, tok in enumerate(tokens):
-                if tok in low:
-                    return r
-            return len(tokens)
-        store.set_background(sorted(found, key=_rank)[0][0])
+        store.set_background(sorted(found, key=_bg_rank)[0][0])
 
 
 def _session_prefix(path: str) -> str:
