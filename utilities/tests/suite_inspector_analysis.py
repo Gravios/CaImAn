@@ -33,6 +33,11 @@ from caiman.utils import event_detection as ed
 from PyQt6.QtWidgets import QApplication, QMessageBox
 app = QApplication.instance() or QApplication([])
 
+
+def pg_color(pen):
+    import pyqtgraph as pg
+    return pg.mkPen(pen).color().name()
+
 rng = np.random.default_rng(7)
 d1, d2, T, FR = 40, 60, 1800, 30.0
 yy, xx = np.mgrid[:d1, :d2]
@@ -134,6 +139,70 @@ try:
     ok("PeakStats / ROIStats carry the source component (-1 merged)")
     w.close()
 
+    # ── event kinetics (raw-ΔF/F check) in the inspector ─────────────────────
+    from caiman.utils import event_kinetics as ek
+    from PyQt6.QtWidgets import QDialog
+    s2 = insp.ComponentStore(A, C, np.zeros((d1, d2)), (d1, d2), SNR_comp=SNR, r_values=RV,
+                             cnn_preds=CNN, fr=FR, decay_time=0.4,
+                             traces={insp.TRACE_DENOISED: C, insp.TRACE_DFF: Fdff.astype(np.float32)})
+    s2.detect_events(FR, 0.4)
+    w = insp.InspectorWindow(s2); w.show(); app.processEvents()
+    t = w.table
+    H = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    for col in ("Ev ok", "Ev ok %", "Shape r", "τ fit (s)"):
+        assert col in H, H
+    ref = ek.summary_table(ek.validate(s2.dff, s2.events, insp.kinetics_prefs()))
+    got = [int(t.item(t.row_of(i), H.index("Ev ok")).text()) for i in range(s2.n)]
+    assert got == ref["n_valid"].tolist() and sum(got) > 0, (got, ref["n_valid"])
+    ok(f"table: Ev ok / Ev ok % / Shape r / τ fit columns ({sum(got)} valid events)")
+
+    calls = []
+    orig_validate = ek.validate
+    ek.validate = lambda *a, **k: (calls.append(1), orig_validate(*a, **k))[1]
+    _ = s2.kinetics
+    new2 = s2.merge([0, 1]); _ = s2.kinetics
+    assert not calls, "merge updates kinetics row-wise"
+    fresh = orig_validate(s2.dff, s2.events, s2.kinetics_params)
+    for a_, b_ in zip(s2.kinetics, fresh):
+        assert np.array_equal(a_["valid"], b_["valid"])
+        assert np.allclose(a_["shape_r"], b_["shape_r"], equal_nan=True)
+    before = s2.kinetics
+    s2.undo(); s2.redo()
+    assert s2.kinetics is not None and not calls
+    ek.validate = orig_validate
+    ok("merge computes only the new row; undo / redo restore the cached kinetics")
+
+    def strict(dlg):
+        dlg._fields["kinetics"]["min_shape_r"].set_value(0.99)
+    insp.PreferencesDialog.exec = lambda self: (strict(self), QDialog.DialogCode.Accepted)[1]
+    w._full_refresh(); app.processEvents()
+    assert w._edit_prefs("kinetics"); app.processEvents()
+    assert s2.kinetics_params["min_shape_r"] == 0.99
+    H = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    got2 = [int(t.item(t.row_of(i), H.index("Ev ok")).text()) for i in range(s2.n)]
+    ref2 = ek.summary_table(ek.validate(s2.dff, s2.events, dict(insp.kinetics_prefs())))
+    assert got2 == ref2["n_valid"].tolist() and sum(got2) < sum(got), (got2, got)
+    ok("Preferences ▸ Event kinetics re-evaluates and refreshes the table")
+
+    comp = int(np.argmax([len(p) for p in s2.events.peaks]))
+    w._on_cell_click(comp, False); app.processEvents()
+    fit_pen = insp.PT["fit"]
+    fits = [it for it in w.event_view.listDataItems()
+            if it.opts["pen"] is not None and pg_color(it.opts["pen"]) == fit_pen]
+    n_test = ek.summarize_row(s2.kinetics[comp])["n_testable"]
+    assert len(fits) == n_test, (len(fits), n_test)
+    assert "kinetics:" in w.event_view.plotItem.titleLabel.text
+    ok(f"event panel draws {len(fits)} fitted templates and counts valid events in its title")
+
+    s2.approved[:] = True
+    out = insp.export_event_tables(s2, str(root / "k_PeakStats.csv"))
+    pk_rows = list(csv.DictReader(open(out[0])))
+    roi_rows = list(csv.DictReader(open(out[1])))
+    assert {"kin_shape_r", "kin_tau_s", "kin_rise_s", "kin_amp_snr", "kin_valid", "kin_fail"} <= set(pk_rows[0])
+    assert sum(int(r["kin_valid"]) for r in pk_rows) == sum(int(r["kin_n_valid"]) for r in roi_rows)
+    w.close()
+    ok("PeakStats kin_* per event, ROIStats kin_* per ROI (consistent)")
+
     # ── blinded review from a file ───────────────────────────────────────────
     e = Est()
     e.A = scipy.sparse.csc_matrix(A); e.C = C; e.dims = (d1, d2)
@@ -168,6 +237,7 @@ try:
     w.start_blinded("R1", [str(src)]); app.processEvents()
     assert np.array_equal(w.store.approved, res.auto_approved), "rater starts from auto_approved"
     assert "Eval" not in hdr() and not [h for h in hdr() if h in qc_cols], hdr()
+    assert "Ev ok" not in hdr() and w.event_view.blinded
     assert "accepted" not in w.statusBar().currentMessage()
     shown = []
     QMessageBox.information = lambda *a, **k: shown.append(a[2])
@@ -181,8 +251,49 @@ try:
         g = f["SLabRandomization/R1"]
         assert np.array_equal(np.sort(g["manually_approved"][()]), np.flatnonzero(res.auto_approved))
     assert "Eval" in hdr() and [h for h in hdr() if h in qc_cols] == had_qc
+    assert "Ev ok" in hdr() and not w.event_view.blinded
     w.close()
     ok("export carries eval_accepted (1 = idx_components / census active)")
+
+    # ── kinetics source: raw C + YrA when loaded, warning when circular ──────
+    RAW = insp.ComponentStore.RAW_TRACE
+    s3 = insp.ComponentStore(A, C, np.zeros((d1, d2)), (d1, d2), SNR_comp=SNR, fr=FR,
+                             decay_time=0.4, traces={insp.TRACE_DENOISED: C,
+                             insp.TRACE_DFF: Fdff.astype(np.float32), RAW: C + YrA})
+    s3.detect_events(FR, 0.4)
+    assert s3.kinetics_source == "raw" and not s3.kinetics_circular
+    exp = ek.validate(ek.raw_dff(C, YrA, Fdff.astype(np.float32)), s3.events, s3.kinetics_params)
+    assert all(np.array_equal(a_["valid"], b_["valid"]) for a_, b_ in zip(s3.kinetics, exp))
+    s4 = insp.ComponentStore(A, C, np.zeros((d1, d2)), (d1, d2), SNR_comp=SNR, fr=FR,
+                             decay_time=0.4, traces={insp.TRACE_DENOISED: C,
+                             insp.TRACE_DFF: (C / 3.0).astype(np.float32)})
+    s4.detect_events(FR, 0.4)
+    assert s4.kinetics_source == "dff" and s4.kinetics_circular
+    w = insp.InspectorWindow(s4); w.show(); app.processEvents()
+    assert "⚠ kinetics" in w.statusBar().currentMessage()
+    w._session_info(); assert "circular" in shown[-1], shown[-1]
+    w.close()
+    ok("kinetics run on raw C + YrA when loaded; ΔF/F ≈ C without residual is flagged")
+
+    # Save keeps the residual (merged row: β-weighted), so C + YrA survives
+    e2 = Est()
+    e2.A = scipy.sparse.csc_matrix(A); e2.C = C; e2.dims = (d1, d2)
+    e2.SNR_comp, e2.r_values, e2.cnn_preds = SNR, RV, CNN
+    e2.F_dff = Fdff; e2.YrA = YrA; e2.S = None; e2.Cn = None
+    e2.idx_components = None; e2.idx_components_bad = None
+    c2 = CNM(); c2.estimates = e2; c2.dims = (d1, d2); c2.provenance = []
+    c2.params = types.SimpleNamespace(data={"fr": FR, "decay_time": 0.4})
+    p2 = root / "yra_results.hdf5"; c2.save(p2)
+    st = insp.load_from_hdf5(str(p2))
+    assert st.kinetics_source == "raw"
+    st.merge([4, 5])
+    out2 = root / "yra_curated.hdf5"; st.save(str(out2))
+    e3 = load_CNMF(out2).estimates
+    assert e3.YrA is not None and e3.YrA.shape == (K - 1, T)
+    assert np.allclose(e3.YrA[:K - 2], YrA[:4], atol=1e-5)
+    assert np.allclose(e3.YrA[-1], st.traces[RAW][-1] - st.C[-1], atol=1e-5)
+    assert insp.load_from_hdf5(str(out2)).kinetics_source == "raw"
+    ok("Save writes YrA (merged row β-weighted); curated files keep the raw trace")
     ok("blinded review: starts from auto_approved, hides Eval / QC (table, status, session "
        "info), blocks re-detection; columns return afterwards")
     print("ALL OK")

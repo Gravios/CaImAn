@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .deps import _ed, _rf
+from .deps import _ed, _ek, _rf
 
 if TYPE_CHECKING:                      # annotations only
     from .store import ComponentStore
@@ -18,7 +18,9 @@ def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
 
     Both tables carry ``component`` (row in the loaded file's estimates, -1
     for a merged component) and, when the file has idx_components,
-    ``eval_accepted`` (1 = CaImAn accepted / census active).
+    ``eval_accepted`` (1 = CaImAn accepted / census active).  With ΔF/F,
+    ``kin_*`` columns add the raw-trace kinetic check
+    (:mod:`caiman.utils.event_kinetics`) per event and per ROI.
 
     ``peak_path`` names the PeakStats file (.xlsx or .csv); ROIStats goes
     next to it with ``PeakStats`` → ``ROIStats`` in the name.  ``.xlsx``
@@ -42,6 +44,19 @@ def export_event_tables(store: 'ComponentStore', peak_path: str) -> list:
                          cnn_preds=store.cnn_preds)
     rr = np.asarray(rois["ROI"], dtype=np.int64)
     rois["component"] = store.orig_idx[rr].astype(np.int64)
+    kin = store.kinetics                     # raw-ΔF/F kinetic check (diagnostic)
+    if kin is not None:
+        ek = _ek()
+        per_ev = ek.event_table(kin, rows)
+        for f in ("shape_r", "tau_s", "rise_s", "amp_snr"):
+            peaks[f"kin_{f}"] = per_ev[f]
+        peaks["kin_valid"] = per_ev["valid"].astype(int)
+        peaks["kin_fail"] = np.array([",".join(ek.decode_fail(m)) for m in per_ev["fail"]],
+                                     dtype=object)
+        summ = ek.summary_table(kin)
+        for f in ek.SUMMARY_FIELDS:
+            if f != "n_events":
+                rois[f"kin_{f}"] = summ[f][rr]
     if store.eval_known:                     # CaImAn: 1 accepted / census active
         rois["eval_accepted"] = store.accepted[rr].astype(int)
         peaks["eval_accepted"] = store.accepted[peaks["roi"]].astype(int)

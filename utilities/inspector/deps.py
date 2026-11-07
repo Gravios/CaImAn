@@ -1,5 +1,6 @@
-"""Lazy loaders for caiman.utils.event_detection / roi_filter, with a
-fallback to this checkout's files when the caiman package can't import."""
+"""Lazy loaders for caiman.utils.event_detection / roi_filter /
+event_kinetics, with a fallback to this checkout's files when the caiman
+package can't import."""
 
 import os
 import sys
@@ -52,4 +53,22 @@ def _rf():
     return mod
 
 
-__all__ = ['_ed', '_rf']
+def _ek():
+    """``caiman.utils.event_kinetics``, imported lazily (same fallback)."""
+    mod = sys.modules.get("_inspector_event_kinetics")
+    if mod is not None:
+        return mod
+    try:
+        from caiman.utils import event_kinetics as mod
+    except Exception:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, os.pardir, "caiman", "utils", "event_kinetics.py")
+        spec = importlib.util.spec_from_file_location("_inspector_event_kinetics", p)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    sys.modules["_inspector_event_kinetics"] = mod
+    return mod
+
+
+__all__ = ['_ed', '_rf', '_ek']

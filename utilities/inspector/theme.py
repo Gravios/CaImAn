@@ -77,6 +77,7 @@ PLOT_THEMES = {
         legend_text="#ffffff", legend_bg="#111111cc", legend_pen="#333333",
         dff="#666666", binary="#dddddd", binary_fill=(255, 255, 255, 70),
         filtered="#44dd66", threshold="#ccaa00", peak="#ff4444",
+        peak_bad="#8a5a5a", fit="#4fc3f7",
         cursor="#ffd23f", cursor_hover="#ffe680", error="#ff4444",
         palette=PALETTE_DARK_BG),
     "light": dict(
@@ -84,6 +85,7 @@ PLOT_THEMES = {
         legend_text="#000000", legend_bg="#ffffffcc", legend_pen="#bbbbbb",
         dff="#9a9a9a", binary="#333333", binary_fill=(0, 0, 0, 45),
         filtered="#1a8f3a", threshold="#a07800", peak="#d62728",
+        peak_bad="#b59a9a", fit="#0277bd",
         cursor="#d08a00", cursor_hover="#f0a000", error="#c62828",
         palette=PALETTE_LIGHT_BG),
 }

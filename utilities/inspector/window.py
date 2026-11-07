@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
 from .constants import OVERLAY_ALPHA
 from .theme import PT, UI, set_theme
 from .deps import _ed, _rf
-from .prefs import load_prefs, prefs_path, roi_filter_prefs, save_prefs
+from .prefs import kinetics_prefs, load_prefs, prefs_path, roi_filter_prefs, save_prefs
 from .store import ComponentStore
 from .loading import (
     _load_image_file,
@@ -55,6 +55,7 @@ class InspectorWindow(QMainWindow):
     def __init__(self, store: ComponentStore):
         super().__init__()
         self.store = store
+        store.set_kinetics_params(kinetics_prefs())
         self.setWindowTitle("CaImAn Component Inspector")
         self.resize(1760, 980)
         self._pair  = None
@@ -724,6 +725,11 @@ class InspectorWindow(QMainWindow):
             QMessageBox.critical(self, "Preferences", f"Could not save:\n{exc}")
             return False
         self.apply_theme()
+        if self.store.set_kinetics_params(kinetics_prefs()):   # new criteria
+            sel = self._selected_rows()
+            self.table.refresh()
+            self._reselect(sel)
+            self.event_view.refresh()
         self.statusBar().showMessage(f"Preferences saved to {path}", 6000)
         return True
 
@@ -920,6 +926,7 @@ class InspectorWindow(QMainWindow):
         self.statusBar().showMessage(f"Loaded background ‘{name}’")
 
     def _swap_store(self, new_store: ComponentStore):
+        new_store.set_kinetics_params(kinetics_prefs())
         self.store = new_store
         for w in (self.table, self.cell_view,
                   self.trace_view, self.event_view, self.corr_view,
@@ -1116,6 +1123,11 @@ class InspectorWindow(QMainWindow):
                         f"{n} {c}" for n, c in fails.items()))
             if ev is None:
                 lines.append(f"Included:  {s.n_approved}")
+        if ev is not None and s.dff is not None:
+            lines.append("Kinetics trace:  " + (
+                "C + residual (raw), on the ΔF/F scale" if s.kinetics_source == "raw"
+                else "ΔF/F ≈ C (no residual) — circular, every event passes"
+                if s.kinetics_circular else "ΔF/F (file has no residual YrA)"))
         if ev is not None:
             lines += [
                 f"Auto-approved:  {int(ev.auto_approved.sum())}",
@@ -1189,7 +1201,8 @@ class InspectorWindow(QMainWindow):
         """Begin a blinded review of ``files`` (already filtered/shuffled)."""
         self._blind = dict(rater=rater, files=list(files), i=0)
         self.act_hide_rejected.setEnabled(False)   # every row is rated
-        self.table.blinded = True                  # no QC / Eval columns
+        self.table.blinded = True                  # no QC / Eval / kinetics
+        self.event_view.blinded = True
         self.act_blind_next.setVisible(True)
         self.act_blind_end.setEnabled(True)
         self.act_blind.setEnabled(False)
@@ -1276,6 +1289,7 @@ class InspectorWindow(QMainWindow):
     def _end_blinded(self):
         self._blind = None
         self.table.blinded = False
+        self.event_view.blinded = False
         self.act_hide_rejected.setEnabled(True)
         self.store.hide_rejected = self.act_hide_rejected.isChecked()
         self.corr_view.redraw(); self.dist_view.redraw()
@@ -1309,7 +1323,10 @@ class InspectorWindow(QMainWindow):
             + (f" ({s.n_accepted} accepted / {s.n - s.n_accepted} rejected)"
                if s.eval_known and self._blind is None else "")
             + ("  —  no ROI-filter fields: Analysis ▸ Run ROI filter… adds them"
-               if s.qc is None and self._blind is None else ""))
+               if s.qc is None and self._blind is None else "")
+            + ("  —  ⚠ kinetics: no residual in this file and ΔF/F ≈ C, so the "
+               "check can't tell real transients from the model's"
+               if s.events is not None and s.kinetics_circular else ""))
         self._update_history_actions()
         if self._blind is not None:          # undo/redo/save are edit ops
             for a in (self.act_undo, self.act_undo_tb,

@@ -74,7 +74,7 @@ try:
 
     # ── preference dialog: Appearance tab
     d = insp.PreferencesDialog(insp.load_prefs(), {}, None, "appearance", w)
-    assert [d.tabs.tabText(i) for i in range(d.tabs.count())] == ["Appearance", "ROI filter"]
+    assert [d.tabs.tabText(i) for i in range(d.tabs.count())] == ["Appearance", "ROI filter", "Event kinetics"]
     f = d._fields["appearance"]
     assert f["theme"].value() == "dark" and f["plot_background"].value() == "auto" and f["font_size"].value() is None
     assert f["font_size"].hint.text() == f"default: {round(default_pt)}" and f["font_size"].spin.value() == round(default_pt)

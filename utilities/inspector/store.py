@@ -9,7 +9,7 @@ import numpy as np
 import scipy.sparse
 
 from .constants import HISTORY_MAXLEN, TRACE_DENOISED, TRACE_DFF
-from .deps import _ed, _rf
+from .deps import _ed, _ek, _rf
 
 
 class ComponentStore:
@@ -29,7 +29,8 @@ class ComponentStore:
         self._A = _to_sparse(A)
         self.dims = dims
         K = self._A.shape[1]
-        self._derived = {}      # corr / centroids / peaks / pixel lookup cache
+        self._derived = {}      # corr / centroids / peaks / pixel lookup / kinetics
+        self.kinetics_params = None   # event_kinetics params (None → defaults)
 
         # ── CaImAn evaluation (census: active / inactive) ────────────────────
         # accepted   : row was in estimates.idx_components (census: active);
@@ -232,6 +233,64 @@ class ComponentStore:
         """(K,) footprint maxima."""
         return self._cached("peaks",
                             lambda: self._A.max(axis=0).toarray().ravel())
+
+    # ── Event kinetics (diagnostic; approval unchanged) ─────────────────────
+
+    @property
+    def kinetics(self):
+        """Per-row :func:`event_kinetics.validate_row` dicts, or None without
+        events / ΔF/F.  Cached; merge / delete / undo keep it in step."""
+        if self.events is None or self.dff is None:
+            return None
+        return self._cached("kinetics", lambda: _ek().validate(
+            self.kinetics_trace, self.events, self.kinetics_params))
+
+    RAW_TRACE = "C + residual (raw)"
+
+    @property
+    def kinetics_source(self) -> str:
+        """``"raw"`` — C + YrA rescaled to ΔF/F (independent of the model's
+        kinetics) — when the residual is loaded, else ``"dff"``."""
+        return "raw" if self.RAW_TRACE in self.traces else "dff"
+
+    @property
+    def kinetics_trace(self):
+        """(K, T) trace the kinetic check runs on (see kinetics_source)."""
+        if self.dff is None:
+            return None
+        if self.kinetics_source == "raw":
+            return self._cached("kin_trace", lambda: _ek().raw_dff(
+                self.C, self.traces[self.RAW_TRACE] - self.C, self.dff))
+        return self.dff
+
+    @property
+    def kinetics_circular(self) -> bool:
+        """True when the check has to use a ΔF/F that is C rescaled (no
+        residual in the file): every event then passes by construction."""
+        if self.kinetics_source == "raw" or self.dff is None:
+            return False
+        r = self._cached("dff_C_r", lambda: _ek().dff_tracks_C(self.dff, self.C))
+        return bool(r > 0.99)
+
+    @property
+    def kinetics_summary(self):
+        """(K,) arrays of event_kinetics.SUMMARY_FIELDS, or None."""
+        rows = self.kinetics
+        return None if rows is None else _ek().summary_table(rows)
+
+    def set_kinetics_params(self, params) -> bool:
+        """Adopt new kinetics criteria; True if they changed (cache dropped)."""
+        params = None if params is None else dict(params)
+        if params == self.kinetics_params:
+            return False
+        self.kinetics_params = params
+        self._derived.pop("kinetics", None)
+        return True
+
+    def _kinetics_row(self, i):
+        ev = self.events
+        return _ek().validate_row(self.kinetics_trace[i], ev.peaks[i], ev.fr,
+                                  ev.decay_time, self.kinetics_params)
 
     def invalidate_corr(self):
         """Drop every cached derived quantity."""
@@ -461,6 +520,12 @@ class ComponentStore:
                 mat[k, :] = row; mat[:, k] = row
                 sub = mat
             new["corr"] = sub
+        if old.get("kinetics") is not None and self.events is not None \
+                and self.dff is not None:
+            ks = [old["kinetics"][j] for j in keep]
+            if merged:
+                ks.append(self._kinetics_row(self.n - 1))
+            new["kinetics"] = ks
         for key, fn in (("centroids", _centroids),
                         ("peaks", lambda A, d: A.max(axis=0).toarray().ravel())):
             if old.get(key) is not None:
@@ -578,6 +643,7 @@ class ComponentStore:
                 getattr(res, f)[r] = getattr(one, f)[0]
             res.peaks[r] = one.peaks[0]
         self._push_undo("detect events")
+        self._derived.pop("kinetics", None)
         self.events = res
         self.approved = self.events.auto_approved.copy()
         self.fr, self.decay_time = float(fr), float(decay_time)
@@ -616,6 +682,7 @@ class ComponentStore:
         rows) are re-detected when possible.  Returns False if the stored
         results don't fit this file (row count mismatch)."""
         oi = self.orig_idx
+        self._derived.pop("kinetics", None)
         if res.n == self.n and np.array_equal(oi, np.arange(self.n)):
             self.events, self.approved = res, np.asarray(approved, bool).copy()
         elif oi.size and oi.max() < res.n:
@@ -655,8 +722,9 @@ class ComponentStore:
         """Write the curated A/C back via cnm_obj.save(), which uses
         CaImAn's own fn_relocated + save_dict_to_hdf5 serialisation path.
 
-        Derived per-component fields (S, YrA, F_dff, etc.) are nulled out
-        because they are invalid after manual edits and must be recomputed.
+        Derived per-component fields (S, R, g, …) are nulled out because they
+        are invalid after manual edits and must be recomputed; F_dff and the
+        residual YrA are written from the edited traces.
         Every row is written; idx_components / idx_components_bad keep the
         accepted / rejected split (census: active / inactive, and the census
         dict is updated).  A provenance entry is appended.
@@ -685,6 +753,10 @@ class ComponentStore:
                 setattr(est, field, None)
         if dff is not None:
             est.F_dff = dff
+        # The residual stays (merged rows: the parts' β-weighted residual),
+        # so the raw trace C + YrA — and the kinetic check — survive Save.
+        if self.RAW_TRACE in self.traces:
+            est.YrA = self.traces[self.RAW_TRACE] - self.C
 
         # Quality metrics
         est.SNR_comp  = self.SNR_comp

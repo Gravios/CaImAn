@@ -86,7 +86,11 @@ Event detection & curation (ported from SLabAnalysisPackage)
     ✓ Include / exclude       — I — non-destructive approval; excluded
                                 footprints are red ("Hide excluded" hides them)
     Event panel               — filtered ΔF/F, threshold, peaks, binary trace
-                                of the last-selected component
+                                of the last-selected component; blue: fitted
+                                expected transient on the raw trace, dashed
+                                peak: fails the kinetic check
+    Ev ok / Shape r / τ fit   — raw-trace kinetics per component
+                                (Preferences > Event kinetics; diagnostic)
     Analysis > Export         — Ctrl+E — <session>_PeakStats / _ROIStats
     Analysis > Batch detect   — stroh_results into every file of a folder
     Analysis > Blinded review — Ctrl+R — shuffled, name-blind rating that

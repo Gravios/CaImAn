@@ -5,7 +5,7 @@ import json
 import os
 import sys
 
-from .deps import _rf
+from .deps import _ek, _rf
 
 
 # ── Preferences (JSON, per user) ─────────────────────────────────────────────
@@ -100,6 +100,40 @@ _RF_PREF_FIELDS = (
      "Off: activity is reported separately and silent cells can pass."),
 )
 
+_KIN_PREF_FIELDS = (
+    ("Expected transient", "decay_time", "Decay time τ (s)", "float", (0.01, 10.0, 0.05, 3),
+     "from events",
+     "Indicator decay time of the template.  Off: the decay time the events "
+     "were detected with (the file's params)."),
+    ("Criteria (an event is valid when all set ones hold)", "min_shape_r",
+     "Min shape r", "float", (-1.0, 1.0, 0.05, 2), "off",
+     "Pearson r of raw ΔF/F around the event with the expected fast-rise / "
+     "exponential-decay template."),
+    ("Criteria (an event is valid when all set ones hold)", "tau_min_frac",
+     "Min fitted τ (× expected)", "float", (0.0, 100.0, 0.1, 2), "off",
+     "Best-fitting decay on the raw trace, relative to the expected τ."),
+    ("Criteria (an event is valid when all set ones hold)", "tau_max_frac",
+     "Max fitted τ (× expected)", "float", (0.0, 100.0, 0.1, 2), "off",
+     "Slow drifts and neuropil decay far slower than the indicator."),
+    ("Criteria (an event is valid when all set ones hold)", "max_rise_s",
+     "Max rise 20→100 % (s)", "float", (0.0, 10.0, 0.01, 3), "off",
+     "Raw rise time from 20 % of the peak above the preceding trough."),
+    ("Criteria (an event is valid when all set ones hold)", "min_amp_snr",
+     "Min amplitude / noise", "float", (0.0, 1000.0, 0.5, 2), "off",
+     "Fitted amplitude over 1.4826·MAD of the raw ΔF/F outside events."),
+)
+
+
+def kinetics_prefs(prefs: dict = None) -> dict:
+    """event_kinetics DEFAULTS overlaid with the saved section."""
+    d = dict(_ek().DEFAULTS)
+    sec = (load_prefs() if prefs is None else prefs).get("kinetics", {})
+    for k, v in (sec if isinstance(sec, dict) else {}).items():
+        if k in d:
+            d[k] = v
+    return d
+
+
 _APPEARANCE_PREF_FIELDS = (
     ("Theme", "theme", "Theme", "choice",
      [("system", "System (follow the desktop)"), ("dark", "Dark"), ("light", "Light")], None,
@@ -123,6 +157,7 @@ PREF_SECTIONS = {
     "appearance": ("Appearance", _APPEARANCE_PREF_FIELDS,
                    lambda: dict(APPEARANCE_DEFAULTS)),
     "roi_filter": ("ROI filter", _RF_PREF_FIELDS, lambda: roi_filter_prefs({})),
+    "kinetics":   ("Event kinetics", _KIN_PREF_FIELDS, lambda: kinetics_prefs({})),
 }
 
 APPEARANCE_DEFAULTS = {"theme": "dark", "plot_background": "auto", "font_size": None,
@@ -140,4 +175,5 @@ def appearance_prefs(prefs: dict = None) -> dict:
     return d
 
 
-__all__ = ['prefs_path', 'load_prefs', 'save_prefs', 'roi_filter_prefs', '_RF_PREF_FIELDS', '_APPEARANCE_PREF_FIELDS', 'PREF_SECTIONS', 'APPEARANCE_DEFAULTS', '_ALPHA_KEYS', 'appearance_prefs']
+__all__ = ['prefs_path', 'load_prefs', 'save_prefs', 'roi_filter_prefs', '_RF_PREF_FIELDS',
+           '_KIN_PREF_FIELDS', 'kinetics_prefs', '_APPEARANCE_PREF_FIELDS', 'PREF_SECTIONS', 'APPEARANCE_DEFAULTS', '_ALPHA_KEYS', 'appearance_prefs']

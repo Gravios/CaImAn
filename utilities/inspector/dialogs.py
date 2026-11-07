@@ -431,6 +431,17 @@ when known, CaImAn's verdict); Batch detect and Blinded review work on a whole
 folder.  A blinded rater starts from the automatic approval and does not see
 the Eval or ROI-filter columns.</p>
 
+<h3>Event kinetics</h3>
+<p>CNMF's denoised trace C has a fast rise and exponential decay by
+construction, so every event is also checked on the raw trace (C + residual,
+rescaled to ΔF/F; ΔF/F when the file has no residual): fit of the expected
+transient (shape r), fitted decay τ, raw rise time and amplitude over the
+raw noise.  Columns Ev ok / Ev ok % / Shape r / τ fit, the event panel (blue
+fitted templates; dashed peaks fail) and the export (kin_*) show it;
+Preferences ▸ Event kinetics sets τ and the criteria.  Approval is not
+changed.  If the file has no residual and its ΔF/F is just C rescaled, the
+check would be circular and the status bar says so.</p>
+
 <h3>ROI filter</h3>
 <p>Results processed by the pipeline carry a <code>roi_filter</code> group
 (footprint shape, edge distance, CaImAn quality, activity); its fields

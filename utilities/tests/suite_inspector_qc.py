@@ -199,7 +199,7 @@ try:
     assert st.events is not None and st.approved.tolist() == manual.tolist()
     w = insp.InspectorWindow(st); w.show(); app.processEvents()
     H = headers(w.table)
-    assert H[-2:] == ["Ev/min", "Incl"] and "QC" in H
+    assert H[-6:] == ["Ev/min", "Ev ok", "Ev ok %", "Shape r", "τ fit (s)", "Incl"] and "QC" in H
     # export: ROIStats carries qc_ columns for the included ROIs
     paths = insp.export_event_tables(st, str(root / "B_PeakStats.csv"))
     roi_csv = [p for p in paths if "ROIStats" in p][0]

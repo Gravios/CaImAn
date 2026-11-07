@@ -198,7 +198,7 @@ try:
     accept_with(insp.RunFilterDialog, lambda d: None)
     w4._run_filter_dialog(); app.processEvents()
     assert st4.approved.tolist() == manual.tolist() and st4.qc is not None
-    H = headers(w4.table); assert H[-2:] == ["Ev/min", "Incl"] and "QC" in H
+    H = headers(w4.table); assert H[-6:] == ["Ev/min", "Ev ok", "Ev ok %", "Shape r", "τ fit (s)", "Incl"] and "QC" in H
     ok("with event approvals: Incl reset is off by default and approvals survive")
 
     # blinded review blocks the action

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .constants import CORR_A, CORR_B, CROSS_MIN_ARM, PALETTE_HEX
+from .deps import _ek
 from .theme import CMAP_RDBU_R, CMAP_VIRIDIS_R, PT, UI
 from .loading import _os_dirname
 from .movie import MovieSource, find_session_movie
@@ -670,7 +671,14 @@ class EventViewer(pg.PlotWidget):
     """Below the traces — event detection for the most recently selected
     component (SLab's dF/f, filtered + peaks and binary panels in one):
     raw ΔF/F (grey), filtered ΔF/F (green), threshold (dashed), binary
-    onset→peak plateaus (filled white) and detected peaks (red lines)."""
+    onset→peak plateaus (filled white) and detected peaks (red lines).
+
+    Event kinetics (diagnostic): each event's fitted expected-τ template is
+    drawn in blue over the raw ΔF/F; events failing a kinetic criterion get
+    a dashed, muted peak line; the title counts valid / testable events.
+    Hidden during a blinded review (``blinded``)."""
+
+    blinded = False
 
     def __init__(self, store: 'ComponentStore', parent=None):
         super().__init__(parent, background=PT["bg"])
@@ -729,15 +737,34 @@ class EventViewer(pg.PlotWidget):
             self.addItem(pg.InfiniteLine(
                 pos=thr, angle=0,
                 pen=pg.mkPen(PT["threshold"], width=1, style=Qt.PenStyle.DashLine)))
-        for pk in ev.peaks[i][:, 0]:
-            self.addItem(pg.InfiniteLine(pos=float(pk), angle=90,
-                                         pen=pg.mkPen(PT["peak"], width=1)))
+        kin = None if self.blinded else s.kinetics
+        krow = kin[i] if kin is not None else None
+        ek = _ek() if krow is not None else None
+        bad_pen = pg.mkPen(PT["peak_bad"], width=1, style=Qt.PenStyle.DashLine)
+        for k, pk in enumerate(ev.peaks[i][:, 0]):
+            ok = krow is None or bool(krow["valid"][k])
+            self.addItem(pg.InfiniteLine(
+                pos=float(pk), angle=90,
+                pen=pg.mkPen(PT["peak"], width=1) if ok else bad_pen))
+            if krow is not None:
+                dec = float((s.kinetics_params or {}).get("decay_time") or ev.decay_time)
+                tx, ty = ek.template_curve(krow, k, ev.fr, dec, ev.peaks[i])
+                if tx.size:
+                    self.plot(tx, ty, pen=pg.mkPen(PT["fit"], width=1.5))
         flag = "✓ included" if s.approved[i] else "✗ excluded"
         auto = "auto ✓" if ev.auto_approved[i] else "auto ✗"
+        kin_txt = ""
+        if krow is not None:
+            sm = ek.summarize_row(krow)
+            kin_txt = (f" — kinetics: {sm['n_valid']}/{sm['n_testable']} valid"
+                       + (f", r {sm['median_shape_r']:.2f}"
+                          if np.isfinite(sm['median_shape_r']) else "")
+                       + (f", τ {sm['median_tau_s']:.2f} s"
+                          if np.isfinite(sm['median_tau_s']) else ""))
         self.setTitle(
             f"<span style='color:{PT['title']};font-size:9pt'>{s.labels[i]} — "
             f"{ev.n_events(i)} events ({ev.frequencies[i]:.2f}/min), "
-            f"thr {thr:.3f} — {flag} ({auto})</span>")
+            f"thr {thr:.3f} — {flag} ({auto}){kin_txt}</span>")
         self.setXRange(0, len(t), padding=0)
         self.enableAutoRange(axis='y')
 

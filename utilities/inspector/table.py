@@ -312,6 +312,23 @@ class ComponentTable(QTableWidget):
     def _show_qc(self) -> bool:
         return self.store.qc is not None and not self.blinded
 
+    # (header, kinetics summary field, cell kind, tooltip)
+    _KIN_COLS = (
+        ("Ev ok", "n_valid", "int",
+         "Events whose raw ΔF/F has the expected kinetics (fast rise, "
+         "exponential decay at the indicator τ) — Preferences ▸ Event kinetics"),
+        ("Ev ok %", "frac_valid", "pct",
+         "Valid share of the testable events (decay not cut short by the next one)"),
+        ("Shape r", "median_shape_r", "f2",
+         "Median Pearson r of raw ΔF/F with the expected transient template"),
+        ("τ fit (s)", "median_tau_s", "f2",
+         "Median decay time fitted on the raw ΔF/F (compare with the indicator's)"),
+    )
+
+    def _show_kin(self) -> bool:
+        return (self.store.events is not None and self.store.dff is not None
+                and not self.blinded)
+
     def _col_names(self):
         cols = list(self._FIXED)
         for label, attr in self._OPTIONAL:
@@ -324,6 +341,8 @@ class ComponentTable(QTableWidget):
             cols += [h for h, fld, _k, _t in self._QC_COLS if fld in qc]
         if self.store.events is not None:
             cols.append("Ev/min")
+            if self._show_kin():
+                cols += [h for h, *_ in self._KIN_COLS]
         if self.store.has_approval:
             cols.append("Incl")
         return cols
@@ -346,6 +365,7 @@ class ComponentTable(QTableWidget):
         tips = {h: t for h, _f, _k, t in self._QC_COLS}
         tips["Incl"] = ("Include flag (I toggles). Starts from the ROI filter's "
                         "QC verdict, or from event auto-approval")
+        tips.update({h: t for h, _f, _k, t in self._KIN_COLS})
         tips["Eval"] = ("CaImAn evaluation: ✓ accepted (idx_components; census: "
                         "active), ✗ rejected (census: inactive). Rejected rows are "
                         "kept and saved; View ▸ Hide rejected / inactive ROIs")
@@ -354,6 +374,7 @@ class ComponentTable(QTableWidget):
                 self.horizontalHeaderItem(c).setToolTip(tips[h])
         self.setRowCount(s.n)
         dark = _ui_color("cell_bg")
+        kin = s.kinetics_summary if self._show_kin() else None
         for i in range(s.n):
             vals = [(s.labels[i], _label_key(s.labels[i])),
                     (f"{s.max_a(i):.3f}", _num_key(s.max_a(i))),
@@ -370,6 +391,9 @@ class ComponentTable(QTableWidget):
             if s.events is not None:
                 fq = s.events.frequencies[i]
                 vals.append((f"{fq:.2f}", _num_key(fq)))
+                if kin is not None:
+                    for _h, fld, kind, _t in self._KIN_COLS:
+                        vals.append(_qc_cell(kin[fld][i], kind))
             if s.has_approval:
                 vals.append(("✓" if s.approved[i] else "✗",
                              (0 if s.approved[i] else 1,)))
