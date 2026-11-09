@@ -12,9 +12,13 @@ metadata, so it is taken as UM_PER_PX_20X (0.8 µm/px) at 20x, scaled by
   20x, 25x   the validated template: gSig 4, gSiz 17, rf 20, stride 10
   16x        cell diameter ~8 µm  @ 1.0 µm/px  -> gSiz 9,  gSig 2
   40x        cell diameter ~18 µm @ 0.4 µm/px  -> gSiz 45, gSig 11
-  unknown    (00x / none) measured: brightness-weighted LoG blob detection on
-             the unfiltered PNR image over gSig 2–12 px (the 16x–40x range);
-             25th percentile of the bright blobs' radii
+  unknown    (00x / none / other) it was still one of these four objectives:
+             gSig is measured (brightness-weighted LoG blob detection on the
+             unfiltered PNR image, radii 2–17 px; 25th percentile of the
+             bright blobs' radii / √2, since a Gaussian cell of width gSig
+             gives a blob radius gSig·√2) and the nearest objective's size —
+             compared as cell diameters on a log scale (16x below ~12 px,
+             20x/25x up to ~28 px, 40x above) — is used
 
 The table is this lab's preparations (CELL_DIAMETER_UM); species does not
 change it.  ``gSig_hint`` (``--gSig``) overrides it.
@@ -63,7 +67,7 @@ UM_PER_PX_20X = 0.8                      # assumed; µm/px ∝ 1 / magnification
 TEMPLATE_MAGS = ("20x", "25x")           # validated template geometry
 TEMPLATE_GEOMETRY = {"gSig": 4, "gSiz": 17, "rf": 20, "stride": 10}
 CELL_DIAMETER_UM = {"16x": 8.0, "40x": 18.0}
-UNKNOWN_GSIG_RANGE = (2, 12)             # blob search when magnification unknown
+UNKNOWN_RADIUS_RANGE = (2, 17)           # blob radii searched when magnification unknown
 # template seeding / roi_filter sizes at gSig 4 (20x), scaled with gSig
 _SEED_20X = {"radius": 4, "min_distance": 5, "smooth_sigma": 1.0,
              "min_pixels": 8, "diameter": 15}
@@ -97,6 +101,18 @@ def cell_size(magnification: Optional[str]) -> Optional[tuple]:
         gSig = max(1, int(round((d_px - 1) / 4)))
         return gSig, 4 * gSig + 1
     return None
+
+
+OBJECTIVES = ("16x", "20x", "25x", "40x")     # what unknown sessions were taken with
+
+
+def nearest_objective(gSig: float) -> str:
+    """The objective whose cell size is closest to *gSig* (the Gaussian width
+    of a cell, as in CaImAn / the template), compared as cell diameters
+    (gSiz = 4·gSig + 1) on a log scale: 16x below ~12 px, 20x / 25x (same
+    size; '20x' returned) up to ~28 px, 40x above."""
+    d = 4 * float(gSig) + 1
+    return min(OBJECTIVES, key=lambda m: abs(math.log(d / cell_size(m)[1])))
 
 
 def patch_geometry(gSiz: int) -> tuple:
@@ -147,9 +163,9 @@ def estimate_params(
         Logged / shown in the QC figure; the cell size comes from the
         magnification (see the module docstring).
     magnification : str, optional
-        '16x', '20x', '25x', '40x' (any 'NNx'); None / '00x' = unknown ->
-        cell size measured from the movie.  Other known values are measured
-        too, with a warning.
+        '16x', '20x', '25x', '40x' (any 'NNx'); None / '00x' / any other
+        value = unknown -> cell size measured from the movie and the nearest
+        of the four objectives used (a warning for an unexpected value).
     gSig_hint : int, optional
         Cell half-width in pixels; overrides the magnification table and
         skips blob detection.
@@ -205,9 +221,10 @@ def estimate_params(
                      f"{um_per_px(magnification):.2f} µm/px")
     else:
         if magnification is not None:
-            logger.warning(f"  No cell size for {magnification}; measuring it from the movie")
+            logger.warning(f"  No cell size for {magnification}; measuring it and using "
+                           f"the nearest of {', '.join(OBJECTIVES)}")
         size_note = (f"magnification {magnification or 'unknown'}: measured, "
-                     f"gSig {UNKNOWN_GSIG_RANGE[0]}–{UNKNOWN_GSIG_RANGE[1]} px")
+                     f"nearest of {', '.join(OBJECTIVES)}")
     logger.info(f"Parameter estimation: species={species}  cell size: {size_note}")
 
     logger.info(f"  Loading {n_frames} frames from {fname_mc}")
@@ -229,11 +246,22 @@ def estimate_params(
         logger.info("  Pass 1: unfiltered PNR for gSig estimation")
         _cn_raw, pnr_raw = _corr_pnr(frames, gSig=None, center_psf=False,
                                       swap_dim=False)
-        lo, hi = UNKNOWN_GSIG_RANGE
-        gSig = _estimate_gsig_from_pnr(
+        lo, hi = UNKNOWN_RADIUS_RANGE
+        radius = _estimate_gsig_from_pnr(
             pnr_raw, prior={"gsig_min": lo, "gsig_max": hi,
-                            "fallback": TEMPLATE_GEOMETRY["gSig"]}, logger=logger)
+                            "fallback": round(TEMPLATE_GEOMETRY["gSig"] * math.sqrt(2))},
+            logger=logger)
         del _cn_raw, pnr_raw
+        # LoG blob radius = sigma·√2 of a Gaussian cell; gSig is that sigma
+        gSig_meas = radius / math.sqrt(2)
+        # it was taken with one of the four objectives: use the nearest one's size
+        magnification = nearest_objective(gSig_meas)
+        size = cell_size(magnification)
+        gSig = size[0]
+        label = "20x/25x" if magnification in TEMPLATE_MAGS else magnification
+        logger.info(f"  measured blob radius {radius} px = gSig {gSig_meas:.1f} -> nearest "
+                    f"objective {label} (gSig {size[0]}, gSiz {size[1]})")
+        magnification = f"{label} (nearest; measured gSig {gSig_meas:.1f})"
 
         logger.info(f"  Pass 2: filtered Cn/PNR with gSig={gSig}")
         cn, pnr = _corr_pnr(frames, gSig=[gSig, gSig], center_psf=True,

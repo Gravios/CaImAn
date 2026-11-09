@@ -61,8 +61,8 @@ Processing flags
   --species mouse|rat   Animal species. Default: mouse.
   --magnification NNx   Objective magnification (16x, 20x, 25x, 40x).  Default:
                         the YAML's, else the session name's (…-25x-…); 00x or
-                        none = unknown, the cell size is then measured from
-                        the movie.  Sets the cell size: 20x/25x the template
+                        none = unknown: the cell size is measured from the
+                        movie and the nearest objective's size is used.  Sets the cell size: 20x/25x the template
                         (gSig 4, gSiz 17, rf 20, stride 10), 16x gSig 2 (8 µm
                         cells), 40x gSig 11 (18 µm cells); --gSig overrides.
   --run                 Run the pipeline script after setup.
@@ -561,7 +561,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--magnification",   metavar="NNx", default=None,
                    help="Objective magnification (16x, 20x, 25x, 40x). Default: the "
                         "YAML's, else the session name's; unknown -> cell size "
-                        "measured from the movie.")
+                        "measured, nearest objective used.")
     p.add_argument("--channels",        metavar="LIST", default=None,
                    help="Comma-separated channel indices for MSR input "
                         "(default: all channels in MSR metadata). Ignored "
@@ -716,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Session    : {session}")
     print(f"  Dest       : {dest}")
     if args.estimate_params or args.run_mc:
-        print(f"  Species    : {species}    Magnif: {magnif or 'unknown (cell size measured)'}"
+        print(f"  Species    : {species}    Magnif: {magnif or 'unknown (measured, nearest objective)'}"
               f"  [{magnif_src}]")
     if overrides:
         print("  Overrides  :")

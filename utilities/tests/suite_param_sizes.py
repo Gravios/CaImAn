@@ -30,6 +30,23 @@ for mag, d_um in pe.CELL_DIAMETER_UM.items():
     assert abs(gSiz * pe.um_per_px(mag) - d_um) <= 2 * pe.um_per_px(mag), (mag, gSiz)
 ok("cell size: 20x/25x template (4/17), 16x 2/9 (8 µm), 40x 11/45 (18 µm); 00x / other → measured")
 
+# ── unknown magnification: the nearest of the four objectives ────────────────
+for g in (1, 2, 2.4):
+    assert pe.nearest_objective(g) == "16x", g
+for g in (3, 4, 5, 6, 6.6):
+    assert pe.nearest_objective(g) == "20x", g          # 20x / 25x share the size
+for g in (7, 9, 11, 14, 30):
+    assert pe.nearest_objective(g) == "40x", g
+for m in pe.OBJECTIVES:                                  # each objective snaps to itself
+    assert pe.cell_size(pe.nearest_objective(pe.cell_size(m)[0])) == pe.cell_size(m)
+lo, hi = pe.UNKNOWN_RADIUS_RANGE
+assert lo / 2 ** .5 <= pe.cell_size("16x")[0] and hi / 2 ** .5 >= pe.cell_size("40x")[0], \
+    "blob radii searched cover 16x–40x cells (radius = gSig·√2)"
+src_e = (REPO / "caiman/utils/params_estimator.py").read_text()
+assert "radius / math.sqrt(2)" in src_e and "nearest_objective(gSig_meas)" in src_e
+ok("unknown magnification: measured blob radius / √2 → nearest objective's size "
+   "(16x below gSig ~2.5, 20x/25x to ~6.7, 40x above); each objective maps to itself")
+
 # ── geometry: template rf/stride unless the ring needs more ──────────────────
 assert pe.patch_geometry(17) == (20, 10) and pe.patch_geometry(9) == (20, 10)
 assert pe.patch_geometry(45) == (46, 23)
