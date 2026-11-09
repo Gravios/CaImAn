@@ -126,3 +126,9 @@ paradigms:
 
 # with no paradigm word, a single leftover plain word is taken as experimentId
 single_word_experiment: true
+
+# trial numbers: written (tl<N> as in the name; --number-missing numbers the
+# ones without by time) or by_time (tl<N> still read but ignored; every
+# session numbered TL001, TL002 … in acquisition order per folder, date and
+# experimentId, so e.g. z-stacks get their own sequence)
+trial_numbers: written

@@ -439,11 +439,18 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
         if p.unparsed:
             it.warnings.append("kept as YAML notes: " + " ".join(p.unparsed))
 
-    if number_missing:                     # TL by acquisition time per folder / date
+    by_time = [it for it in items if it.parsed and it.rules is not None
+               and it.rules.trial_numbers == "by_time"]
+    for it in by_time:                     # rules: written tl<N> ignored
+        it.parsed.found.discard("trialId")
+    if number_missing or by_time:          # TL by acquisition time per folder / date
         groups = defaultdict(list)
         for it in items:
             if it.parsed and "trialId" in it.parsed.parts:
-                groups[(it.src.parent, it.parsed.parts["date"])].append(it)
+                bt = it.rules is not None and it.rules.trial_numbers == "by_time"
+                if bt or number_missing:
+                    groups[(it.src.parent, it.parsed.parts["date"],
+                            it.parsed.parts["experimentId"] if bt else None)].append(it)
         for grp in groups.values():
             used = {int(it.parsed.parts["trialId"][2:]) for it in grp
                     if "trialId" in it.parsed.found}

@@ -370,6 +370,33 @@ try:
         assert rc == 2 and msg in out and str(forced.resolve()) in out, (bad, out)
     ok("a bad rules file stops the run before anything is planned, naming the file, "
        "the rule and the problem")
+    # trial_numbers: by_time — written tl<N> ignored, numbered by time per
+    # folder / date / experimentId (z-stacks their own sequence)
+    t10 = root / "t10" / "strohA-zb" / "strohA-zb-000000-20140228"; t10.mkdir(parents=True)
+    for n in ("140228_tl1alz15hz_12-08-36", "140228_tl1alz15hz_11-36-50", "140228_alz15hz_11-42-04",
+              "140228_alz15hzZ_13-12-11", "140228_alz15hzZ_13-10-47"):
+        (t10 / n).mkdir()
+    (t10.parent / rr.FILENAME).write_text(
+        "defaults: {experimentId: spont}\nsingle_word_experiment: false\ntrial_numbers: by_time\n"
+        "extra_tokens:\n"
+        "  - {field: notes, pattern: '(alz)(.*)', value: 1, type: lower, rest: 2}\n"
+        "  - {field: sample_rate, pattern: '(\\d+)hz(.*)', value: 1, rest: 2}\n"
+        "  - {field: experimentId, pattern: 'zs?(\\d{6})?', value: zstack, rest: 1}\n")
+    got = {it.src.name: it.dst.name for it in rs.plan(root / "t10")}
+    assert got == {
+        "140228_tl1alz15hz_11-36-50": "strohA-zb-000000-20140228-TL001_113650-00x-spont",
+        "140228_alz15hz_11-42-04":    "strohA-zb-000000-20140228-TL002_114204-00x-spont",
+        "140228_tl1alz15hz_12-08-36": "strohA-zb-000000-20140228-TL003_120836-00x-spont",
+        "140228_alz15hzZ_13-10-47":   "strohA-zb-000000-20140228-TL001_131047-00x-zstack",
+        "140228_alz15hzZ_13-12-11":   "strohA-zb-000000-20140228-TL002_131211-00x-zstack",
+    }, got
+    it = next(i for i in rs.plan(root / "t10") if "11-36-50" in i.src.name)
+    assert it.parsed.sample_rate == 15.0 and it.parsed.unparsed == ["alz"]
+    (t10.parent / rr.FILENAME).write_text("trial_numbers: often\n")
+    rc, out = run("--root", str(root / "t10"))
+    assert rc == 2 and "trial_numbers must be written or by_time" in out, out
+    ok("trial_numbers: by_time numbers every session by time per date and experiment "
+       "(written tl1 ignored, z-stacks their own TL001…); glued 15hz / alz / Z read by rules")
     print("ALL OK")
 finally:
     shutil.rmtree(root)

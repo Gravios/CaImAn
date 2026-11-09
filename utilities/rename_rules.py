@@ -120,6 +120,7 @@ class Rules:
     paradigms: dict
     prefixes: list                     # paradigm words usable as a prefix, longest first
     single_word_experiment: bool
+    trial_numbers: str = "written"     # written | by_time
 
     @property
     def label(self) -> str:
@@ -249,6 +250,9 @@ def build(doc: dict, path: Optional[Path] = None) -> Rules:
         max_trial = int(doc["max_trial"])
     except (TypeError, ValueError):
         raise RulesError(f"{where}: max_trial must be a number") from None
+    trial_numbers = str(doc.get("trial_numbers", "written"))
+    if trial_numbers not in ("written", "by_time"):
+        raise RulesError(f"{where}: trial_numbers must be written or by_time")
     return Rules(
         path=path, legacy_name=legacy, separators=_regex(f"{where}: separators",
                                                          doc["separators"], 0),
@@ -257,7 +261,8 @@ def build(doc: dict, path: Optional[Path] = None) -> Rules:
         max_trial=max_trial, defaults={str(k): str(v) for k, v in doc["defaults"].items()},
         pre=pre, tokens=tokens, paradigms=paradigms,
         prefixes=sorted((k for k in paradigms if len(k) >= pmin), key=len, reverse=True),
-        single_word_experiment=bool(doc.get("single_word_experiment", True)))
+        single_word_experiment=bool(doc.get("single_word_experiment", True)),
+        trial_numbers=trial_numbers)
 
 
 _CACHE: dict = {}
