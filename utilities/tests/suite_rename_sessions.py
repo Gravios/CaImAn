@@ -51,7 +51,32 @@ try:
         "150218_tl1-spont-LP4_45-FA2_19-07-52":
             ("20150218", "190752", "TL001", "00x", "spont", 4.45, 2, None, []),
         "141114_P1-90_15-23-51":
-            ("20141114", "152351", "TL000", "00x", "default", None, None, None, ["P1", "90"]),
+            ("20141114", "152351", "TL000", "00x", "default", 1.0, None, None, ["90"]),
+        # 2014 strohA-ms patterns
+        "140225_tl8_fpstim_z100_p10_17-08-24":
+            ("20140225", "170824", "TL008", "00x", "fpstim", 10.0, None, 100, []),
+        "140324_TL1new_4000img_z100_p10_fa2_fpstim_14-42-09":
+            ("20140324", "144209", "TL001", "00x", "fpstim", 10.0, 2, 100, ["new"]),
+        "140522_tl5_z130_favg1_14-06-21":
+            ("20140522", "140621", "TL005", "00x", "default", None, 1, 130, []),
+        "140522_3Dscan4_favg2_75_195_14-50-00":
+            ("20140522", "145000", "TL004", "00x", "3dscan", None, 2, None, ["75", "195"]),
+        "140604_TL1_p25_z125fpstim_16-12-08":
+            ("20140604", "161208", "TL001", "00x", "fpstim", 25.0, None, 125, []),
+        "140623_tl5_spontan_z130_p15_16-24-05":
+            ("20140623", "162405", "TL005", "00x", "spont", 15.0, None, 130, []),
+        "140714_tl2_p25sb_z150_favg1_stim_16-33-26":
+            ("20140714", "163326", "TL002", "00x", "stim", 25.0, 1, 150, ["sb"]),
+        "140808_tl1_stim_cloud25_z130_favg1_12-26-42":
+            ("20140808", "122642", "TL001", "00x", "stim", None, 1, 130, ["cloud25"]),
+        "140714_zstack1_17-25-32":
+            ("20140714", "172532", "TL001", "00x", "zstack", None, None, None, []),
+        "140902_tl1fiber_test_p25_sb_z150_14-14-37":
+            ("20140902", "141437", "TL001", "00x", "test", 25.0, None, 150, ["fiber", "sb"]),
+        "140922_tl4_ispsipawstim10pulses3Hz_z122_13-20-16":
+            ("20140922", "132016", "TL004", "00x", "pawstim", None, None, 122, []),
+        "140924_tl8fpstimpinzettealle10sipsil_p20_z125_favg1_17-20-12":
+            ("20140924", "172012", "TL008", "00x", "fpstim", 20.0, 1, 125, []),
         "20160301_tl12-chrimson-40x_09-05-00":
             ("20160301", "090500", "TL012", "40x", "chrimson", None, None, None, []),
     }
@@ -61,13 +86,21 @@ try:
                p.parts["experimentId"], p.laser_power, p.fa, p.depth_um, p.unparsed)
         assert got == (date, time, tl, mag, exp, lp, fa, depth, left), (name, got)
         assert p.name == name
+    p = rs.parse_legacy("140922_tl4_ispsipawstim10pulses3Hz_z122_13-20-16")
+    assert (p.side, p.protocol) == ("ipsi", ["10pulses3Hz"])
+    p = rs.parse_legacy("140924_tl8fpstimpinzettealle10sipsil_p20_z125_favg1_17-20-12")
+    assert (p.side, p.protocol) == ("ipsi", ["pinzettealle10s"])
+    p = rs.parse_legacy("140527_tl11_favg2_z140_p7_gain61_17-17-15")
+    assert (p.gain, p.laser_power, p.fa) == (61, 7.0, 2)
+    assert rs.parse_legacy("140324_TL2_4000img_z100_p10_fa2_spont_14-49-45").n_frames == 4000
     assert rs.parse_legacy("strohA-ia-000000-20140807-TL001_131248-00x-default") is None
     assert rs.parse_legacy("140231_tl1_12-00-00") is None, "not a calendar date"
     assert rs.parse_legacy("140225_tl1_25-00-00") is None, "not a clock time"
     assert rs.parse_legacy("notes") is None and not rs.is_legacy("strohA-ia-000000")
     ok(f"legacy names parsed ({len(cases)} cases): YYMMDD/YYYYMMDD, HH-MM-SS, tl<N>→TL<NNN>, "
        "25x/25xspont/vs25x, LP5 / LP1_65 / p1_50, FA<N>, 104um / depth116 / z90, "
-       "paradigm words; unknown tokens reported")
+       "paradigm words; 2014: glued tl<N>…, p<N>, favg<N>, z<N><word>, 3Dscan<N> / zstack<N>, "
+       "gain<N>, <N>img, paw / forepaw protocol + side; anything else kept as notes")
 
     # ── 2. tree, dry run ─────────────────────────────────────────────────────
     base = root / "strohA" / "strohA-ia"
@@ -153,6 +186,19 @@ try:
     assert get(y, *S, "laserPower", "value") == 9.9 and get(y, "subject", "species") == "mouse"
     assert rs.write_yaml(new1, rs.parse_legacy(leg1.name)).endswith("up to date")
     ok("an existing YAML is never overwritten: only null fields are filled")
+
+    t5 = root / "t5" / "strohA-ms-000000-20140922"
+    d5 = t5 / "140922_tl4_ispsipawstim10pulses3Hz_z122_13-20-16"; d5.mkdir(parents=True)
+    d6 = t5 / "140922_tl2_p25sb_gain61_4000img_cloud_spont_12-00-00"; d6.mkdir()
+    run("--root", str(t5.parent), "--apply")
+    y5 = ydoc(t5 / "strohA-ms-000000-20140922-TL004_132016-00x-pawstim")
+    assert get(y5, "experiment", "protocol") == "10pulses3Hz" and get(y5, "experiment", "side") == "ipsi"
+    assert get(y5, *S, "depth", "value") == -122 and "notes" not in y5["experiment"]
+    y6 = ydoc(t5 / "strohA-ms-000000-20140922-TL002_120000-00x-spont")
+    assert get(y6, *S, "gain", "value") == 61 and get(y6, *S, "n_frames") == 4000
+    assert get(y6, *S, "laserPower", "value") == 25.0
+    assert get(y6, "experiment", "notes") == ["sb", "cloud"]
+    ok("YAML: protocol, side, gain, requested n_frames; unexplained tokens as experiment.notes")
 
     # ── 6. refusals, overrides, numbering, confidence ────────────────────────
     t2 = root / "t2" / "lab-xy-M17-20150301"

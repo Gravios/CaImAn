@@ -16,17 +16,34 @@ Schema (:mod:`utilities.rename_stem`)::
 
 Where each field comes from
 ---------------------------
+Tokens are separated by - _ . and read in order; a rule may hand back the
+rest of a glued token (tl1fpstim → tl1 + fpstim, z125fpstim → z125 + fpstim).
+
   date, time      leading YYMMDD (or YYYYMMDD) and trailing HH-MM-SS
-  trialId         tl<N> → TL<NNN>; none → TL000 (or --number-missing)
+  trialId         tl<N> (also glued: tl1fpstim, TL1new) → TL<NNN>; the index of
+                  3Dscan<N> / zstack<N> when there is no tl<N>; none → TL000
+                  (or --number-missing)
   magnification   <N>x, also glued to a word (25xspont, vs25x) → <N>x; none → 00x
-  experimentId    known words (spont, vstim, fpstim, …, see PARADIGMS); one
-                  other unknown word is taken as is; none → default
+  experimentId    a known word or a word starting with one (PARADIGMS: spont /
+                  spontan, vstim / visstim, fpstim, stimfp, pawstim, fiberstim,
+                  3dscan, zstack, test, …); one other plain word is taken as is;
+                  none → default
   sourceId-userId from the nearest ancestor named <src>-<user>-<subj>[-<date>]
   subjectId       (e.g. strohA-ia-000000-20140225), or --prefix / --subject
-  laser power     LP<N>[_<frac>], P<N>_<frac>   (LP5 → 5.0, p1_50 → 1.5) ┐
-  frame averaging FA<N>                                                  ├ YAML
-  depth           <N>um, depth<N>, z<N>   (stored negative, as stack-   │ only
-                  sessions does: below the surface)                     ┘
+
+YAML only (not in the name):
+  laserPower      LP<N>[_<frac>], P<N>[_<frac>], P<N>sb   (p7_50 → 7.5, p10 → 10)
+  fa              FA<N>, favg<N>
+  depth           <N>um, depth<N>, z<N>  (stored negative, as stack-sessions
+                  does: below the surface)
+  gain            gain<N>
+  n_frames        <N>img (requested; stack-sessions overwrites it with SizeT)
+  experiment.protocol   the rest of a paradigm word or a protocol-like word
+                        (pawstim10pulses3Hz → 10pulses3Hz, 1pulse50msfp,
+                        pinzettealle10s)
+  experiment.side       ipsi / contra (ipsi…, ispsi…, …ipsil)
+  experiment.notes      every token no rule explains (sb, cloud25, 75 195, …),
+                        verbatim — nothing is guessed or dropped
 
 The Trial YAML ``<new>/<new>.yaml`` is the acquisition template filled from
 the new name (as stack-sessions would) plus laser power, FA and depth, and
@@ -78,22 +95,32 @@ _LEGACY_RE = re.compile(
     r"(?:[_-](?P<body>.*?))?"
     r"[_-](?P<hh>\d{2})-(?P<mm>\d{2})-(?P<ss>\d{2})$")
 
-_B = r"(?<![A-Za-z0-9])"            # token start (separators are - _ .)
-_E = r"(?![A-Za-z0-9])"             # token end
-_TRIAL_RE = re.compile(_B + r"tl(\d+)" + _E, re.I)
-_LP_RE    = re.compile(_B + r"(?:lp(\d+)(?:_(\d+))?|p(\d+)_(\d+))%?" + _E, re.I)
-_FA_RE    = re.compile(_B + r"fa(\d+)" + _E, re.I)
-_DEPTH_RE = re.compile(_B + r"(?:(\d+)um|depth[-_]?(\d+)|z(\d+))" + _E, re.I)
-_MAG_RE   = re.compile(r"(?<![0-9])(\d+)x(?![0-9])", re.I)    # 25x, 25xspont, vs25x
+# Token rules, tried in order on each token (separators: - _ . space).  A
+# rule may hand back the rest of a glued token (tl1fpstim → tl1 + fpstim).
+_LP_FRAC_RE = re.compile(r"(?<![A-Za-z0-9])(lp|p)(\d+)_(\d+)(?![A-Za-z0-9])", re.I)
+_TRIAL_RE   = re.compile(r"tl(\d+)(.*)$", re.I)                  # tl5, tl1fpstim, TL1new
+_LP_RE      = re.compile(r"(?:lp|p)(\d+)(sb)?$", re.I)           # LP5, p10, p25sb
+_FA_RE      = re.compile(r"(?:fa|favg)(\d+)$", re.I)             # FA1, favg2
+_GAIN_RE    = re.compile(r"gain(\d+)$", re.I)                    # gain61
+_IMG_RE     = re.compile(r"(\d+)img$", re.I)                     # 4000img
+_DEPTH_RE   = re.compile(r"(?:(\d+)um|depth(\d+)|z(\d+))(.*)$", re.I)   # 104um, depth116, z125fpstim
+_MAG_RE     = re.compile(r"(?<![0-9])(\d+)x(?![0-9])", re.I)    # 25x, 25xspont, vs25x
+_SIDE_RE    = re.compile(r"(ispsi|ipsil|ipsi|contra)", re.I)
+_PROTOCOL_RE = re.compile(r"puls|pules|\d+(?:ms|hz)|alle\d", re.I)  # 10pulses3Hz, 50ms, alle10s
 
-# experimentId vocabulary (lower case → name token)
+# experimentId vocabulary (lower case → name token).  Words that only *start*
+# with one of these (pawstim10pulses3Hz, fpstimsinglepuleses50msl) give the
+# paradigm, and the rest becomes the YAML protocol.
 PARADIGMS = {
-    "spont": "spont", "spontact": "spont", "spontaneous": "spont",
-    "vs": "vstim", "vstim": "vstim", "stim": "stim", "fpstim": "fpstim",
-    "astim": "astim", "chrimson": "chrimson", "opo": "opo", "tisa": "tisa",
-    "3d": "3dscan", "3dscan": "3dscan", "loco": "loco", "dark": "dark",
+    "spont": "spont", "spontact": "spont", "spontaneous": "spont", "spontan": "spont",
+    "vs": "vstim", "vstim": "vstim", "visstim": "vstim", "stim": "stim",
+    "fpstim": "fpstim", "stimfp": "stimfp", "pawstim": "pawstim",
+    "fiberstim": "fiberstim", "astim": "astim", "chrimson": "chrimson",
+    "opo": "opo", "tisa": "tisa", "3d": "3dscan", "3dscan": "3dscan",
+    "zstack": "zstack", "loco": "loco", "dark": "dark", "test": "test",
     "default": "default",
 }
+_PREFIXES = sorted((k for k in PARADIGMS if len(k) >= 4), key=len, reverse=True)
 DEFAULTS = {"subjectId": "000000", "trialId": "TL000",
             "magnification": "00x", "experimentId": "default"}
 # fields that count towards the confidence score
@@ -113,8 +140,12 @@ class Parsed:
     laser_power: Optional[float] = None
     fa: Optional[int] = None
     depth_um: Optional[int] = None                   # positive µm below surface
+    gain: Optional[int] = None
+    n_frames: Optional[int] = None                   # requested (<N>img)
+    side: Optional[str] = None                       # ipsi / contra
+    protocol: list = field(default_factory=list)     # stimulation protocol words
     found: set = field(default_factory=set)          # SCORED fields actually read
-    unparsed: list = field(default_factory=list)     # tokens left over
+    unparsed: list = field(default_factory=list)     # kept verbatim as YAML notes
 
     @property
     def confidence(self) -> int:
@@ -130,6 +161,18 @@ def _year(d: str) -> str:
 
 def is_legacy(name: str) -> bool:
     return bool(_LEGACY_RE.match(name)) and parse_stem(name) is None
+
+
+def _paradigm(word: str):
+    """(experimentId, protocol rest) for a word that is or starts with a
+    known paradigm, else None."""
+    w = word.lower()
+    if w in PARADIGMS:
+        return PARADIGMS[w], ""
+    for k in _PREFIXES:
+        if w.startswith(k):
+            return PARADIGMS[k], word[len(k):]
+    return None
 
 
 def parse_legacy(name: str) -> Optional[Parsed]:
@@ -148,46 +191,71 @@ def parse_legacy(name: str) -> Optional[Parsed]:
     p.found |= {"date", "time"}
     body = m.group("body") or ""
 
-    def take(rx, fn):
-        nonlocal body
-        mm = rx.search(body)
-        if not mm:
-            return None
+    # laser power with a fraction spans a separator: LP1_65, p7_50
+    mm = _LP_FRAC_RE.search(body)
+    if mm:
+        p.laser_power = float(f"{int(mm.group(2))}.{mm.group(3)}")
         body = body[:mm.start()] + " " + body[mm.end():]
-        return fn(mm)
-
-    tl = take(_TRIAL_RE, lambda mm: int(mm.group(1)))
-    if tl is not None:
-        p.parts["trialId"] = f"TL{tl:03d}"
+    todo = [w for w in re.split(r"[-_.\s]+", body) if w]
+    scan_index = None
+    paradigms: list = []
+    while todo:
+        w = todo.pop(0)
+        if (mm := re.fullmatch(r"(3d)(scan)(\d*)", w, re.I)) or \
+                (mm := re.fullmatch(r"(z)(stack)(\d*)", w, re.I)):
+            paradigms.append("3dscan" if mm.group(1).lower() == "3d" else "zstack")
+            if mm.group(3):
+                scan_index = int(mm.group(3))
+        elif (mm := _TRIAL_RE.fullmatch(w)) and "trialId" not in p.found:
+            p.parts["trialId"] = f"TL{int(mm.group(1)):03d}"
+            p.found.add("trialId")
+            if mm.group(2):
+                todo.insert(0, mm.group(2))
+        elif (mm := _LP_RE.fullmatch(w)) and p.laser_power is None:
+            p.laser_power = float(mm.group(1))
+            if mm.group(2):
+                todo.insert(0, mm.group(2))
+        elif (mm := _FA_RE.fullmatch(w)) and p.fa is None:
+            p.fa = int(mm.group(1))
+        elif (mm := _GAIN_RE.fullmatch(w)) and p.gain is None:
+            p.gain = int(mm.group(1))
+        elif (mm := _IMG_RE.fullmatch(w)) and p.n_frames is None:
+            p.n_frames = int(mm.group(1))
+        elif (mm := _DEPTH_RE.fullmatch(w)) and p.depth_um is None:
+            p.depth_um = int(next(g for g in mm.groups()[:3] if g))
+            if mm.group(4):
+                todo.insert(0, mm.group(4))
+        elif (mm := _MAG_RE.search(w)) and "magnification" not in p.found:
+            p.parts["magnification"] = f"{int(mm.group(1))}x"
+            p.found.add("magnification")
+            rest = w[:mm.start()] + w[mm.end():]
+            if rest:
+                todo.insert(0, rest)
+        elif (mm := _SIDE_RE.search(w)) and p.side is None:
+            p.side = "contra" if mm.group(1).lower() == "contra" else "ipsi"
+            rest = [r for r in (w[:mm.start()], w[mm.end():]) if r]
+            todo[:0] = rest
+        elif (par := _paradigm(w)) is not None:
+            paradigms.append(par[0])
+            if par[1]:
+                todo.insert(0, par[1])
+        elif _PROTOCOL_RE.search(w) and paradigms and not w.isdigit():
+            p.protocol.append(w)
+        else:
+            p.unparsed.append(w)
+    if paradigms:
+        p.parts["experimentId"] = paradigms[0]
+        p.found.add("experimentId")
+        p.unparsed += [x for x in paradigms[1:] if x != paradigms[0]]
+    elif len(p.unparsed) == 1 and re.fullmatch(r"[A-Za-z]+", p.unparsed[0]):
+        p.parts["experimentId"] = p.unparsed.pop().lower()     # e.g. a new paradigm
+        p.found.add("experimentId")
+    if scan_index is not None and "trialId" not in p.found:
+        p.parts["trialId"] = f"TL{scan_index:03d}"
         p.found.add("trialId")
-
-    def lp(mm):
-        whole, frac = (mm.group(1), mm.group(2)) if mm.group(1) else (mm.group(3), mm.group(4))
-        return float(f"{int(whole)}.{frac}") if frac else float(whole)
-    p.laser_power = take(_LP_RE, lp)
-    p.fa = take(_FA_RE, lambda mm: int(mm.group(1)))
-    p.depth_um = take(_DEPTH_RE, lambda mm: int(next(g for g in mm.groups() if g)))
     for key, v in (("laser_power", p.laser_power), ("fa", p.fa), ("depth_um", p.depth_um)):
         if v is not None:
             p.found.add(key)
-
-    mag = take(_MAG_RE, lambda mm: int(mm.group(1)))
-    if mag is not None:
-        p.parts["magnification"] = f"{mag}x"
-        p.found.add("magnification")
-
-    words = [w for w in re.split(r"[-_.\s]+", body) if w]
-    known = [PARADIGMS[w.lower()] for w in words if w.lower() in PARADIGMS]
-    other = [w for w in words if w.lower() not in PARADIGMS]
-    if known:
-        p.parts["experimentId"] = known[0]
-        p.found.add("experimentId")
-        p.unparsed = other + [w for w in words if w.lower() in PARADIGMS][1:]
-    elif len(other) == 1 and re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", other[0]):
-        p.parts["experimentId"] = other[0].lower()      # e.g. a new paradigm
-        p.found.add("experimentId")
-    else:
-        p.unparsed = other
     for k, v in DEFAULTS.items():
         p.parts.setdefault(k, v)
     return p
@@ -265,7 +333,7 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
         if p.confidence < min_confidence:
             it.problems.append(f"confidence {p.confidence} < {min_confidence}")
         if p.unparsed:
-            it.warnings.append("not understood: " + " ".join(p.unparsed))
+            it.warnings.append("kept as YAML notes: " + " ".join(p.unparsed))
 
     if number_missing:                     # TL by acquisition time per folder / date
         groups = defaultdict(list)
@@ -328,7 +396,18 @@ def trial_doc(new_name: str, p: Optional[Parsed]) -> dict:
             sm.set_path(doc, s + ("fa", "value"), p.fa)
         if p.depth_um is not None:
             sm.set_path(doc, s + ("depth", "value"), -abs(p.depth_um))
-        doc.setdefault("experiment", {})["legacy_name"] = p.name
+        if p.gain is not None:
+            sm.set_path(doc, s + ("gain", "value"), p.gain)
+        if p.n_frames is not None:          # requested; stack-sessions writes SizeT
+            sm.set_path(doc, s + ("n_frames",), p.n_frames)
+        exp = doc.setdefault("experiment", {})
+        if p.protocol:
+            exp["protocol"] = " ".join(p.protocol)
+        if p.side:
+            exp["side"] = p.side
+        if p.unparsed:
+            exp["notes"] = list(p.unparsed)
+        exp["legacy_name"] = p.name
     return doc
 
 
@@ -493,11 +572,16 @@ def main(argv=None) -> int:
         if it.dst is not None:
             out(f"    -> {it.dst.name}")
         p = it.parsed
-        if p is not None and (p.laser_power is not None or p.fa is not None or p.depth_um is not None):
+        if p is not None:
             extra = [f"laserPower {p.laser_power}" if p.laser_power is not None else "",
                      f"fa {p.fa}" if p.fa is not None else "",
-                     f"depth -{p.depth_um} um" if p.depth_um is not None else ""]
-            out("    yaml: " + ", ".join(e for e in extra if e))
+                     f"depth -{p.depth_um} um" if p.depth_um is not None else "",
+                     f"gain {p.gain}" if p.gain is not None else "",
+                     f"n_frames {p.n_frames}" if p.n_frames is not None else "",
+                     f"side {p.side}" if p.side else "",
+                     f"protocol '{' '.join(p.protocol)}'" if p.protocol else ""]
+            if any(extra):
+                out("    yaml: " + ", ".join(e for e in extra if e))
         for w in it.warnings:
             out(f"    note: {w}")
         for pr in it.problems:
