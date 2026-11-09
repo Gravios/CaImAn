@@ -103,6 +103,7 @@ setup(
         'stack-bigtiff       = caiman.utils.stack_to_bigtiff:main',
         'rename-stem         = utilities.rename_stem:main',
         'rename-sessions     = utilities.rename_sessions:main',
+        'batch-preview       = utilities.batch_preview:main',
         'tiff-viewer         = utilities.tiff_viewer:main',
         'stack-viewer        = utilities.stack_viewer:main',
     ] },
