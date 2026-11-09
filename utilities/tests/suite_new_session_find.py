@@ -55,6 +55,12 @@ try:
     assert infer(root) == (stem, ch)
     print("ok  one stack found from channel / session / date / subject dir")
 
+    # a source OME stack kept beside the converted one is not an input
+    src = date / S / f"{S}_C00.ome.tif"; src.write_bytes(b"II*\0")
+    assert infer(date / S) == (stem, ch), infer(date / S)
+    src.unlink()
+    print("ok  a kept source stack <name>_C00.ome.tif is never taken for the session input")
+
     # full CLI dry run from the date dir with a custom template
     tpl = root / "template.json"
     tpl.write_text((REPO / "utilities/pipelines/template_pipeline.json").read_text())

@@ -966,5 +966,77 @@ def stack_frames(
     _write_single_channel(_args, frames, Path(output_path))
 
 
+def stack_pages(path: Path) -> tuple:
+    """(pages, frame shape, dtype) of a multi-page TIFF, read as plain pages
+    (is_ome=False: its OME-XML is not interpreted).  Every page must have the
+    same 2-D shape (singleton axes squeezed) and dtype."""
+    with tifffile.TiffFile(str(path), is_ome=False) as tf:
+        pages = tf.pages
+        n = len(pages)
+        p0 = pages[0]
+        shape = tuple(s for s in p0.shape if s != 1)
+        if len(shape) != 2:
+            raise ValueError(f"{path.name}: page shape {p0.shape} is not a 2-D frame")
+        for i in range(1, n):
+            p = pages[i]
+            if tuple(s for s in p.shape if s != 1) != shape or p.dtype != p0.dtype:
+                raise ValueError(f"{path.name}: page {i} is {p.shape} {p.dtype}, "
+                                 f"page 0 {p0.shape} {p0.dtype}")
+        return n, shape, p0.dtype
+
+
+def convert_stack(src: Path, output_path: Path, n_frames=None,
+                  flush_every: int = 200, n_check: int = 64) -> int:
+    """Copy the pages of an existing multi-page (OME-)TIFF stack into a plain
+    BigTIFF at *output_path* — the layout :func:`stack_frames` writes
+    (preallocated, uncompressed, no OME-XML).
+
+    Pages are read with ``is_ome=False``: the source's OME-XML is ignored,
+    because XML that describes other files, more channels or Z planes makes
+    an OME reader return a wrong shape or the wrong frames.  The first
+    *n_frames* pages are copied (default: all).  The output goes to
+    ``*.partial.tif`` and is renamed onto *output_path* only after
+    *n_check* frames spread over the stack (always the first and last) read
+    back identical to the source.  Returns the number of frames.
+    """
+    src, output_path = Path(src), Path(output_path)
+    n_pages, shape, dtype = stack_pages(src)
+    n = n_pages if n_frames is None else int(n_frames)
+    if not 0 < n <= n_pages:
+        raise ValueError(f"{src.name}: {n} frames requested, {n_pages} pages")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = partial_path(output_path)
+    tmp.unlink(missing_ok=True)           # stale leftover from a killed run
+    logger.info(f"Converting    : {src.name} ({n} x {shape} {dtype}) -> {output_path.name}")
+    try:
+        with tifffile.TiffFile(str(src), is_ome=False) as tf:
+            mm = tifffile.memmap(str(tmp), shape=(n,) + shape, dtype=dtype, bigtiff=True)
+            buf = mm._mmap if hasattr(mm, "_mmap") else None
+            try:
+                for i in range(n):
+                    mm[i] = tf.pages[i].asarray().reshape(shape)
+                    if buf is not None and (i + 1) % flush_every == 0:
+                        buf.flush()
+            finally:
+                if buf is not None:
+                    buf.flush()
+                del mm
+            idx = sorted({0, n - 1, *np.linspace(0, n - 1, min(n, n_check)).astype(int)})
+            with tifffile.TiffFile(str(tmp)) as out:   # read back as CaImAn reads it
+                s = out.series[0]
+                if s.shape != (n,) + shape:
+                    raise ValueError(f"written stack reads as {s.shape}, expected {(n,) + shape}")
+                got = s.asarray(out="memmap")
+                for i in idx:
+                    if not np.array_equal(got[i], tf.pages[int(i)].asarray().reshape(shape)):
+                        raise ValueError(f"frame {i} differs after writing")
+                del got
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(output_path)
+    return n
+
+
 if __name__ == "__main__":
     main()

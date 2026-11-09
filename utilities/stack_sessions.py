@@ -3,7 +3,8 @@
 utilities/stack_sessions.py
 ============================
 Stack OME-TIFF frame series into per-channel BigTIFF stacks for every
-session directory under a parent directory.
+session directory under a parent directory, and convert existing
+per-channel OME stacks (``<name>_C<NN>.ome.tif``) into the same layout.
 
 For each session this script:
   1. Finds the master OME-TIFF and reads frame count / sample rate from
@@ -19,6 +20,28 @@ For each session this script:
   6. Stacks each channel into a single preallocated BigTIFF.  The stack is
      written as ``*.partial.tif`` and renamed only once complete, so an
      interrupted run is redone, not skipped, on the next invocation.
+
+Existing stacks ``<name>_C<NN>.ome.tif`` (one file per channel, no
+``_t<index>``) are converted instead of stacked: their pages are copied into
+the same plain BigTIFF (no OME-XML), read with is_ome=False.  Their OME-XML
+is not trusted for the pixels — XML that maps planes elsewhere, labels them
+Z or lists more channels makes an OME reader (CaImAn's) return a wrong
+shape or wrong frames, sometimes silently.  It is still used for the YAML
+(sample rate, frame / pixel size, SizeT) after checking it against the file:
+
+  * pages == SizeT           converted
+  * pages <  SizeT           refused; --allow-incomplete converts the pages
+  * pages >  SizeT, SizeZ>1  refused (the header does not describe the file)
+  * frames and a stack for one channel, or two stacks: refused
+  * no OME SizeT             all pages taken, with a warning
+
+A refused stack gets no YAML.  The conversion is renamed into place only
+after sampled frames (incl. first and last) read back identical.
+--delete-sources removes a converted source stack.
+
+The master's OME-XML is kept verbatim as ``<session>.ome.xml`` (written once,
+never parsed by the pipeline): the Trial YAML holds what is used, the XML
+the full instrument record.
 
 A failure in one channel or session is reported and the batch continues;
 the exit status is 1 if anything failed.  --dry-run writes nothing.
@@ -55,6 +78,7 @@ Output layout (per session)
 ---------------------------
   <session>/
     <session>.yaml                                          Trial YAML
+    <session>.ome.xml                                       OME-XML archive
     <session>-C00-fc<NNNNNN>/<session>-C00-fc<NNNNNN>.tif   channel 00
     <session>-C01-fc<NNNNNN>/<session>-C01-fc<NNNNNN>.tif   channel 01 (if present)
 
@@ -74,7 +98,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 try:
     from caiman.utils.ome_meta import extract_pixels, format_rate_str, update_yaml
-    from caiman.utils.stack_to_bigtiff import frame_sort_key, stack_frames
+    from caiman.utils.stack_to_bigtiff import (
+        convert_stack, frame_sort_key, stack_frames, stack_pages)
 except ImportError as _exc:
     sys.exit(
         f"ImportError: {_exc}\n"
@@ -127,6 +152,8 @@ PAD_WIDTH = 10
 # Time-index regex for padding
 _TINDEX_RE = re.compile(r'(_t)(\d+)((?:\.ome)?\.tif)$', re.IGNORECASE)
 _CHANNEL_RE = re.compile(r'_C(\d+)_t', re.IGNORECASE)
+# an existing per-channel stack: <name>_C00.ome.tif (no _t<index>)
+_STACK_RE = re.compile(r'_C(\d+)\.ome\.tiff?$', re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +382,70 @@ def _discover_channels(session_dir: Path) -> list[str]:
     return sorted(ids)
 
 
+def _discover_stacks(session_dir: Path) -> dict[str, list[Path]]:
+    """Existing per-channel stacks ``*_C<NN>.ome.tif`` (no ``_t<index>``),
+    by channel."""
+    out: dict[str, list[Path]] = {}
+    for f in sorted(session_dir.glob("*_C*.ome.tif*")):
+        m = _STACK_RE.search(f.name)
+        if m and f.is_file() and not _TINDEX_RE.search(f.name) and ".partial." not in f.name:
+            out.setdefault(m.group(1).zfill(2), []).append(f)
+    return out
+
+
+def _stack_header(path: Path, master: Path | None, px: dict) -> dict:
+    """OME Pixels fields of a stack (the session's px if it is the master);
+    {} without readable OME-XML."""
+    if master is not None and path == master:
+        return px
+    try:
+        return extract_pixels(path)
+    except SystemExit:
+        return {}
+
+
+def _check_stack(n_pages: int, hdr: dict, allow_incomplete: bool) -> tuple[int | None, str]:
+    """Frames to take from a stack of *n_pages* pages, given its OME header:
+    ``(n, note)`` or ``(None, reason)``.  Its pages must be the time series
+    of one channel: SizeZ > 1 is refused, more pages than SizeT is refused
+    (the header does not describe this file), fewer only with
+    *allow_incomplete*."""
+    size_t, size_z = hdr.get("size_t"), hdr.get("size_z")
+    if size_z and size_z > 1:
+        return None, f"OME SizeZ={size_z}: a volume, not a time series"
+    if not size_t:
+        return n_pages, f"no OME SizeT; taking all {n_pages} pages as frames"
+    if n_pages > size_t:
+        return None, f"{n_pages} pages but OME SizeT is {size_t}"
+    if n_pages < size_t:
+        if not allow_incomplete:
+            return None, (f"{n_pages} of {size_t} frames; pass --allow-incomplete "
+                          "to convert the recorded frames")
+        return n_pages, f"{n_pages} of {size_t} frames (--allow-incomplete)"
+    return n_pages, ""
+
+
+def _archive_ome_xml(session_dir: Path, session_name: str, master: Path,
+                     dry_run: bool) -> str:
+    """Keep the master's OME-XML verbatim as ``<session>.ome.xml`` (never
+    parsed by the pipeline; the Trial YAML holds what it uses).  Written once."""
+    dest = session_dir / f"{session_name}.ome.xml"
+    if dest.exists():
+        return ""
+    if dry_run:
+        return f"would archive OME-XML of {master.name} -> {dest.name}"
+    import tifffile
+    try:
+        with tifffile.TiffFile(str(master)) as tf:
+            xml = tf.ome_metadata
+    except Exception as exc:                       # noqa: BLE001
+        return f"WARNING could not read OME-XML of {master.name}: {exc}"
+    if not xml:
+        return ""
+    dest.write_text(xml)
+    return f"archived OME-XML -> {dest.name}"
+
+
 def _channel_frames(session_dir: Path, channel: str) -> list[Path]:
     """Raw frames of one channel in numeric time order (width-independent)."""
     return sorted(session_dir.glob(f"*_C{channel}_t*.tif"), key=frame_sort_key)
@@ -526,12 +617,53 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         channel_ids = _discover_channels(session_dir)
-        if not channel_ids:
-            print("    No channel frame files found, skipping")
+        stacks = _discover_stacks(session_dir)
+        for ch in sorted(set(channel_ids) & set(stacks)):
+            print(f"    C{ch}: ERROR - both frame files and a stack "
+                  f"({stacks[ch][0].name}); remove one, channel skipped")
+            failed.append(f"{session_name} C{ch}")
+            channel_ids.remove(ch)
+            del stacks[ch]
+        for ch in sorted(ch for ch, fs in stacks.items() if len(fs) > 1):
+            print(f"    C{ch}: ERROR - {len(stacks[ch])} stacks "
+                  f"({', '.join(f.name for f in stacks[ch])}); channel skipped")
+            failed.append(f"{session_name} C{ch}")
+            del stacks[ch]
+        # stacks are checked before anything is written: a refused stack
+        # gets no YAML / archived XML from the header it was refused over
+        planned: dict[str, tuple] = {}
+        for ch, (src,) in sorted(stacks.items()):
+            existing = _stacked_output(session_dir, session_name, ch)
+            if existing is not None:
+                print(f"    C{ch}: already exists ({existing.parent.name}/), skipping"
+                      + (f"; {src.name} kept" if args.delete_sources else ""))
+                continue
+            try:
+                n_pages, shape, dtype = stack_pages(src)
+            except Exception as exc:                     # noqa: BLE001
+                print(f"    C{ch}: ERROR - {src.name}: {exc}; not converted")
+                failed.append(f"{session_name} C{ch}")
+                continue
+            n_st, why = _check_stack(n_pages, _stack_header(src, master, px),
+                                     args.allow_incomplete)
+            if n_st is None:
+                print(f"    C{ch}: ERROR - {src.name}: {why}; not converted, source kept")
+                failed.append(f"{session_name} C{ch}")
+                continue
+            if why:
+                print(f"    C{ch}: WARNING - {why}")
+            planned[ch] = (src, n_st, shape, dtype)
+        if not channel_ids and not planned:
+            if not stacks:
+                print("    No channel frame files or stacks found, skipping")
+            print()
             continue
 
         frame_count = px["size_t"] or 0
-        if not frame_count:
+        if not frame_count and not channel_ids:
+            frame_count = next(iter(planned.values()))[1]
+            print(f"    WARNING: OME header has no SizeT; using the stack's {frame_count} pages")
+        elif not frame_count:
             # No SizeT in the OME header: fall back to the on-disk frame count
             # of the first channel rather than stamping the stem with fc000000.
             frame_count = len(list(session_dir.glob(f"*_C{channel_ids[0]}_t*.tif")))
@@ -544,6 +676,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    Master      : {master.name}")
         print(f"    Frame count : {fc_str}")
         print(f"    Sample rate : {rate_str} Hz")
+
+        msg = _archive_ome_xml(session_dir, session_name, master, args.dry_run)
+        if msg:
+            print(f"    {msg}")
 
         # ── Build and write Trial YAML (before stacking) ─────────────────────
         yaml_path = session_dir / f"{session_name}.yaml"
@@ -559,7 +695,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if not args.dry_run:
                 try:
-                    doc = build_yaml(session_name, master, px, len(channel_ids))
+                    doc = build_yaml(session_name, master, px,
+                                     len(channel_ids) + len(stacks))
                     _write_yaml(yaml_path, doc)
                 except Exception as exc:
                     print(f"    yaml: WARNING write failed: {exc}")
@@ -670,6 +807,25 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.delete_sources:
                 to_delete.extend(frames)
+
+        # ── Existing stacks: copy their pages into the plain BigTIFF layout ──
+        for ch, (src, n_frames, shape, dtype) in planned.items():
+            stem   = f"{session_name}-C{ch}-fc{n_frames:06d}"
+            output = session_dir / stem / f"{stem}.tif"
+            print(f"    C{ch}: stack {src.name} ({n_frames} x {shape[0]}x{shape[1]} {dtype}) "
+                  f"-> {stem}/")
+            if args.dry_run:
+                print(f"    C{ch}: would convert to a plain BigTIFF (pages read without OME)")
+                continue
+            try:
+                convert_stack(src, output, n_frames=n_frames)
+            except (Exception, SystemExit) as exc:
+                print(f"    C{ch}: ERROR - conversion failed ({exc}), source kept")
+                failed.append(f"{session_name} C{ch}")
+                continue
+            print(f"    C{ch}: converted, {n_frames} frames verified")
+            if args.delete_sources:
+                to_delete.append(src)
 
         # ── Delete sources (deferred to the end of the session) ──────────────
         # The OME master frame is the session's only record of SizeT and the

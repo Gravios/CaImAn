@@ -256,6 +256,9 @@ def _check_tif(dest: Path, session: str) -> str | None:
 
 _CH_SUBDIR_RE = re.compile(r'.+-C\d{2}-fc\d+$')
 _RAW_FRAME_RE = re.compile(r'_C\d{2}_t\d+(?:\.ome)?\.tif$', re.IGNORECASE)
+# a source OME stack stack-sessions converts (<name>_C00.ome.tif): its OME-XML
+# can make CaImAn read the wrong frames, the converted stack is the input
+_SRC_STACK_RE = re.compile(r'_C\d{2}\.ome\.tif$', re.IGNORECASE)
 
 
 def _find_stacks(root: Path, prefix: str | None = None) -> list[Path]:
@@ -308,10 +311,12 @@ def _infer_from_cwd(prefix: str | None = None) -> tuple[str, Path]:
         own = cwd / f"{cwd.name}{suffix}"
         if own.is_file() and _ok(own.stem):
             return own.stem, cwd
-    # Raw acquisition frames (…_C00_t0000.ome.tif) and unfinished stacks are
-    # never session inputs; a session dir with kept sources holds thousands.
+    # Raw acquisition frames (…_C00_t0000.ome.tif), source OME stacks
+    # (…_C00.ome.tif) and unfinished stacks are never session inputs; a
+    # session dir with kept sources holds thousands.
     tifs = sorted(p for p in cwd.glob("*.tif")
                   if p.is_file() and not _RAW_FRAME_RE.search(p.name)
+                  and not _SRC_STACK_RE.search(p.name)
                   and not p.name.endswith(".partial.tif") and _ok(p.stem))
     msrs = sorted(p for p in cwd.glob("*.msr") if p.is_file() and _ok(p.stem))
     candidates = tifs + msrs
