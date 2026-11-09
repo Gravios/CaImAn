@@ -1,38 +1,46 @@
 """
 caiman/utils/params_estimator.py
 =================================
-Data-driven estimation of CaImAn pipeline parameters from a movie sample,
-with optional species and magnification priors.
+Estimation of CaImAn pipeline parameters from a movie sample, with the cell
+size taken from the objective when the magnification is known.
 
-Given a small temporal subsample of the motion-corrected movie, ``estimate_params``
-computes the Cn/PNR images and from them estimates:
+Cell size (gSig, gSiz) — the pixel size is usually missing from the
+metadata, so it is taken as UM_PER_PX_20X (0.8 µm/px) at 20x, scaled by
+20 / magnification (same scan settings).  gSiz is the cell diameter in px
+(the template's gSiz 17 at 20x = 13.6 µm), gSig = (gSiz - 1) / 4:
 
-- **gSig** — Gaussian half-width of the PSF (soma radius proxy).  Measured by
-  brightness-weighted LoG blob detection on the unfiltered PNR image.  Only
-  blobs whose peak PNR ≥ the image 87th percentile are retained (soma bodies
-  have high PNR; dendrites do not).  The estimate is the 25th percentile of
-  retained blob radii, clipped to the species × magnification prior range.
-- **gSiz** — Spatial support: ``4 × gSig + 1`` (always odd).
-- **rf** — Patch half-size.  Chosen as ``ceil(gSiz × 1.7)``, rounded to an
-  even number, with a hard lower bound of ``ceil(ring_size_factor × gSiz) + 4``
-  to ensure a useful ring annulus.  Empirically calibrated: mouse cortex with
-  18–20 px soma diameter (gSig=5, gSiz=21) → rf=36 validated in session data.
-- **stride** — Half of rf (50% patch overlap).
-- **ring_size_factor** — Fixed at 0.9 (validated for 2P sparse recordings).
-- **merge_thr** — Returned at 0.85 (0.7 merges neighbouring cells).
-- **min_corr / min_pnr** — Seed thresholds estimated from Cn/PNR distributions.
-- **K** — Seeds per patch, scaled to expected neuron density.
+  20x, 25x   the validated template: gSig 4, gSiz 17, rf 20, stride 10
+  16x        cell diameter ~8 µm  @ 1.0 µm/px  -> gSiz 9,  gSig 2
+  40x        cell diameter ~18 µm @ 0.4 µm/px  -> gSiz 45, gSig 11
+  unknown    (00x / none) measured: brightness-weighted LoG blob detection on
+             the unfiltered PNR image over gSig 2–12 px (the 16x–40x range);
+             25th percentile of the bright blobs' radii
 
-Species × magnification priors
---------------------------------
-``species`` ∈ {"mouse", "rat"}, ``magnification`` ∈ {"20x", "40x"}.
-These constrain the gSig search range and set the blob-detection fallback:
+The table is this lab's preparations (CELL_DIAMETER_UM); species does not
+change it.  ``gSig_hint`` (``--gSig``) overrides it.
 
-  mouse 20x: gSig 3–9 px  (10-15 µm soma @ ~0.8 µm/px, FOV ~400 µm)
-  mouse 25x: gSig 3–7 px  (10-15 µm soma @ ~0.78 µm/px; empirical: gSig=4, gSiz=17)
-  mouse 40x: gSig 6–14 px (10-15 µm soma @ ~0.4 µm/px, FOV ~200 µm)
-  rat   20x: gSig 4–11 px (12-18 µm soma @ ~0.8 µm/px)
-  rat   40x: gSig 7–16 px (12-18 µm soma @ ~0.4 µm/px)
+Geometry — rf / stride stay at the template's 20 / 10 unless the CNMF ring
+constraint (ring_size_factor × gSiz < rf) needs a larger patch:
+rf = even(ceil(0.9 × gSiz) + 4), stride = rf // 2 (40x: rf 46, stride 23).
+
+Measured on every movie (Cn / PNR filtered with that gSig):
+
+- **min_corr / min_pnr** — seed thresholds from the Cn / PNR distributions.
+- **K** — seeds per patch from the active (Cn × PNR) area / π·gSig², over
+  the movie's own patch count (its dims and stride).
+- **dff_frames_window** — ~17 s at the session's frame rate.
+
+Sized with the cell, for the pipeline stages that work in pixels (returned
+as dotted keys; new-session writes them only where the pipeline JSON has
+that section):
+
+- **seeding** — radius = gSig, min_distance, smooth_sigma, min_pixels and
+  the Cellpose diameter, scaled from the template's 20x values.
+- **roi_filter.edge_px** — scaled from 10 px at 20x.
+
+Everything else (ring_size_factor, merge_thr, maxthr, tsub, …) is left to
+the pipeline template.  min_pnr is measured at full frame rate; the
+pipeline rescales it by sqrt(tsub) for the tsub-averaged movie itself.
 
 All estimates are starting points — inspect the QC figure and tune from there.
 """
@@ -48,21 +56,71 @@ import numpy as np
 
 logger = logging.getLogger("caiman")
 
-# ── Species × magnification priors ────────────────────────────────────────────
-_PRIORS: dict[tuple, dict] = {
-    ("mouse", "16x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
-    ("mouse", "20x"): {"gsig_min": 3, "gsig_max":  9, "fallback": 6},
-    ("mouse", "25x"): {"gsig_min": 3, "gsig_max":  7, "fallback": 4},
-    ("mouse", "40x"): {"gsig_min": 6, "gsig_max": 14, "fallback": 9},
-    ("rat",   "16x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
-    ("rat",   "20x"): {"gsig_min": 4, "gsig_max": 11, "fallback": 7},
-    ("rat",   "25x"): {"gsig_min": 5, "gsig_max": 13, "fallback": 9},
-    ("rat",   "40x"): {"gsig_min": 7, "gsig_max": 16, "fallback": 10},
-}
+_RING_SIZE_FACTOR = 0.9   # template ring_size_factor (ring = 0.9 × gSiz < rf)
 
-_RING_SIZE_FACTOR = 0.9   # validated for 2P sparse recordings
-_RF_SCALE         = 1.7   # rf ≈ 1.7 × gSiz — calibrated from mouse/20x gSig=5 rf=36
-_MERGE_THR        = 0.85  # validated for 2P soma (0.7 merges neighbouring cells)
+# ── Cell size per objective ───────────────────────────────────────────────────
+UM_PER_PX_20X = 0.8                      # assumed; µm/px ∝ 1 / magnification
+TEMPLATE_MAGS = ("20x", "25x")           # validated template geometry
+TEMPLATE_GEOMETRY = {"gSig": 4, "gSiz": 17, "rf": 20, "stride": 10}
+CELL_DIAMETER_UM = {"16x": 8.0, "40x": 18.0}
+UNKNOWN_GSIG_RANGE = (2, 12)             # blob search when magnification unknown
+# template seeding / roi_filter sizes at gSig 4 (20x), scaled with gSig
+_SEED_20X = {"radius": 4, "min_distance": 5, "smooth_sigma": 1.0,
+             "min_pixels": 8, "diameter": 15}
+_EDGE_PX_20X = 10
+
+
+def normalize_magnification(mag) -> Optional[str]:
+    """'25x' / '25' / 25 / 25.0 -> '25x'; None, '', '00x', 0 -> None (unknown)."""
+    if mag is None:
+        return None
+    txt = str(mag).strip().lower().rstrip("x")
+    try:
+        val = float(txt)
+    except ValueError:
+        return None
+    return f"{int(round(val))}x" if val > 0 else None
+
+
+def um_per_px(magnification: str) -> float:
+    """Assumed pixel size for *magnification* ('16x' -> 1.0 µm/px)."""
+    return UM_PER_PX_20X * 20.0 / float(magnification.rstrip("x"))
+
+
+def cell_size(magnification: Optional[str]) -> Optional[tuple]:
+    """(gSig, gSiz) for a known magnification, None when it must be measured."""
+    mag = normalize_magnification(magnification)
+    if mag in TEMPLATE_MAGS:
+        return TEMPLATE_GEOMETRY["gSig"], TEMPLATE_GEOMETRY["gSiz"]
+    if mag in CELL_DIAMETER_UM:
+        d_px = CELL_DIAMETER_UM[mag] / um_per_px(mag)
+        gSig = max(1, int(round((d_px - 1) / 4)))
+        return gSig, 4 * gSig + 1
+    return None
+
+
+def patch_geometry(gSiz: int) -> tuple:
+    """(rf, stride): the template's 20 / 10, enlarged only when the ring
+    (ring_size_factor × gSiz) needs it."""
+    ring_min = int(math.ceil(_RING_SIZE_FACTOR * gSiz)) + 4
+    ring_min += ring_min % 2
+    if ring_min <= TEMPLATE_GEOMETRY["rf"]:
+        return TEMPLATE_GEOMETRY["rf"], TEMPLATE_GEOMETRY["stride"]
+    return ring_min, ring_min // 2
+
+
+def sized_stages(gSig: int) -> dict:
+    """Pixel sizes of the seeding / roi_filter stages for cell size *gSig*
+    (dotted keys), scaled from the template's values at gSig 4."""
+    f = gSig / TEMPLATE_GEOMETRY["gSig"]
+    return {
+        "seeding.radius":       max(1, int(round(_SEED_20X["radius"] * f))),
+        "seeding.min_distance": max(2, int(round(_SEED_20X["min_distance"] * f))),
+        "seeding.smooth_sigma": round(max(0.5, _SEED_20X["smooth_sigma"] * f), 2),
+        "seeding.min_pixels":   max(3, int(round(_SEED_20X["min_pixels"] * f * f))),
+        "seeding.diameter":     max(5, int(round(_SEED_20X["diameter"] * f))),
+        "roi_filter.edge_px":   max(3, int(round(_EDGE_PX_20X * f))),
+    }
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -72,7 +130,7 @@ def estimate_params(
     *,
     yaml_path:     Optional[Union[str, Path]] = None,
     species:       str                       = "mouse",
-    magnification: str                       = "20x",
+    magnification: Optional[str]             = None,
     gSig_hint:     Optional[int]             = None,
     n_frames:      int                       = 500,
     fr:            float                     = 30.0,
@@ -86,11 +144,15 @@ def estimate_params(
     fname_mc : str or Path
         Path to the F-order motion-corrected mmap (``*rig*order_F*.mmap``).
     species : {"mouse", "rat"}
-        Sets the gSig search bounds.
-    magnification : {"20x", "40x"}
-        Combined with species to bound gSig.
+        Logged / shown in the QC figure; the cell size comes from the
+        magnification (see the module docstring).
+    magnification : str, optional
+        '16x', '20x', '25x', '40x' (any 'NNx'); None / '00x' = unknown ->
+        cell size measured from the movie.  Other known values are measured
+        too, with a warning.
     gSig_hint : int, optional
-        Prior soma half-width in pixels.  Skips blob detection.
+        Cell half-width in pixels; overrides the magnification table and
+        skips blob detection.
     n_frames : int
         Frames to subsample for Cn/PNR.  500 is fast (~2 s).
     fr : float
@@ -102,7 +164,9 @@ def estimate_params(
     Returns
     -------
     dict
-        Ready-to-use suggestions for the pipeline JSON cnmf section.
+        Suggestions for the pipeline JSON: plain keys for the cnmf section
+        (gSig, gSiz, rf, stride, min_corr, min_pnr, K, dff_frames_window),
+        dotted keys for the seeding / roi_filter sizes.
     """
     import caiman.mmapping as _mmap
 
@@ -116,8 +180,8 @@ def estimate_params(
             if fr == 30.0 and isinstance(_sr.get("value"), (int, float)):
                 fr = float(_sr["value"])
             _mag = _acq.get("magnification", {})
-            if magnification == "20x" and isinstance(_mag.get("value"), (int, float)):
-                magnification = f"{int(_mag['value'])}x"
+            if magnification is None and isinstance(_mag, dict):
+                magnification = normalize_magnification(_mag.get("value"))
             _sp_raw = (_yd.get("subject") or {}).get("species", "") or ""
             if species == "mouse" and _sp_raw:
                 species = "rat" if "rat" in _sp_raw.lower() else "mouse"
@@ -131,17 +195,20 @@ def estimate_params(
         except Exception as _ye:
             logger.warning(f"  Could not read YAML {yaml_path}: {_ye}")
 
-    prior_key = (species.lower(), magnification.lower())
-    if prior_key not in _PRIORS:
-        raise ValueError(
-            f"Unknown (species, magnification)={prior_key!r}. "
-            f"Valid: {list(_PRIORS)}"
-        )
-    prior = _PRIORS[prior_key]
-    logger.info(
-        f"Parameter estimation: species={species}  magnification={magnification}  "
-        f"gSig prior=[{prior['gsig_min']}, {prior['gsig_max']}] px"
-    )
+    magnification = normalize_magnification(magnification)
+    size = cell_size(magnification)
+    if gSig_hint is not None:
+        size_note = f"--gSig {gSig_hint}"
+    elif size is not None:
+        size_note = (f"{magnification}: template" if magnification in TEMPLATE_MAGS else
+                     f"{magnification}: {CELL_DIAMETER_UM[magnification]:g} µm cells @ "
+                     f"{um_per_px(magnification):.2f} µm/px")
+    else:
+        if magnification is not None:
+            logger.warning(f"  No cell size for {magnification}; measuring it from the movie")
+        size_note = (f"magnification {magnification or 'unknown'}: measured, "
+                     f"gSig {UNKNOWN_GSIG_RANGE[0]}–{UNKNOWN_GSIG_RANGE[1]} px")
+    logger.info(f"Parameter estimation: species={species}  cell size: {size_note}")
 
     logger.info(f"  Loading {n_frames} frames from {fname_mc}")
     Yr, dims, T = _mmap.load_memmap(str(fname_mc))
@@ -153,16 +220,19 @@ def estimate_params(
     # ── Cn / PNR ─────────────────────────────────────────────────────────────
     from caiman.summary_images import correlation_pnr as _corr_pnr
 
-    if gSig_hint is not None:
-        gSig = int(np.clip(round(gSig_hint), prior["gsig_min"], prior["gsig_max"]))
-        logger.info(f"  gSig: hint={gSig_hint} → clipped to prior → {gSig} px")
+    if gSig_hint is not None or size is not None:
+        gSig = max(1, int(round(gSig_hint))) if gSig_hint is not None else size[0]
+        logger.info(f"  gSig={gSig} px ({size_note})")
         cn, pnr = _corr_pnr(frames, gSig=[gSig, gSig], center_psf=True,
                              swap_dim=False)
     else:
         logger.info("  Pass 1: unfiltered PNR for gSig estimation")
         _cn_raw, pnr_raw = _corr_pnr(frames, gSig=None, center_psf=False,
                                       swap_dim=False)
-        gSig = _estimate_gsig_from_pnr(pnr_raw, prior=prior, logger=logger)
+        lo, hi = UNKNOWN_GSIG_RANGE
+        gSig = _estimate_gsig_from_pnr(
+            pnr_raw, prior={"gsig_min": lo, "gsig_max": hi,
+                            "fallback": TEMPLATE_GEOMETRY["gSig"]}, logger=logger)
         del _cn_raw, pnr_raw
 
         logger.info(f"  Pass 2: filtered Cn/PNR with gSig={gSig}")
@@ -180,41 +250,16 @@ def estimate_params(
     )
 
     # ── Geometry ──────────────────────────────────────────────────────────────
-    gSiz = gSig * 4 + 1   # must be odd; 4×gSig+1 is the CaImAn convention
-
-    # Lower bound: ring annulus must fit with margin
-    rf_ring_min = int(math.ceil(_RING_SIZE_FACTOR * gSiz)) + 4
-    # Target: 1.7 × gSiz — empirically calibrated from validated session:
-    # mouse, 18-20 px soma diameter, gSig=5, gSiz=21 → rf=36 (ceil(21×1.7)=36).
-    rf_target   = int(math.ceil(gSiz * _RF_SCALE))
-
-    rf = max(rf_ring_min, rf_target)
-    if rf % 2 != 0:
-        rf += 1   # CaImAn expects even half-sizes
-
-    stride  = rf // 2
+    gSiz = (size[1] if size is not None and gSig_hint is None and size[0] == gSig
+            else gSig * 4 + 1)            # 4×gSig+1 (odd) = cell diameter in px
+    rf, stride = patch_geometry(gSiz)
     ring_px = _RING_SIZE_FACTOR * gSiz
-    margin  = rf - ring_px
-    if margin <= 0:
-        logger.warning(
-            f"  Ring constraint VIOLATED: rf={rf} <= ring={ring_px:.1f}px. "
-            f"Increasing rf to {int(ring_px) + 6}.")
-        rf = int(ring_px) + 6
-        if rf % 2 != 0:
-            rf += 1
-        stride = rf // 2
-        margin = rf - ring_px
-
-    # Informational: patch count on a typical 512×512 FOV.
-    # CaImAn steps patches by stride (= rf//2 here), so the number of
-    # patch origins along one axis is ceil(FOV / stride).
-    n_per_dim         = max(1, math.ceil(512 / stride))
-    n_patches_typical = n_per_dim ** 2
-
+    # patches on this movie: origins every `stride` px along each axis
+    n_patches = int(np.prod([max(1, math.ceil(d / stride)) for d in dims]))
     logger.info(
         f"  Geometry: gSig={gSig}  gSiz={gSiz}  rf={rf}  stride={stride}  "
-        f"ring={ring_px:.1f}px  margin={margin:.1f}px  "
-        f"~{n_patches_typical} patches on 512×512 FOV"
+        f"ring={ring_px:.1f}px  margin={rf - ring_px:.1f}px  "
+        f"{n_patches} patches on {dims[0]}×{dims[1]}"
     )
 
     # ── Thresholds ────────────────────────────────────────────────────────────
@@ -248,14 +293,14 @@ def estimate_params(
     n_active_px = int(active_mask.sum())
     cell_area_px = math.pi * float(gSig) ** 2
     n_cells_est = max(1.0, n_active_px / max(cell_area_px, 1.0))
-    K_raw = math.ceil(n_cells_est * 2.0 / max(1, n_patches_typical))
+    K_raw = math.ceil(n_cells_est * 2.0 / max(1, n_patches))
     # Sensible bounds: K=3 is the minimum that still allows merging
     # ambiguity at boundaries; K=40 caps any over-estimate from a Cn map
     # contaminated by horizontal banding or other periodic noise.
     K = int(max(3, min(K_raw, 40)))
     logger.info(
         f"  K={K}  (data-driven: {n_active_px} active px, "
-        f"{n_cells_est:.0f} cells est., {n_patches_typical} patches, "
+        f"{n_cells_est:.0f} cells est., {n_patches} patches, "
         f"raw={K_raw}, clamped to [3, 40])"
     )
 
@@ -265,43 +310,19 @@ def estimate_params(
 
     # ── Assemble ──────────────────────────────────────────────────────────────
     suggestions = {
-        # Spatial filter
-        "gSig":             [gSig, gSig],
-        "gSiz":             [gSiz, gSiz],
-        # Patch geometry (compact patches validated to avoid over-merging)
-        "rf":               rf,
-        "stride":           stride,
-        # Background model (validated ring factor for 2P sparse)
-        "ring_size_factor": _RING_SIZE_FACTOR,
-        # Merging (0.7 merges neighbouring somas — use 0.85)
-        "merge_thr":        _MERGE_THR,
-        # Seed thresholds
-        "min_corr":         min_corr,
-        "min_pnr":          min_pnr,
-        # Seeds per patch
-        "K":                K,
-        # ssub=1: avoids shape mismatch in precomputed filt inject (ssub>1 bug).
-        # tsub=2: halves temporal load with negligible quality loss at 30 Hz.
-        "ssub":             1,
-        "tsub":             2,
-        # nb_patch=0 required for corr_pnr + gnb>0 (avoids scale mismatch)
-        "nb_patch":         0,
-        # del_duplicates=False for sparse 2P — let merge_comps handle duplicates
-        "del_duplicates":   False,
-        # normalize_init must be False for corr_pnr + ring model
-        "normalize_init":   False,
-        "rolling_sum":      True,
-        "ssub_B":           2,
-        # GCaMP baseline is non-negative
-        "bas_nonneg":       True,
-        # 0.1 (default) clips weak neurons; 0.05 is more inclusive
-        "maxthr":           0.05,
-        # keep largest connected component per footprint (soma recording)
-        "extract_cc":       True,
-        # dF/F baseline
-        "dff_quantile_min":  8,
+        # cell size and patch geometry (template / objective table / measured)
+        "gSig":              [gSig, gSig],
+        "gSiz":              [gSiz, gSiz],
+        "rf":                rf,
+        "stride":            stride,
+        # measured on this movie
+        "min_corr":          min_corr,
+        "min_pnr":           min_pnr,
+        "K":                 K,
         "dff_frames_window": dff_window,
     }
+    # pixel sizes of the stages that work on the cell size
+    suggestions.update(sized_stages(gSig))
     logger.info(f"  Suggestions: {suggestions}")
 
     if out_path is not None:
@@ -506,7 +527,7 @@ def _save_inspection_figure(
                                   interpolation="nearest")
         ax_pnr.set_title(
             f"PNR  |  min_pnr={min_pnr:.1f}  |  gSig≈{gSig} px  "
-            f"|  {species} {magnification}",
+            f"|  {species} {magnification or 'unknown mag'}",
             color="0.85", fontsize=8)
         cb2 = plt.colorbar(im_pnr,
                            cax=make_axes_locatable(ax_pnr).append_axes("right","3%",pad=0.05))

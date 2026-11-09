@@ -59,7 +59,12 @@ Processing flags
   --estimate-params     Estimate CNMF parameters from the MC'd movie.
   --n-frames N          Frames to subsample for param estimation. Default: 500.
   --species mouse|rat   Animal species. Default: mouse.
-  --magnification 20x|40x  Objective magnification. Default: 20x.
+  --magnification NNx   Objective magnification (16x, 20x, 25x, 40x).  Default:
+                        the YAML's, else the session name's (…-25x-…); 00x or
+                        none = unknown, the cell size is then measured from
+                        the movie.  Sets the cell size: 20x/25x the template
+                        (gSig 4, gSiz 17, rf 20, stride 10), 16x gSig 2 (8 µm
+                        cells), 40x gSig 11 (18 µm cells); --gSig overrides.
   --run                 Run the pipeline script after setup.
 
 Behaviour flags
@@ -443,14 +448,19 @@ def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> bool
         if mc_path and mc_path[-1]:
             print("\nEstimating parameters...")
             from caiman.utils.params_estimator import estimate_params, apply_suggestions
+            cfg = json.loads(Path(out_json).read_text())
+            fr = (cfg.get("data") or {}).get("fr")
             suggestions = estimate_params(
                 mc_path[-1],
                 species       = args.species,
-                magnification = args.magnification,
+                magnification = getattr(args, "magnification_resolved", None),
+                gSig_hint     = args.gSig,
                 n_frames      = args.n_frames,
+                fr            = float(fr) if isinstance(fr, (int, float)) else 30.0,
                 out_path      = dest / f"{session}_qc_00_param_estimate.png",
                 logger        = log,
             )
+            suggestions = _for_sections(suggestions, cfg)
             apply_suggestions(out_json, suggestions)
             print("\n  JSON updated with estimated parameters.")
         elif not args.run_mc:
@@ -463,6 +473,43 @@ def _run_mc_and_estimate(args, session: str, dest: Path, out_json: Path) -> bool
             except OSError as exc:
                 log.warning(f"Could not delete MC mmap: {exc}")
     return True
+
+
+def _for_sections(suggestions: dict, cfg: dict) -> dict:
+    """Drop dotted suggestions (seeding.radius, roi_filter.edge_px, …) for
+    sections the pipeline JSON doesn't have: an older template without a
+    seeding section must not get a partial one."""
+    return {k: v for k, v in suggestions.items()
+            if "." not in k or isinstance(cfg.get(k.split(".", 1)[0]), dict)}
+
+
+def normalize_magnification(mag):
+    """'25x' / 25 / '25' -> '25x'; None, '', '00x', 0 -> None (unknown).
+    (Same as caiman.utils.params_estimator.normalize_magnification, kept here
+    so new-session doesn't import caiman before it is needed.)"""
+    if mag is None:
+        return None
+    try:
+        val = float(str(mag).strip().lower().rstrip("x"))
+    except ValueError:
+        return None
+    return f"{int(round(val))}x" if val > 0 else None
+
+
+def _resolve_magnification(cli, yaml_mag, session: str) -> tuple:
+    """(magnification or None, where it came from): --magnification, else
+    the YAML's, else the session name's (…-25x-…).  00x / 0 = unknown."""
+    if cli:
+        return normalize_magnification(cli), "--magnification"
+    if yaml_mag is not None and normalize_magnification(yaml_mag):
+        return normalize_magnification(yaml_mag), "YAML"
+    try:
+        from utilities.rename_stem import parse_stem
+    except ImportError:
+        from rename_stem import parse_stem
+    parts = parse_stem(re.sub(r"-C\d{2}-fc\d+$", "", session)) or {}
+    mag = normalize_magnification(parts.get("magnification"))
+    return mag, ("session name" if mag else "unknown")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -511,7 +558,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--estimate-params", action="store_true")
     p.add_argument("--n-frames",        type=int, default=500, metavar="N")
     p.add_argument("--species",         choices=["mouse", "rat"], default="mouse")
-    p.add_argument("--magnification",   choices=["20x", "40x"],   default="20x")
+    p.add_argument("--magnification",   metavar="NNx", default=None,
+                   help="Objective magnification (16x, 20x, 25x, 40x). Default: the "
+                        "YAML's, else the session name's; unknown -> cell size "
+                        "measured from the movie.")
     p.add_argument("--channels",        metavar="LIST", default=None,
                    help="Comma-separated channel indices for MSR input "
                         "(default: all channels in MSR metadata). Ignored "
@@ -607,7 +657,9 @@ def main(argv: list[str] | None = None) -> int:
     gSig    = args.gSig       if args.gSig       is not None else yd.get("gSig")
     gSiz    = args.gSiz       if args.gSiz       is not None else yd.get("gSiz")
     species = args.species    if args.species    != "mouse"  else yd.get("species", args.species)
-    magnif  = args.magnification if args.magnification != "20x" else yd.get("magnification", args.magnification)
+    magnif, magnif_src = _resolve_magnification(args.magnification,
+                                                yd.get("magnification"), session)
+    args.magnification_resolved = magnif
 
     overrides: dict = {}
     if fr    is not None: overrides["data.fr"]           = fr
@@ -664,7 +716,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Session    : {session}")
     print(f"  Dest       : {dest}")
     if args.estimate_params or args.run_mc:
-        print(f"  Species    : {species}    Magnif: {magnif}")
+        print(f"  Species    : {species}    Magnif: {magnif or 'unknown (cell size measured)'}"
+              f"  [{magnif_src}]")
     if overrides:
         print("  Overrides  :")
         for k, v in overrides.items():
