@@ -77,6 +77,19 @@ try:
             ("20140922", "132016", "TL004", "00x", "pawstim", None, None, 122, []),
         "140924_tl8fpstimpinzettealle10sipsil_p20_z125_favg1_17-20-12":
             ("20140924", "172012", "TL008", "00x", "fpstim", 20.0, 1, 125, []),
+        # 2015 patterns
+        "150121_TL15_spontan_z130_p15_25x_favg2_15_4Hz_16-20-42":
+            ("20150121", "162042", "TL015", "25x", "spont", 15.0, 2, 130, []),
+        "150122_test3_25xobj_option_z165_25x_16-40-51":
+            ("20150122", "164051", "TL003", "25x", "test", None, None, 165, ["obj", "option"]),
+        "150310_tl2_Upown_favg1_30_8Hz_P24_z120_11-38-21":
+            ("20150310", "113821", "TL002", "00x", "updown", 24.0, 1, 120, []),
+        "150220_TL1_persUpstate_z120_p6_favg1_30_8Hz_11-13-02":
+            ("20150220", "111302", "TL001", "00x", "persup", 6.0, 1, 120, []),
+        "150220_morph2_favg6_13-10-57":
+            ("20150220", "131057", "TL002", "00x", "morph", None, 6, None, []),
+        "150203_tl1_cloud_p75_z110_updown_40x_10-40-41":
+            ("20150203", "104041", "TL001", "40x", "updown", 75.0, None, 110, ["cloud"]),
         "20160301_tl12-chrimson-40x_09-05-00":
             ("20160301", "090500", "TL012", "40x", "chrimson", None, None, None, []),
     }
@@ -93,6 +106,11 @@ try:
     p = rs.parse_legacy("140527_tl11_favg2_z140_p7_gain61_17-17-15")
     assert (p.gain, p.laser_power, p.fa) == (61, 7.0, 2)
     assert rs.parse_legacy("140324_TL2_4000img_z100_p10_fa2_spont_14-49-45").n_frames == 4000
+    assert rs.parse_legacy("150128_TL1_spont_25x_favg1_30.4Hz_p7_z130_14-43-28").sample_rate == 30.4
+    assert rs.parse_legacy("150121_TL1_spont_z110_sb_p6_favg2_15_3Hz_25x_14-00-18").sample_rate == 15.3
+    assert rs.parse_legacy("140922_tl2_pawstim10pulses3Hz_z125_12-24-06").sample_rate is None, \
+        "a rate inside a protocol word stays protocol"
+    assert rs.parse_legacy("150122_tl2_spont_sys3_z195_p18_25x_16-08-24").system == 3
     assert rs.parse_legacy("strohA-ia-000000-20140807-TL001_131248-00x-default") is None
     assert rs.parse_legacy("140231_tl1_12-00-00") is None, "not a calendar date"
     assert rs.parse_legacy("140225_tl1_25-00-00") is None, "not a clock time"
@@ -100,7 +118,8 @@ try:
     ok(f"legacy names parsed ({len(cases)} cases): YYMMDD/YYYYMMDD, HH-MM-SS, tl<N>→TL<NNN>, "
        "25x/25xspont/vs25x, LP5 / LP1_65 / p1_50, FA<N>, 104um / depth116 / z90, "
        "paradigm words; 2014: glued tl<N>…, p<N>, favg<N>, z<N><word>, 3Dscan<N> / zstack<N>, "
-       "gain<N>, <N>img, paw / forepaw protocol + side; anything else kept as notes")
+       "gain<N>, <N>img, paw / forepaw protocol + side; 2015: rates 15_4Hz / 30.4Hz, "
+       "persUp / UpDown, <paradigm><N> index, sys<N>; anything else kept as notes")
 
     # ── 2. tree, dry run ─────────────────────────────────────────────────────
     base = root / "strohA" / "strohA-ia"
@@ -199,6 +218,41 @@ try:
     assert get(y6, *S, "laserPower", "value") == 25.0
     assert get(y6, "experiment", "notes") == ["sb", "cloud"]
     ok("YAML: protocol, side, gain, requested n_frames; unexplained tokens as experiment.notes")
+
+    # 2015: date folder with a suffix, System<N> folders, wrong date folders
+    t6 = root / "t6"
+    mf = t6 / "strohA-ms-000000-20150121_2Pexp_micfailure"
+    s1 = mf / "System1" / "150121_TL15_spontan_z130_p15_25x_favg2_15_4Hz_16-20-42"
+    s3 = mf / "System3" / "150122_tl2_spont_sys3_z195_p18_25x_16-08-24"
+    swapped = t6 / "strohA-ms-000000-20150302" / "150203_tl1_cloud_p75_z110_updown_40x_10-40-41"
+    bad = t6 / "strohA-ms-000000-20152020" / "150220_morph2_favg6_13-10-57"
+    for d in (s1, s3, swapped, bad):
+        d.mkdir(parents=True)
+    rc, out = run("--root", str(t6))
+    assert "4 legacy directories: 4 to rename" in out, out
+    assert "strohA-ms-000000-20150302\n    -> strohA-ms-000000-20150203" in out
+    assert "20152020 is not a date" in out and "[--fix-date-folders]" in out
+    assert "micfailure: sessions from 20150121, 20150122 — left as is" in out
+    before6 = tree(t6)
+    log6 = root / "r6.tsv"
+    rc, out = run("--root", str(t6), "--apply", "--fix-date-folders", "--log", str(log6))
+    assert rc == 0, out
+    n1 = mf / "System1" / "strohA-ms-000000-20150121-TL015_162042-25x-spont"
+    y = ydoc(n1)
+    assert get(y, *S, "sample_rate", "value") == 15.4 and get(y, "acquisition_system", "system") == 1
+    assert get(y, "experiment", "folder_note") == "2Pexp_micfailure"
+    assert get(ydoc(mf / "System3" / "strohA-ms-000000-20150122-TL002_160824-25x-spont"),
+               "acquisition_system", "system") == 3
+    assert (t6 / "strohA-ms-000000-20150203" / "strohA-ms-000000-20150203-TL001_104041-40x-updown").is_dir()
+    assert (t6 / "strohA-ms-000000-20150220" / "strohA-ms-000000-20150220-TL002_131057-00x-morph").is_dir()
+    assert mf.is_dir() and not (t6 / "strohA-ms-000000-20150302").exists()
+    rows = list(csv.DictReader(open(log6), delimiter="\t"))
+    assert [r["confidence"] for r in rows][-2:] == ["folder", "folder"]
+    rc, out = run("--undo", str(log6), "--apply")
+    assert rc == 0 and tree(t6) == before6, sorted(set(tree(t6)) ^ set(before6))
+    ok("2015: date folder suffix kept as folder_note, System<N> / sys<N> → acquisition_system.system, "
+       "sample rate from the name; --fix-date-folders renames folders whose sessions agree "
+       "(mixed ones reported); undo restores the tree")
 
     # ── 6. refusals, overrides, numbering, confidence ────────────────────────
     t2 = root / "t2" / "lab-xy-M17-20150301"

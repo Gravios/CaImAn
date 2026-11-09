@@ -21,17 +21,25 @@ rest of a glued token (tl1fpstim → tl1 + fpstim, z125fpstim → z125 + fpstim)
 
   date, time      leading YYMMDD (or YYYYMMDD) and trailing HH-MM-SS
   trialId         tl<N> (also glued: tl1fpstim, TL1new) → TL<NNN>; the index of
-                  3Dscan<N> / zstack<N> when there is no tl<N>; none → TL000
+                  <paradigm><N> (3Dscan2, zstack1, morph2, test3) when there is
+                  no tl<N>; none → TL000
                   (or --number-missing)
   magnification   <N>x, also glued to a word (25xspont, vs25x) → <N>x; none → 00x
   experimentId    a known word or a word starting with one (PARADIGMS: spont /
                   spontan, vstim / visstim, fpstim, stimfp, pawstim, fiberstim,
-                  3dscan, zstack, test, …); one other plain word is taken as is;
+                  3dscan, zstack, morph, test, persup (persUp, persUpstate),
+                  updown (UpDown, UpDownstate, Upown), …); one other plain word
+                  is taken as is;
                   none → default
-  sourceId-userId from the nearest ancestor named <src>-<user>-<subj>[-<date>]
-  subjectId       (e.g. strohA-ia-000000-20140225), or --prefix / --subject
+  sourceId-userId from the nearest ancestor named <src>-<user>-<subj>[-<date>[_note]]
+  subjectId       (e.g. strohA-ia-000000-20140225, …-20150121_2Pexp_micfailure),
+                  or --prefix / --subject
 
 YAML only (not in the name):
+  sample_rate     15_4Hz, 30.4Hz, 30Hz (a separate token; stack-sessions
+                  replaces it with the OME header's)
+  acquisition_system.system   sys<N>, or a System<N> folder above the session
+  experiment.folder_note      the date folder's suffix (2Pexp_micfailure)
   laserPower      LP<N>[_<frac>], P<N>[_<frac>], P<N>sb   (p7_50 → 7.5, p10 → 10)
   fa              FA<N>, favg<N>
   depth           <N>um, depth<N>, z<N>  (stored negative, as stack-sessions
@@ -58,8 +66,12 @@ Safety
     or that two directories would both get is refused (nothing for either).
   * Each directory is renamed together with the entries inside it that carry
     its old name; a failure rolls that directory back.
-  * --log writes a TSV (src, dst, confidence, unparsed); --undo LOG reverses
-    an applied log.
+  * --log writes a TSV (src, dst, confidence, unparsed, yaml); --undo LOG
+    reverses an applied log.
+  * Date folders <src>-<user>-<subj>-<date> whose date disagrees with every
+    session inside (e.g. 20150302 holding 150203 sessions, or 20152020) are
+    reported, and renamed with --fix-date-folders after their sessions
+    (folders with sessions from several dates are only reported).
   * Pipeline files (*_pipeline.json, *_results.hdf5, *.mmap) embed absolute
     paths a rename does not rewrite: they are listed as warnings.
 
@@ -69,6 +81,7 @@ Usage
   rename-sessions --root … --apply --log rename.tsv
   rename-sessions --root … --min-confidence 4 --apply
   rename-sessions --root … --number-missing --apply   # TL by time for dirs without tl<N>
+  rename-sessions --root … --fix-date-folders --apply # also fix wrong date folders
   rename-sessions --root … --yaml-only --apply        # YAML for already-named dirs
   rename-sessions --undo rename.tsv --apply
 """
@@ -98,6 +111,10 @@ _LEGACY_RE = re.compile(
 # Token rules, tried in order on each token (separators: - _ . space).  A
 # rule may hand back the rest of a glued token (tl1fpstim → tl1 + fpstim).
 _LP_FRAC_RE = re.compile(r"(?<![A-Za-z0-9])(lp|p)(\d+)_(\d+)(?![A-Za-z0-9])", re.I)
+# frame rate, also across a separator: 15_4Hz, 30.4Hz, 30Hz (not inside a word:
+# 10pulses3Hz stays a protocol)
+_RATE_RE    = re.compile(r"(?<![A-Za-z0-9])(\d+)(?:[_.](\d+))?hz(?![A-Za-z0-9])", re.I)
+_SYS_RE     = re.compile(r"sys(?:tem)?(\d+)$", re.I)              # sys3
 _TRIAL_RE   = re.compile(r"tl(\d+)(.*)$", re.I)                  # tl5, tl1fpstim, TL1new
 _LP_RE      = re.compile(r"(?:lp|p)(\d+)(sb)?$", re.I)           # LP5, p10, p25sb
 _FA_RE      = re.compile(r"(?:fa|favg)(\d+)$", re.I)             # FA1, favg2
@@ -118,6 +135,10 @@ PARADIGMS = {
     "fiberstim": "fiberstim", "astim": "astim", "chrimson": "chrimson",
     "opo": "opo", "tisa": "tisa", "3d": "3dscan", "3dscan": "3dscan",
     "zstack": "zstack", "loco": "loco", "dark": "dark", "test": "test",
+    "morph": "morph",
+    # Up / Down states (incl. the spellings in the 2015 names)
+    "persup": "persup", "persupstate": "persup",
+    "updown": "updown", "updownstate": "updown", "upown": "updown",
     "default": "default",
 }
 _PREFIXES = sorted((k for k in PARADIGMS if len(k) >= 4), key=len, reverse=True)
@@ -129,7 +150,8 @@ SCORED = ("date", "time", "trialId", "magnification", "experimentId",
 
 # ancestor carrying <src>-<user>-<subj>[-<date8>]
 _ANCESTOR_RE = re.compile(r"^(?P<src>[^-_\s]+)-(?P<user>[^-_\s]+)-(?P<subj>[^-_\s]+)"
-                          r"(?:-(?P<date>\d{8}))?$")
+                          r"(?:-(?P<date>\d{8})(?P<suffix>[_-].+)?)?$")
+_SYSTEM_DIR_RE = re.compile(r"^system[-_ ]?(\d+)$", re.I)            # System3
 
 
 @dataclass
@@ -141,8 +163,11 @@ class Parsed:
     fa: Optional[int] = None
     depth_um: Optional[int] = None                   # positive µm below surface
     gain: Optional[int] = None
+    folder_note: str = ""                            # date-folder suffix (_2Pexp_micfailure)
     n_frames: Optional[int] = None                   # requested (<N>img)
     side: Optional[str] = None                       # ipsi / contra
+    sample_rate: Optional[float] = None              # Hz, from 15_4Hz / 30.4Hz
+    system: Optional[int] = None                     # acquisition system (sys3)
     protocol: list = field(default_factory=list)     # stimulation protocol words
     found: set = field(default_factory=set)          # SCORED fields actually read
     unparsed: list = field(default_factory=list)     # kept verbatim as YAML notes
@@ -191,7 +216,11 @@ def parse_legacy(name: str) -> Optional[Parsed]:
     p.found |= {"date", "time"}
     body = m.group("body") or ""
 
-    # laser power with a fraction spans a separator: LP1_65, p7_50
+    # frame rate and laser power with a fraction span a separator
+    mm = _RATE_RE.search(body)
+    if mm:
+        p.sample_rate = float(f"{int(mm.group(1))}.{mm.group(2)}" if mm.group(2) else mm.group(1))
+        body = body[:mm.start()] + " " + body[mm.end():]
     mm = _LP_FRAC_RE.search(body)
     if mm:
         p.laser_power = float(f"{int(mm.group(2))}.{mm.group(3)}")
@@ -201,12 +230,7 @@ def parse_legacy(name: str) -> Optional[Parsed]:
     paradigms: list = []
     while todo:
         w = todo.pop(0)
-        if (mm := re.fullmatch(r"(3d)(scan)(\d*)", w, re.I)) or \
-                (mm := re.fullmatch(r"(z)(stack)(\d*)", w, re.I)):
-            paradigms.append("3dscan" if mm.group(1).lower() == "3d" else "zstack")
-            if mm.group(3):
-                scan_index = int(mm.group(3))
-        elif (mm := _TRIAL_RE.fullmatch(w)) and "trialId" not in p.found:
+        if (mm := _TRIAL_RE.fullmatch(w)) and "trialId" not in p.found:
             p.parts["trialId"] = f"TL{int(mm.group(1)):03d}"
             p.found.add("trialId")
             if mm.group(2):
@@ -217,6 +241,8 @@ def parse_legacy(name: str) -> Optional[Parsed]:
                 todo.insert(0, mm.group(2))
         elif (mm := _FA_RE.fullmatch(w)) and p.fa is None:
             p.fa = int(mm.group(1))
+        elif (mm := _SYS_RE.fullmatch(w)) and p.system is None:
+            p.system = int(mm.group(1))
         elif (mm := _GAIN_RE.fullmatch(w)) and p.gain is None:
             p.gain = int(mm.group(1))
         elif (mm := _IMG_RE.fullmatch(w)) and p.n_frames is None:
@@ -225,8 +251,9 @@ def parse_legacy(name: str) -> Optional[Parsed]:
             p.depth_um = int(next(g for g in mm.groups()[:3] if g))
             if mm.group(4):
                 todo.insert(0, mm.group(4))
-        elif (mm := _MAG_RE.search(w)) and "magnification" not in p.found:
-            p.parts["magnification"] = f"{int(mm.group(1))}x"
+        elif (mm := _MAG_RE.search(w)) and ("magnification" not in p.found or
+                                            p.parts["magnification"] == f"{int(mm.group(1))}x"):
+            p.parts["magnification"] = f"{int(mm.group(1))}x"     # a repeat is dropped
             p.found.add("magnification")
             rest = w[:mm.start()] + w[mm.end():]
             if rest:
@@ -237,7 +264,9 @@ def parse_legacy(name: str) -> Optional[Parsed]:
             todo[:0] = rest
         elif (par := _paradigm(w)) is not None:
             paradigms.append(par[0])
-            if par[1]:
+            if par[1].isdigit():                 # 3Dscan2, zstack1, morph2, test3
+                scan_index = int(par[1]) if scan_index is None else scan_index
+            elif par[1]:
                 todo.insert(0, par[1])
         elif _PROTOCOL_RE.search(w) and paradigms and not w.isdigit():
             p.protocol.append(w)
@@ -261,16 +290,38 @@ def parse_legacy(name: str) -> Optional[Parsed]:
     return p
 
 
-def ancestor_ids(path: Path) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """(sourceId, userId, subjectId, date) from the nearest ancestor named
-    <src>-<user>-<subj>[-<date8>] that is not itself a session."""
+@dataclass
+class Ancestry:
+    """What the folders above a session say."""
+    source: Optional[str] = None
+    user: Optional[str] = None
+    subject: Optional[str] = None
+    date: Optional[str] = None           # of the date folder <src>-<user>-<subj>-<date8>
+    date_dir: Optional[Path] = None
+    suffix: str = ""                     # after the date: _2Pexp_micfailure
+    system: Optional[int] = None         # a System<N> folder on the way up
+
+
+def ancestor_ids(path: Path) -> Ancestry:
+    """Ids from the nearest ancestor named <src>-<user>-<subj>[-<date8>[_note]]
+    that is not itself a session; a System<N> folder below it gives the
+    acquisition system."""
+    anc = Ancestry()
     for a in path.parents:
         if parse_stem(a.name) is not None:
             continue
+        ms = _SYSTEM_DIR_RE.match(a.name)
+        if ms and anc.system is None:
+            anc.system = int(ms.group(1))
+            continue
         m = _ANCESTOR_RE.match(a.name)
         if m:
-            return m.group("src"), m.group("user"), m.group("subj"), m.group("date")
-    return None, None, None, None
+            anc.source, anc.user, anc.subject = m.group("src"), m.group("user"), m.group("subj")
+            if m.group("date"):
+                anc.date, anc.date_dir = m.group("date"), a
+                anc.suffix = (m.group("suffix") or "").lstrip("_-")
+            return anc
+    return anc
 
 
 # ── Plan ─────────────────────────────────────────────────────────────────────
@@ -282,6 +333,7 @@ class Item:
     dst: Optional[Path] = None
     problems: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    ancestry: Optional["Ancestry"] = None
 
     @property
     def ok(self) -> bool:
@@ -319,7 +371,13 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
         if p is None:
             it.problems.append("not a legacy name (date or time invalid)")
             continue
-        src_id, user_id, subj_id, anc_date = ancestor_ids(d)
+        anc = ancestor_ids(d)
+        it.ancestry = anc
+        src_id, user_id, subj_id, anc_date = anc.source, anc.user, anc.subject, anc.date
+        if p.system is None:
+            p.system = anc.system
+        if anc.suffix:
+            p.folder_note = anc.suffix
         if prefix:
             src_id, _, user_id = prefix.partition("-")
             if not user_id:
@@ -377,6 +435,46 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
     return items
 
 
+@dataclass
+class FolderFix:
+    src: Path
+    dst: Path
+    reason: str
+
+
+def plan_date_folders(items: list[Item]) -> tuple[list[FolderFix], list[str]]:
+    """Date folders whose name disagrees with *every* session in them on one
+    date: (fixes, notes on folders left alone because their sessions
+    disagree among themselves or the target exists)."""
+    by_dir = defaultdict(set)
+    for it in items:
+        anc = it.ancestry
+        if it.parsed is not None and anc is not None and anc.date_dir is not None:
+            by_dir[anc.date_dir].add(it.parsed.parts["date"])
+    fixes, notes = [], []
+    for d, dates in sorted(by_dir.items()):
+        m = _ANCESTOR_RE.match(d.name)
+        folder_date = m.group("date")
+        if dates == {folder_date}:
+            continue
+        if len(dates) > 1:
+            notes.append(f"{d.name}: sessions from {', '.join(sorted(dates))} — left as is")
+            continue
+        (date,) = dates
+        new = d.with_name(f"{m.group('src')}-{m.group('user')}-{m.group('subj')}-{date}"
+                          f"{m.group('suffix') or ''}")
+        try:
+            datetime.strptime(folder_date, "%Y%m%d")
+            why = f"its sessions are from {date}"
+        except ValueError:
+            why = f"{folder_date} is not a date; its sessions are from {date}"
+        if new.exists():
+            notes.append(f"{d.name}: {why}, but {new.name} exists — left as is")
+            continue
+        fixes.append(FolderFix(d, new, why))
+    return fixes, notes
+
+
 # ── YAML ─────────────────────────────────────────────────────────────────────
 
 def trial_doc(new_name: str, p: Optional[Parsed]) -> dict:
@@ -398,6 +496,10 @@ def trial_doc(new_name: str, p: Optional[Parsed]) -> dict:
             sm.set_path(doc, s + ("depth", "value"), -abs(p.depth_um))
         if p.gain is not None:
             sm.set_path(doc, s + ("gain", "value"), p.gain)
+        if p.sample_rate is not None:       # from the name; stack-sessions writes OME's
+            sm.set_path(doc, s + ("sample_rate", "value"), p.sample_rate)
+        if p.system is not None:
+            doc.setdefault("acquisition_system", {})["system"] = p.system
         if p.n_frames is not None:          # requested; stack-sessions writes SizeT
             sm.set_path(doc, s + ("n_frames",), p.n_frames)
         exp = doc.setdefault("experiment", {})
@@ -407,6 +509,8 @@ def trial_doc(new_name: str, p: Optional[Parsed]) -> dict:
             exp["side"] = p.side
         if p.unparsed:
             exp["notes"] = list(p.unparsed)
+        if p.folder_note:
+            exp["folder_note"] = p.folder_note
         exp["legacy_name"] = p.name
     return doc
 
@@ -436,7 +540,7 @@ LOG_FIELDS = ("src", "dst", "confidence", "unparsed", "yaml")   # yaml: wrote|fi
 
 
 def apply(items: list[Item], *, yaml: bool = True, log: Optional[Path] = None,
-          out=print) -> int:
+          out=print, folders: Optional[list] = None) -> int:
     """Rename every OK item; returns the number of failures.  Each rename is
     logged as soon as it is done, so the log stays complete (and --undo
     works) even if the run stops part-way."""
@@ -472,6 +576,21 @@ def apply(items: list[Item], *, yaml: bool = True, log: Optional[Path] = None,
                 writer.writerow((str(it.src), str(it.dst), it.parsed.confidence,
                                  " ".join(it.parsed.unparsed), done))
                 fh.flush()
+        for fx in folders or []:              # after the sessions inside them
+            try:
+                # the folder only: sessions inside already carry the new date,
+                # and must not be touched by a stem rename
+                if fx.dst.exists():
+                    raise FileExistsError(f"target already exists: {fx.dst}")
+                fx.src.rename(fx.dst)
+            except OSError as exc:
+                failed += 1
+                out(f"  FAILED folder {fx.src.name}: {exc}")
+                continue
+            out(f"  folder {fx.src.name} -> {fx.dst.name}")
+            if writer is not None:
+                writer.writerow((str(fx.src), str(fx.dst), "folder", "", ""))
+                fh.flush()
     finally:
         if fh is not None:
             fh.close()
@@ -499,7 +618,10 @@ def undo(log: Path, *, dry_run: bool = True, out=print) -> int:
             try:
                 if drop:
                     made.unlink()
-                sm.apply_rename(sm.plan_rename(dst, src.name))
+                if r.get("confidence") == "folder":     # a date folder: itself only
+                    dst.rename(src)
+                else:
+                    sm.apply_rename(sm.plan_rename(dst, src.name))
             except OSError as exc:
                 out(f"  FAILED: {exc}"); failed += 1
     return failed
@@ -523,6 +645,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--number-missing", action="store_true",
                     help="number directories without tl<N> TL001, TL002, … by time "
                          "(per folder and date, skipping numbers in use)")
+    ap.add_argument("--fix-date-folders", action="store_true",
+                    help="also rename a date folder <src>-<user>-<subj>-<date> whose "
+                         "date disagrees with all sessions in it (they agree on one "
+                         "date); mixed folders are only reported")
     ap.add_argument("--no-yaml", action="store_true", help="rename only")
     ap.add_argument("--yaml-only", action="store_true",
                     help="no renames: write / fill the YAML of directories already "
@@ -579,19 +705,32 @@ def main(argv=None) -> int:
                      f"gain {p.gain}" if p.gain is not None else "",
                      f"n_frames {p.n_frames}" if p.n_frames is not None else "",
                      f"side {p.side}" if p.side else "",
-                     f"protocol '{' '.join(p.protocol)}'" if p.protocol else ""]
+                     f"protocol '{' '.join(p.protocol)}'" if p.protocol else "",
+                     f"sample_rate {p.sample_rate} Hz" if p.sample_rate is not None else "",
+                     f"system {p.system}" if p.system is not None else ""]
             if any(extra):
                 out("    yaml: " + ", ".join(e for e in extra if e))
         for w in it.warnings:
             out(f"    note: {w}")
         for pr in it.problems:
             out(f"    SKIP: {pr}")
+    fixes, fnotes = plan_date_folders(items)
+    if fixes or fnotes:
+        out("\ndate folders:")
+        for fx in fixes:
+            out(f"  {fx.src.name}\n    -> {fx.dst.name}  ({fx.reason})"
+                + ("" if a.fix_date_folders else "  [--fix-date-folders]"))
+        for n in fnotes:
+            out(f"  note: {n}")
+    if not a.fix_date_folders:
+        fixes = []
     out(f"\n{len(items)} legacy director{'y' if len(items) == 1 else 'ies'}: "
-        f"{n_ok} to rename, {len(items) - n_ok} skipped")
+        f"{n_ok} to rename, {len(items) - n_ok} skipped"
+        + (f"; {len(fixes)} date folder(s) to rename" if fixes else ""))
     if not a.apply:
         out("dry run; --apply to rename" + ("" if a.no_yaml else " and write the YAML"))
         return 0
-    failed = apply(items, yaml=not a.no_yaml, log=a.log, out=out)
+    failed = apply(items, yaml=not a.no_yaml, log=a.log, out=out, folders=fixes)
     out(f"renamed {n_ok - failed}" + (f", {failed} failed" if failed else ""))
     return 1 if failed else 0
 
