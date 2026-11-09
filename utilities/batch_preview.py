@@ -2,8 +2,8 @@
 """
 batch-preview
 =============
-One random frame from every session (and channel) under a source / user
-directory, written flat into ``<root>/preview/`` for checking the image
+One random frame from every stacked session (and channel) under a source /
+user directory, written flat into ``<root>/preview/`` for checking the image
 quality by eye.
 
     cd /data/source/stroh/strohA-ia
@@ -15,14 +15,14 @@ Output (flat, one file per session and channel):
     preview/<session>-C00-t004211.png     frame 4211 of channel C00
     preview/<session>-C00-t004211-m5.png  mean of frames 4211–4215 (--mean 5)
 
-A session is any folder below --root holding image data, under its folder
-name (renamed or still legacy-named).  The frame is taken from, in order:
+Only the stacked BigTIFFs are sampled:
 
-  1. the stacked BigTIFF  <session>-C<NN>-fc<N>/<session>-C<NN>-fc<N>.tif
-  2. the raw frame files  *_C<NN>_t<index>.ome.tif   (a random file)
-  3. an OME stack         *_C<NN>.ome.tif
+    <session>/<session>-C<NN>-fc<N>/<session>-C<NN>-fc<N>.tif
 
-All are read as plain TIFF pages (OME-XML ignored).  Contrast: each image is
+read as plain TIFF pages, at any depth below --root (subject / date folders
+or not).  OME-TIFFs left in the session folders (raw frames, OME stacks)
+are ignored; a folder holding only those is counted as "not stacked" in
+the summary.  Unfinished *.partial.tif stacks are ignored.  Contrast: each image is
 scaled from its 0.5th to its 99.5th percentile to 8 bit (--low / --high), so
 dim and bright sessions both show detail; the scaling is the same for every
 image's own range, not across images.
@@ -50,47 +50,44 @@ _STACK_RE = re.compile(r"_C(?P<ch>\d{2})\.ome\.tiff?$", re.I)
 
 # ── discovery ────────────────────────────────────────────────────────────────
 
-def _sources(d: Path) -> dict:
-    """{channel: (kind, paths)} of the image data directly in session dir *d*:
-    kind 'stack' (stacked BigTIFF), 'frames' (raw frame files) or 'ome'
-    (an OME stack); the first kind found per channel wins, in that order."""
+def _stacks(d: Path) -> dict:
+    """{channel: stacked BigTIFF} of session dir *d*:
+    <d>/<d.name>-C<NN>-fc<N>/<d.name>-C<NN>-fc<N>.tif."""
     found: dict = {}
     try:
-        entries = sorted(d.iterdir())
+        kids = sorted(d.iterdir())
     except OSError:
         return found
-    for c in entries:
+    for c in kids:
         m = _CH_DIR_RE.match(c.name)
-        if c.is_dir() and m and m.group("session") == d.name:
+        if m and m.group("session") == d.name and c.is_dir():
             f = c / f"{c.name}.tif"
             if f.is_file():
-                found.setdefault(m.group("ch"), ("stack", [f]))
-    frames: dict = {}
-    stacks: dict = {}
-    for c in entries:
-        if not c.is_file() or ".partial." in c.name:
-            continue
-        if (m := _FRAME_RE.search(c.name)):
-            frames.setdefault(m.group("ch"), []).append(c)
-        elif (m := _STACK_RE.search(c.name)):
-            stacks.setdefault(m.group("ch"), []).append(c)
-    for ch, fs in frames.items():
-        found.setdefault(ch, ("frames", fs))
-    for ch, fs in stacks.items():
-        found.setdefault(ch, ("ome", fs[:1]))
+                found.setdefault(m.group("ch"), f)
     return found
 
 
-def find_sessions(root: Path) -> list:
-    """(session dir, {channel: (kind, paths)}) for every folder below *root*
-    with image data, sorted by path.  Doesn't descend into a session's
-    channel folders, or into preview/."""
-    out = []
+def _has_ome(d: Path) -> bool:
+    """Raw frames or an OME stack directly in *d* (data not stacked yet)."""
+    try:
+        return any(_FRAME_RE.search(f.name) or _STACK_RE.search(f.name)
+                   for f in d.iterdir())
+    except OSError:
+        return False
+
+
+def find_sessions(root: Path) -> tuple:
+    """([(session dir, {channel: stack})], [folders with OME data but no
+    stack]), sorted by path.  Doesn't descend into a session's channel
+    folders, or into <root>/preview."""
+    out, unstacked = [], []
 
     def walk(d: Path) -> None:
-        src = _sources(d)
-        if src:
-            out.append((d, src))
+        st = _stacks(d)
+        if st:
+            out.append((d, st))
+        elif _has_ome(d):
+            unstacked.append(d)
         try:
             kids = sorted(c for c in d.iterdir() if c.is_dir() and not c.is_symlink())
         except OSError:
@@ -103,7 +100,7 @@ def find_sessions(root: Path) -> list:
                 continue
             walk(c)
     walk(root)
-    return out
+    return out, unstacked
 
 
 # ── reading ──────────────────────────────────────────────────────────────────
@@ -113,29 +110,18 @@ def _n_pages(tf) -> int:
     return s.shape[0] if len(s.shape) == 3 else len(tf.pages)
 
 
-def pick_frame(kind: str, paths: list, rng: random.Random, mean: int = 1):
-    """(index, image) of a random frame; *mean* > 1 averages that many
-    consecutive frames starting there (frame files: consecutive files)."""
+def pick_frame(path: Path, rng: random.Random, mean: int = 1):
+    """(index, image) of a random frame of a stack; *mean* > 1 averages that
+    many consecutive frames starting there."""
     import tifffile
-    if kind == "frames":
-        paths = sorted(paths, key=lambda p: int(_FRAME_RE.search(p.name).group("t")))
-        i = rng.randrange(max(1, len(paths) - mean + 1))
-        imgs = []
-        for p in paths[i:i + mean]:
-            with tifffile.TiffFile(str(p), is_ome=False) as tf:
-                imgs.append(tf.pages[0].asarray())
-        idx = int(_FRAME_RE.search(paths[i].name).group("t"))
-    else:
-        with tifffile.TiffFile(str(paths[0]), is_ome=False) as tf:
-            n = _n_pages(tf)
-            i = rng.randrange(max(1, n - mean + 1))
-            imgs = [tf.pages[k].asarray() for k in range(i, min(n, i + mean))]
-        idx = i
-    imgs = [np.squeeze(a) for a in imgs]
+    with tifffile.TiffFile(str(path), is_ome=False) as tf:
+        n = _n_pages(tf)
+        i = rng.randrange(max(1, n - mean + 1))
+        imgs = [np.squeeze(tf.pages[k].asarray()) for k in range(i, min(n, i + mean))]
     if any(a.ndim != 2 for a in imgs):
         raise ValueError(f"frame shape {imgs[0].shape} is not 2-D")
     img = imgs[0] if len(imgs) == 1 else np.mean(np.stack(imgs).astype(np.float64), 0)
-    return idx, img
+    return i, img
 
 
 def to_8bit(img: np.ndarray, low: float = 0.5, high: float = 99.5) -> np.ndarray:
@@ -198,15 +184,17 @@ def main(argv=None) -> int:
     out = (a.out or root / PREVIEW_DIR).resolve()
     rng = random.Random(a.seed)
     want = {c.zfill(2) for c in a.channel} if a.channel else None
-    sessions = find_sessions(root)
+    sessions, unstacked = find_sessions(root)
     if not sessions:
-        print(f"batch-preview: no session with image data under {root}")
+        print(f"batch-preview: no stacked session under {root}"
+              + (f" ({len(unstacked)} with OME-TIFFs only: run stack-sessions)"
+                 if unstacked else ""))
         return 1
     if not a.dry_run:
         out.mkdir(parents=True, exist_ok=True)
     n_new = n_skip = n_err = 0
     for d, src in sessions:
-        for ch, (kind, paths) in sorted(src.items()):
+        for ch, path in sorted(src.items()):
             if want is not None and ch not in want:
                 continue
             stem = f"{d.name}-C{ch}"
@@ -216,11 +204,11 @@ def main(argv=None) -> int:
                 continue
             rel = d.relative_to(root)
             if a.dry_run:
-                print(f"  would preview {rel} C{ch} ({kind})")
+                print(f"  would preview {rel} C{ch}")
                 n_new += 1
                 continue
             try:
-                idx, img = pick_frame(kind, paths, rng, a.mean)
+                idx, img = pick_frame(path, rng, a.mean)
             except Exception as exc:                     # noqa: BLE001
                 print(f"  ERROR {rel} C{ch}: {exc}")
                 n_err += 1
@@ -230,11 +218,14 @@ def main(argv=None) -> int:
             for f in old:                               # --overwrite: one per channel
                 if f.name != name:
                     f.unlink()
-            print(f"  {name}   ({kind}, {img.shape[1]}x{img.shape[0]})")
+            print(f"  {name}   ({img.shape[1]}x{img.shape[0]})")
             n_new += 1
     verb = "would write" if a.dry_run else "wrote"
-    print(f"\n{len(sessions)} sessions: {verb} {n_new}, kept {n_skip} existing"
+    print(f"\n{len(sessions)} stacked sessions: {verb} {n_new}, kept {n_skip} existing"
           + (f", {n_err} errors" if n_err else "") + f"  -> {out}")
+    if unstacked:
+        print(f"{len(unstacked)} folders with OME-TIFFs but no stack, not sampled "
+              f"(e.g. {unstacked[0].relative_to(root)})")
     return 1 if n_err else 0
 
 
