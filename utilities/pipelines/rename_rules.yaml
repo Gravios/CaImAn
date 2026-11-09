@@ -1,0 +1,128 @@
+# rename-sessions rules: how a legacy directory name is read.
+#
+#   140225_tl1_fpstim_z90_p1_50_15-56-08
+#     -> strohA-ms-000000-20140225-TL001_155608-00x-fpstim   (+ Trial YAML)
+#
+# Generate an editable copy:   rename-sessions --write-rules DIR_OR_FILE
+# Apply it:  put it in a folder as  rename-rules.yaml  (it applies to every
+#            legacy session below that folder; the nearest one wins), or pass
+#            --rules FILE (applies to everything under --root).
+#
+# A rules file may be partial.  Keys it gives replace the built-in ones,
+# except `paradigms` and `defaults`, which are merged (a word set to null is
+# removed).  `extra_pre` / `extra_tokens` are tried before `pre` / `tokens`,
+# so a dataset can add a rule without copying the whole list:
+#
+#   extra_tokens:
+#     - {field: laser_power, pattern: 'pw(\d+)', value: 1}
+#   paradigms: {zs: zstack}
+#
+# Patterns are Python regular expressions, case-insensitive.
+version: 1
+
+# <date>[_-]<body>[_-]<HH>-<MM>-<SS>; groups date, hh, mm, ss (body optional).
+# A 6-digit date is YYMMDD (19YY for YY >= 70).
+legacy_name: '^(?P<date>\d{6}|\d{8})(?:[_-](?P<body>.*?))?[_-](?P<hh>\d{2})-(?P<mm>\d{2})-(?P<ss>\d{2})$'
+
+# the body is split into tokens on these
+separators: '[-_.\s]+'
+
+# Folders above a session: the nearest <src>-<user>-<subj>[-<date8>[_note]]
+# gives sourceId / userId / subjectId (and the date folder); a System<N>
+# folder below it gives the acquisition system.  Groups src, user, subj,
+# date, suffix / one number.
+ancestor_name: '^(?P<src>[^-_\s]+)-(?P<user>[^-_\s]+)-(?P<subj>[^-_\s]+)(?:-(?P<date>\d{8})(?P<suffix>[_-].+)?)?$'
+system_folder: '^system[-_ ]?(\d+)$'
+
+# Trials never go above this.  A larger tl<N> is a trial with a value glued
+# on (tl1200 -> TL001 + 200, tl120hz -> TL001 + 20hz) when exactly one split
+# fits (trial 1..max_trial, rest not starting with 0); two fits (tl1150) are
+# refused; a lone tl<N> above it (tl25) is kept with a note.
+max_trial: 20
+
+# name fields nothing gave
+defaults: {subjectId: '000000', trialId: TL000, magnification: 00x, experimentId: default}
+
+# ── Rules ────────────────────────────────────────────────────────────────────
+# Each rule:
+#   field    trialId magnification experimentId laser_power fa depth_um gain
+#            n_frames sample_rate system side protocol notes
+#   pattern  regex; must match the whole token (match: search -> anywhere in it)
+#   value    group number (0 = the whole token), [int group, fraction group]
+#            (type decimal), or a literal string (e.g. experimentId: zstack)
+#   type     int | float | decimal | str | lower   (default per field)
+#   rest     group handed back as a new token (tl1fpstim -> fpstim), or
+#            around (match: search): the text before / after the match
+#   map      {matched text: value}; others -> `default`
+#   format   '{}x', 'TL{:03d}'   (default per field)
+#   repeat   drop -> a second, identical value is dropped (25x … 25x)
+#   after    a field that must already be set (protocol only after a paradigm)
+#   kind     trial (max_trial split) | paradigm (the `paradigms` vocabulary)
+# A rule applies only while its field is unset (protocol / notes collect).
+# The first rule that applies wins; a token no rule takes goes to notes
+# (YAML experiment.notes, verbatim).
+
+# searched in the whole body before it is split (may span a separator)
+pre:
+  # frame rate: 15_4Hz, 30.4Hz, 30Hz (not inside a word: 10pulses3Hz)
+  - {field: sample_rate, pattern: '(?<![A-Za-z0-9])(\d+)(?:[_.](\d+))?hz(?![A-Za-z0-9])', value: [1, 2], type: decimal}
+  # laser power with a fraction: LP1_65, p1_50, tl3p1_25
+  - {field: laser_power, pattern: '(?<![A-Za-z])(?:lp|p)(\d+)_(\d+)(?![A-Za-z0-9])', value: [1, 2], type: decimal}
+
+# tried in order on each token
+tokens:
+  - {field: trialId, kind: trial, pattern: 'tl(\d+)(.*)', value: 1, rest: 2}       # tl5, tl1fpstim, TL1new
+  - {field: notes, pattern: '(\d+hz)([A-Za-z].*)', value: 1, rest: 2}               # 20hzvistim
+  - {field: laser_power, pattern: '(?:lp|p)(\d+)(sb)?', value: 1, rest: 2}          # LP5, p10, p25sb
+  - {field: fa, pattern: '(?:fa|favg)(\d+)', value: 1}                              # FA1, favg2
+  - {field: system, pattern: 'sys(?:tem)?(\d+)', value: 1}                          # sys3
+  - {field: gain, pattern: 'gain(\d+)', value: 1}                                   # gain61
+  - {field: n_frames, pattern: '(\d+)img', value: 1}                                # 4000img
+  - {field: depth_um, pattern: '(\d+)um(.*)', value: 1, rest: 2}                    # 104um
+  - {field: depth_um, pattern: 'depth(\d+)(.*)', value: 1, rest: 2}                 # depth116
+  - {field: depth_um, pattern: 'z(\d+)(.*)', value: 1, rest: 2}                     # z90, z125fpstim
+  - {field: magnification, pattern: '(?<![0-9])(\d+)x(?![0-9])', match: search, value: 1, rest: around, repeat: drop}   # 25x, 25xspont, vs25x
+  - {field: side, pattern: '(ispsi|ipsil|ipsi|contra)', match: search, value: 1, rest: around, map: {contra: contra}, default: ipsi}
+  - {field: experimentId, kind: paradigm}
+  - {field: protocol, pattern: 'puls|pules|\d+(?:ms|hz)|alle\d', match: search, value: 0, after: experimentId}   # 10pulses3Hz, 50ms, alle10s
+
+# ── experimentId ─────────────────────────────────────────────────────────────
+# word (lower case) -> experimentId.  A word that only starts with one of
+# these (at least paradigm_prefix_min letters long) gives that paradigm, and
+# its rest is read again (pawstim10pulses3Hz -> pawstim + 10pulses3Hz); a
+# number as the rest (3Dscan2, zstack1) is the trial when there is no tl<N>.
+paradigm_prefix_min: 4
+paradigms:
+  spont: spont
+  spontact: spont
+  spontaneous: spont
+  spontan: spont
+  vs: vstim
+  vstim: vstim
+  visstim: vstim
+  vistim: vstim
+  stim: stim
+  fpstim: fpstim
+  stimfp: stimfp
+  pawstim: pawstim
+  fiberstim: fiberstim
+  astim: astim
+  chrimson: chrimson
+  opo: opo
+  tisa: tisa
+  3d: 3dscan
+  3dscan: 3dscan
+  zstack: zstack
+  loco: loco
+  dark: dark
+  test: test
+  morph: morph
+  persup: persup            # Up / Down states (2015 spellings)
+  persupstate: persup
+  updown: updown
+  updownstate: updown
+  upown: updown
+  default: default
+
+# with no paradigm word, a single leftover plain word is taken as experimentId
+single_word_experiment: true

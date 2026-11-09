@@ -317,6 +317,59 @@ try:
     assert r.returncode == 0 and "wrote" in r.stdout, (r.stdout, r.stderr[-1500:])
     assert (t4 / "strohA-ia-000000-20140225-TL001_155608-00x-fpstim").is_dir()
     ok("runs without the CaImAn stack (name and YAML code are standard library + PyYAML)")
+
+    # ── 9. rules files ───────────────────────────────────────────────────────
+    from utilities import rename_rules as rr
+    t9 = root / "t9"; t9.mkdir()
+    rc, out = run("--write-rules", str(t9))
+    written = t9 / rr.FILENAME
+    assert rc == 0 and written.read_text() == rr.DEFAULT_PATH.read_text()
+    assert run("--write-rules", str(t9))[0] == 2, "never overwrites"
+    full = rr.load_rules(written)
+    for name in cases:
+        a_, b_ = rs.parse_legacy(name), rs.parse_legacy(name, full)
+        assert (a_.parts, a_.unparsed, a_.laser_power) == (b_.parts, b_.unparsed, b_.laser_power)
+    written.unlink()
+    ok("--write-rules writes the built-in rules (commented, never overwriting); "
+       "that file reads every name as the built-in rules do")
+
+    ej = "140708_tl3_fa2_pw4_vistim_14-25-46"
+    ds = t9 / "data" / "strohA-ej"
+    (ds / "strohA-ej-000000-20140708" / ej).mkdir(parents=True)
+    (t9 / "data" / "strohA-ms" / "strohA-ms-000000-20140708" / ej).mkdir(parents=True)
+    (ds / rr.FILENAME).write_text(
+        "extra_tokens:\n  - {field: laser_power, pattern: 'pw(\\d+)', value: 1}\n"
+        "paradigms: {vistim: null, vis: vision}\nmax_trial: 2\nparadigm_prefix_min: 3\n")
+    items = {it.src.parent.parent.name: it for it in rs.plan(t9 / "data")}
+    e, m = items["strohA-ej"], items["strohA-ms"]
+    assert e.rules.path == (ds / rr.FILENAME).resolve() and m.rules.path is None
+    assert (e.parsed.laser_power, m.parsed.laser_power) == (4.0, None)
+    assert m.parsed.unparsed == ["pw4"] and m.dst.name.endswith("-vstim")
+    assert e.dst.name.endswith("-vision"), "vistim removed, vis prefix → vision"
+    assert "trial 3 > 2" in e.warnings
+    sub = ds / "strohA-ej-000000-20140708"
+    (sub / rr.FILENAME).write_text("max_trial: 9\n")           # nearest wins (whole file)
+    e = next(it for it in rs.plan(t9 / "data") if "strohA-ej" in str(it.src))
+    assert e.parsed.laser_power is None and not e.parsed.remarks
+    (sub / rr.FILENAME).unlink()
+    forced = t9 / "forced.yaml"; forced.write_text("paradigms: {vistim: vstim2}\n")
+    rc, out = run("--root", str(t9 / "data"), "--rules", str(forced))
+    assert rc == 0 and out.count("-vstim2") == 2, out
+    assert f"rules: {forced.resolve()} (2 directories)" in out, out
+    ok("a dataset's rename-rules.yaml (partial: extra_tokens first, paradigms merged / "
+       "null removes, max_trial) applies to the sessions below it, nearest file wins, "
+       "--rules overrides; built-in elsewhere")
+
+    for bad, msg in [("tokens:\n  - {field: colour, pattern: x}\n", "field 'colour'"),
+                     ("extra_tokens:\n  - {field: fa, pattern: 'fa(', value: 1}\n", "bad pattern"),
+                     ("extra_tokens:\n  - {field: fa, pattern: 'fa(\\d+)', value: 2}\n", "group 2"),
+                     ("extra_tokens:\n  - {field: fa, pattern: x, colour: 1}\n", "unknown key"),
+                     ("version: 2\n", "version 2")]:
+        forced.write_text(bad)
+        rc, out = run("--root", str(t9 / "data"), "--rules", str(forced))
+        assert rc == 2 and msg in out and str(forced.resolve()) in out, (bad, out)
+    ok("a bad rules file stops the run before anything is planned, naming the file, "
+       "the rule and the problem")
     print("ALL OK")
 finally:
     shutil.rmtree(root)

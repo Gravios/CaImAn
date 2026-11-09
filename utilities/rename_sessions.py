@@ -14,19 +14,36 @@ Schema (:mod:`utilities.rename_stem`)::
 
     <sourceId>-<userId>-<subjectId>-<date>-<trialId>_<time>-<magnification>-<experimentId>
 
-Where each field comes from
----------------------------
+Rules files
+-----------
+Every pattern, word and limit below comes from a rules file
+(utilities/pipelines/rename_rules.yaml, documented there).  A dataset that
+names its folders differently gets its own:
+
+  rename-sessions --write-rules /data/source/stroh/stroh-ej   # editable copy
+  # edit it (or keep only the changes: extra_tokens, paradigms, max_trial …)
+  rename-sessions --root /data/source/stroh/stroh-ej          # picks it up
+
+A rename-rules.yaml applies to the legacy sessions below its folder (the
+nearest one wins; a partial file is read on top of the built-in rules);
+--rules FILE applies one file to everything under --root.  The dry run
+says which rules each directory got.
+
+Where each field comes from (built-in rules)
+--------------------------------------------
 Tokens are separated by - _ . and read in order; a rule may hand back the
 rest of a glued token (tl1fpstim → tl1 + fpstim, z125fpstim → z125 + fpstim).
 
   date, time      leading YYMMDD (or YYYYMMDD) and trailing HH-MM-SS
-  trialId         tl<N> (also glued: tl1fpstim, TL1new) → TL<NNN>; the index of
+  trialId         tl<N> (also glued: tl1fpstim, TL1new) → TL<NNN>; trials never
+                  exceed max_trial (20): tl1200 → TL001 + 200, tl120hz → TL001 +
+                  20hz, two possible splits (tl1150) refused; the index of
                   <paradigm><N> (3Dscan2, zstack1, morph2, test3) when there is
                   no tl<N>; none → TL000
                   (or --number-missing)
   magnification   <N>x, also glued to a word (25xspont, vs25x) → <N>x; none → 00x
-  experimentId    a known word or a word starting with one (PARADIGMS: spont /
-                  spontan, vstim / visstim, fpstim, stimfp, pawstim, fiberstim,
+  experimentId    a known word or a word starting with one (paradigms: spont /
+                  spontan, vstim / visstim / vistim, fpstim, stimfp, pawstim, fiberstim,
                   3dscan, zstack, morph, test, persup (persUp, persUpstate),
                   updown (UpDown, UpDownstate, Upown), …); one other plain word
                   is taken as is;
@@ -83,6 +100,8 @@ Usage
   rename-sessions --root … --number-missing --apply   # TL by time for dirs without tl<N>
   rename-sessions --root … --fix-date-folders --apply # also fix wrong date folders
   rename-sessions --root … --yaml-only --apply        # YAML for already-named dirs
+  rename-sessions --root … --rules ej-rules.yaml     # one rules file for all
+  rename-sessions --write-rules DIR                   # DIR/rename-rules.yaml to edit
   rename-sessions --undo rename.tsv --apply
 """
 from __future__ import annotations
@@ -97,64 +116,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from utilities.rename_rules import (
+    FILENAME as RULES_FILENAME, Rule, Rules, RulesError, find_rules_file, load_rules,
+    write_rules)
 from utilities.rename_stem import build_stem, parse_stem
 from utilities import session_meta as sm
 
 # ── Legacy-name grammar ─────────────────────────────────────────────────────
+# The rules (patterns, vocabulary, limits, defaults) live in a rules file:
+# utilities/pipelines/rename_rules.yaml (built-in), plus a dataset's own
+# rename-rules.yaml found in a folder above the sessions, or --rules FILE.
+# See utilities.rename_rules.
 
-# <date>[_-]<body>[_-]<HH>-<MM>-<SS>    (body may be empty)
-_LEGACY_RE = re.compile(
-    r"^(?P<date>\d{6}|\d{8})"
-    r"(?:[_-](?P<body>.*?))?"
-    r"[_-](?P<hh>\d{2})-(?P<mm>\d{2})-(?P<ss>\d{2})$")
-
-# Token rules, tried in order on each token (separators: - _ . space).  A
-# rule may hand back the rest of a glued token (tl1fpstim → tl1 + fpstim).
-# (may follow a glued trial number: tl3p1_25)
-_LP_FRAC_RE = re.compile(r"(?<![A-Za-z])(lp|p)(\d+)_(\d+)(?![A-Za-z0-9])", re.I)
-# frame rate, also across a separator: 15_4Hz, 30.4Hz, 30Hz (not inside a word:
-# 10pulses3Hz stays a protocol)
-_RATE_RE    = re.compile(r"(?<![A-Za-z0-9])(\d+)(?:[_.](\d+))?hz(?![A-Za-z0-9])", re.I)
-_SYS_RE     = re.compile(r"sys(?:tem)?(\d+)$", re.I)              # sys3
-_TRIAL_RE   = re.compile(r"tl(\d+)(.*)$", re.I)                  # tl5, tl1fpstim, TL1new
-MAX_TRIAL   = 20                     # trials never go above this; larger = glued digits
-_HZ_GLUED_RE = re.compile(r"(\d+hz)([A-Za-z].*)$", re.I)          # 20hzvistim
-_LP_RE      = re.compile(r"(?:lp|p)(\d+)(sb)?$", re.I)           # LP5, p10, p25sb
-_FA_RE      = re.compile(r"(?:fa|favg)(\d+)$", re.I)             # FA1, favg2
-_GAIN_RE    = re.compile(r"gain(\d+)$", re.I)                    # gain61
-_IMG_RE     = re.compile(r"(\d+)img$", re.I)                     # 4000img
-_DEPTH_RE   = re.compile(r"(?:(\d+)um|depth(\d+)|z(\d+))(.*)$", re.I)   # 104um, depth116, z125fpstim
-_MAG_RE     = re.compile(r"(?<![0-9])(\d+)x(?![0-9])", re.I)    # 25x, 25xspont, vs25x
-_SIDE_RE    = re.compile(r"(ispsi|ipsil|ipsi|contra)", re.I)
-_PROTOCOL_RE = re.compile(r"puls|pules|\d+(?:ms|hz)|alle\d", re.I)  # 10pulses3Hz, 50ms, alle10s
-
-# experimentId vocabulary (lower case → name token).  Words that only *start*
-# with one of these (pawstim10pulses3Hz, fpstimsinglepuleses50msl) give the
-# paradigm, and the rest becomes the YAML protocol.
-PARADIGMS = {
-    "spont": "spont", "spontact": "spont", "spontaneous": "spont", "spontan": "spont",
-    "vs": "vstim", "vstim": "vstim", "visstim": "vstim", "vistim": "vstim", "stim": "stim",
-    "fpstim": "fpstim", "stimfp": "stimfp", "pawstim": "pawstim",
-    "fiberstim": "fiberstim", "astim": "astim", "chrimson": "chrimson",
-    "opo": "opo", "tisa": "tisa", "3d": "3dscan", "3dscan": "3dscan",
-    "zstack": "zstack", "loco": "loco", "dark": "dark", "test": "test",
-    "morph": "morph",
-    # Up / Down states (incl. the spellings in the 2015 names)
-    "persup": "persup", "persupstate": "persup",
-    "updown": "updown", "updownstate": "updown", "upown": "updown",
-    "default": "default",
-}
-_PREFIXES = sorted((k for k in PARADIGMS if len(k) >= 4), key=len, reverse=True)
-DEFAULTS = {"subjectId": "000000", "trialId": "TL000",
-            "magnification": "00x", "experimentId": "default"}
 # fields that count towards the confidence score
 SCORED = ("date", "time", "trialId", "magnification", "experimentId",
           "laser_power", "fa", "depth_um")
-
-# ancestor carrying <src>-<user>-<subj>[-<date8>]
-_ANCESTOR_RE = re.compile(r"^(?P<src>[^-_\s]+)-(?P<user>[^-_\s]+)-(?P<subj>[^-_\s]+)"
-                          r"(?:-(?P<date>\d{8})(?P<suffix>[_-].+)?)?$")
-_SYSTEM_DIR_RE = re.compile(r"^system[-_ ]?(\d+)$", re.I)            # System3
 
 
 @dataclass
@@ -189,36 +165,25 @@ def _year(d: str) -> str:
     return f"{1900 + yy if yy >= 70 else 2000 + yy}{d[2:]}"
 
 
-def is_legacy(name: str) -> bool:
-    return bool(_LEGACY_RE.match(name)) and parse_stem(name) is None
+def is_legacy(name: str, rules: Optional[Rules] = None) -> bool:
+    rules = rules or load_rules()
+    return bool(rules.legacy_name.match(name)) and parse_stem(name) is None
 
 
-def _paradigm(word: str):
-    """(experimentId, protocol rest) for a word that is or starts with a
-    known paradigm, else None."""
-    w = word.lower()
-    if w in PARADIGMS:
-        return PARADIGMS[w], ""
-    for k in _PREFIXES:
-        if w.startswith(k):
-            return PARADIGMS[k], word[len(k):]
-    return None
-
-
-def _split_trial(digits: str, rest: str, p: "Parsed") -> tuple:
+def _split_trial(digits: str, rest: str, p: "Parsed", max_trial: int) -> tuple:
     """Trial number and the rest of a ``tl<digits><rest>`` token.
 
-    Trials never exceed MAX_TRIAL, so ``tl1200`` / ``tl120hz`` / ``tl220hz``
+    Trials never exceed *max_trial*, so ``tl1200`` / ``tl120hz`` / ``tl220hz``
     carry a glued value: split after the 1–2 digit trial so that the rest
     does not start with 0 (tl1200 → 1 + 200, tl120hz → 1 + 20hz,
     tl220hz → 2 + 20hz).  Only a value of ≥ 2 digits or one followed by a
     unit / word counts (tl25 stays trial 25, flagged).  Two possible splits
     (tl1150 = 1 + 150 or 11 + 50) make the name a doubt (refused)."""
     n = int(digits)
-    if n <= MAX_TRIAL:
+    if n <= max_trial:
         return n, rest
     cands = [(digits[:k], digits[k:]) for k in (1, 2) if k < len(digits)
-             and 1 <= int(digits[:k]) <= MAX_TRIAL and digits[k] != "0"
+             and 1 <= int(digits[:k]) <= max_trial and digits[k] != "0"
              and (len(digits) - k >= 2 or rest)]
     if len(cands) == 1:
         a, b = cands[0]
@@ -228,13 +193,83 @@ def _split_trial(digits: str, rest: str, p: "Parsed") -> tuple:
         p.doubts.append(f"tl{digits}{rest}: trial " + " or ".join(
             f"{int(a)} + {b}" for a, b in cands))
     else:
-        p.remarks.append(f"trial {n} > {MAX_TRIAL}")
+        p.remarks.append(f"trial {n} > {max_trial}")
     return n, rest
 
 
-def parse_legacy(name: str) -> Optional[Parsed]:
-    """Parse a legacy directory name, or None if it isn't one."""
-    m = _LEGACY_RE.match(name)
+class _State:
+    """Per-name parse state besides Parsed: paradigm words seen, scan index."""
+    def __init__(self):
+        self.paradigms: list = []
+        self.scan_index: Optional[int] = None
+
+
+_LISTS = {"notes": "unparsed", "protocol": "protocol"}
+_PARTS = ("trialId", "magnification")
+
+
+def _filled(p: Parsed, st: _State, f: str) -> bool:
+    if f in _PARTS:
+        return f in p.found
+    if f == "experimentId":
+        return bool(st.paradigms)
+    if f in _LISTS:
+        return bool(getattr(p, _LISTS[f]))
+    return getattr(p, f) is not None
+
+
+def _set(p: Parsed, st: _State, r: Rule, v) -> None:
+    if r.field in _PARTS:
+        p.parts[r.field] = r.format.format(v)
+        p.found.add(r.field)
+    elif r.field == "experimentId":
+        st.paradigms.append(str(v).lower())
+    elif r.field in _LISTS:
+        getattr(p, _LISTS[r.field]).append(v)
+    else:
+        setattr(p, r.field, v)
+
+
+def _apply_rule(r: Rule, w: str, p: Parsed, st: _State, rules: Rules):
+    """Tokens handed back if rule *r* takes token *w*, else None."""
+    if r.kind == "paradigm":
+        par = rules.paradigm(w)
+        if par is None:
+            return None
+        st.paradigms.append(par[0])
+        if par[1].isdigit():                     # 3Dscan2, zstack1, morph2, test3
+            if st.scan_index is None:
+                st.scan_index = int(par[1])
+            return []
+        return [par[1]] if par[1] else []
+    if r.after and not _filled(p, st, r.after):
+        return None
+    m = r.find(w)
+    if m is None:
+        return None
+    collects = r.collects or r.field == "experimentId"
+    if r.kind == "trial":
+        if _filled(p, st, r.field):
+            return None
+        rest = m.group(r.rest) if isinstance(r.rest, int) else ""
+        trial, rest = _split_trial(m.group(r.value), rest or "", p, rules.max_trial)
+        _set(p, st, r, trial)
+        return [rest] if rest else []
+    v = r.read(m, w)
+    if not collects and _filled(p, st, r.field):
+        same = (r.repeat_drop and r.field in _PARTS
+                and p.parts[r.field] == r.format.format(v))
+        if not same:
+            return None
+    _set(p, st, r, v)                            # an identical repeat: re-set, dropped
+    return r.leftover(m, w)
+
+
+def parse_legacy(name: str, rules: Optional[Rules] = None) -> Optional[Parsed]:
+    """Parse a legacy directory name with *rules* (built-in by default), or
+    None if it isn't one."""
+    rules = rules or load_rules()
+    m = rules.legacy_name.match(name)
     if not m or parse_stem(name) is not None:
         return None
     p = Parsed(name)
@@ -246,82 +281,42 @@ def parse_legacy(name: str) -> Optional[Parsed]:
         return None
     p.parts.update(date=date, time=time)
     p.found |= {"date", "time"}
-    body = m.group("body") or ""
+    body = m.groupdict().get("body") or ""
+    st = _State()
 
-    # frame rate and laser power with a fraction span a separator
-    mm = _RATE_RE.search(body)
-    if mm:
-        p.sample_rate = float(f"{int(mm.group(1))}.{mm.group(2)}" if mm.group(2) else mm.group(1))
-        body = body[:mm.start()] + " " + body[mm.end():]
-    mm = _LP_FRAC_RE.search(body)
-    if mm:
-        p.laser_power = float(f"{int(mm.group(2))}.{mm.group(3)}")
-        body = body[:mm.start()] + " " + body[mm.end():]
-    todo = [w for w in re.split(r"[-_.\s]+", body) if w]
-    scan_index = None
-    paradigms: list = []
+    # values that may span a separator (frame rate 15_4Hz, laser power p1_50)
+    for r in rules.pre:
+        if not r.collects and _filled(p, st, r.field):
+            continue
+        mm = r.regex.search(body)
+        if mm:
+            _set(p, st, r, r.read(mm, mm.group(0)))
+            body = body[:mm.start()] + " " + body[mm.end():]
+    todo = [w for w in rules.separators.split(body) if w]
     while todo:
         w = todo.pop(0)
-        if (mm := _TRIAL_RE.fullmatch(w)) and "trialId" not in p.found:
-            trial, rest = _split_trial(mm.group(1), mm.group(2), p)
-            p.parts["trialId"] = f"TL{trial:03d}"
-            p.found.add("trialId")
-            if rest:
-                todo.insert(0, rest)
-        elif (mm := _HZ_GLUED_RE.fullmatch(w)):
-            p.unparsed.append(mm.group(1))       # meaning of a glued Hz not settled
-            todo.insert(0, mm.group(2))
-        elif (mm := _LP_RE.fullmatch(w)) and p.laser_power is None:
-            p.laser_power = float(mm.group(1))
-            if mm.group(2):
-                todo.insert(0, mm.group(2))
-        elif (mm := _FA_RE.fullmatch(w)) and p.fa is None:
-            p.fa = int(mm.group(1))
-        elif (mm := _SYS_RE.fullmatch(w)) and p.system is None:
-            p.system = int(mm.group(1))
-        elif (mm := _GAIN_RE.fullmatch(w)) and p.gain is None:
-            p.gain = int(mm.group(1))
-        elif (mm := _IMG_RE.fullmatch(w)) and p.n_frames is None:
-            p.n_frames = int(mm.group(1))
-        elif (mm := _DEPTH_RE.fullmatch(w)) and p.depth_um is None:
-            p.depth_um = int(next(g for g in mm.groups()[:3] if g))
-            if mm.group(4):
-                todo.insert(0, mm.group(4))
-        elif (mm := _MAG_RE.search(w)) and ("magnification" not in p.found or
-                                            p.parts["magnification"] == f"{int(mm.group(1))}x"):
-            p.parts["magnification"] = f"{int(mm.group(1))}x"     # a repeat is dropped
-            p.found.add("magnification")
-            rest = w[:mm.start()] + w[mm.end():]
-            if rest:
-                todo.insert(0, rest)
-        elif (mm := _SIDE_RE.search(w)) and p.side is None:
-            p.side = "contra" if mm.group(1).lower() == "contra" else "ipsi"
-            rest = [r for r in (w[:mm.start()], w[mm.end():]) if r]
-            todo[:0] = rest
-        elif (par := _paradigm(w)) is not None:
-            paradigms.append(par[0])
-            if par[1].isdigit():                 # 3Dscan2, zstack1, morph2, test3
-                scan_index = int(par[1]) if scan_index is None else scan_index
-            elif par[1]:
-                todo.insert(0, par[1])
-        elif _PROTOCOL_RE.search(w) and paradigms and not w.isdigit():
-            p.protocol.append(w)
+        for r in rules.tokens:
+            back = _apply_rule(r, w, p, st, rules)
+            if back is not None:
+                todo[:0] = back
+                break
         else:
             p.unparsed.append(w)
-    if paradigms:
-        p.parts["experimentId"] = paradigms[0]
+    if st.paradigms:
+        p.parts["experimentId"] = st.paradigms[0]
         p.found.add("experimentId")
-        p.unparsed += [x for x in paradigms[1:] if x != paradigms[0]]
-    elif len(p.unparsed) == 1 and re.fullmatch(r"[A-Za-z]+", p.unparsed[0]):
+        p.unparsed += [x for x in st.paradigms[1:] if x != st.paradigms[0]]
+    elif (rules.single_word_experiment and len(p.unparsed) == 1
+          and re.fullmatch(r"[A-Za-z]+", p.unparsed[0])):
         p.parts["experimentId"] = p.unparsed.pop().lower()     # e.g. a new paradigm
         p.found.add("experimentId")
-    if scan_index is not None and "trialId" not in p.found:
-        p.parts["trialId"] = f"TL{scan_index:03d}"
+    if st.scan_index is not None and "trialId" not in p.found:
+        p.parts["trialId"] = f"TL{st.scan_index:03d}"
         p.found.add("trialId")
     for key, v in (("laser_power", p.laser_power), ("fa", p.fa), ("depth_um", p.depth_um)):
         if v is not None:
             p.found.add(key)
-    for k, v in DEFAULTS.items():
+    for k, v in rules.defaults.items():
         p.parts.setdefault(k, v)
     return p
 
@@ -338,24 +333,26 @@ class Ancestry:
     system: Optional[int] = None         # a System<N> folder on the way up
 
 
-def ancestor_ids(path: Path) -> Ancestry:
+def ancestor_ids(path: Path, rules: Optional[Rules] = None) -> Ancestry:
     """Ids from the nearest ancestor named <src>-<user>-<subj>[-<date8>[_note]]
-    that is not itself a session; a System<N> folder below it gives the
-    acquisition system."""
+    (the rules' ancestor_name) that is not itself a session; a System<N>
+    folder below it gives the acquisition system."""
+    rules = rules or load_rules()
     anc = Ancestry()
     for a in path.parents:
         if parse_stem(a.name) is not None:
             continue
-        ms = _SYSTEM_DIR_RE.match(a.name)
+        ms = rules.system_folder.match(a.name)
         if ms and anc.system is None:
             anc.system = int(ms.group(1))
             continue
-        m = _ANCESTOR_RE.match(a.name)
+        m = rules.ancestor_name.match(a.name)
         if m:
-            anc.source, anc.user, anc.subject = m.group("src"), m.group("user"), m.group("subj")
-            if m.group("date"):
-                anc.date, anc.date_dir = m.group("date"), a
-                anc.suffix = (m.group("suffix") or "").lstrip("_-")
+            g = m.groupdict()
+            anc.source, anc.user, anc.subject = g["src"], g["user"], g["subj"]
+            if g.get("date"):
+                anc.date, anc.date_dir = g["date"], a
+                anc.suffix = (g.get("suffix") or "").lstrip("_-")
             return anc
     return anc
 
@@ -370,44 +367,55 @@ class Item:
     problems: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     ancestry: Optional["Ancestry"] = None
+    rules: Optional[Rules] = None
 
     @property
     def ok(self) -> bool:
         return self.dst is not None and not self.problems
 
 
-def find_legacy_dirs(root: Path) -> list[Path]:
-    """Legacy-named directories below *root* (not descending into them)."""
-    out: list[Path] = []
+def find_legacy_dirs(root: Path, rules: Optional[Rules] = None) -> list[tuple]:
+    """(directory, rules) for the legacy-named directories below *root* (not
+    descending into them).  *rules* applies to all; without it each
+    directory gets the nearest rename-rules.yaml above it, else the
+    built-in rules."""
+    out: list[tuple] = []
 
-    def walk(d: Path) -> None:
+    def walk(d: Path, r: Rules) -> None:
         try:
             children = sorted(c for c in d.iterdir() if c.is_dir() and not c.is_symlink())
         except OSError:
             return
         for c in children:
-            if is_legacy(c.name):
-                out.append(c)
+            if is_legacy(c.name, r):
+                out.append((c, r))
             elif parse_stem(c.name) is None:      # sessions don't nest
-                walk(c)
-    if is_legacy(root.name):
-        return [root]
-    walk(root)
+                f = c / RULES_FILENAME
+                walk(c, r if rules is not None or not f.is_file() else load_rules(f))
+    if rules is None:
+        start = load_rules(find_rules_file(root.parent if is_legacy(root.name) else root))
+    else:
+        start = rules
+    if is_legacy(root.name, start):
+        return [(root, start)]
+    walk(root, start)
     return out
 
 
 def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = None,
-         min_confidence: int = 0, number_missing: bool = False) -> list[Item]:
-    """What would be renamed, and why not where it can't be."""
+         min_confidence: int = 0, number_missing: bool = False,
+         rules: Optional[Rules] = None) -> list[Item]:
+    """What would be renamed, and why not where it can't be.  *rules*
+    overrides the rename-rules.yaml files found in the tree."""
     items: list[Item] = []
-    for d in find_legacy_dirs(root):
-        p = parse_legacy(d.name)
-        it = Item(d, p)
+    for d, r in find_legacy_dirs(root, rules):
+        p = parse_legacy(d.name, r)
+        it = Item(d, p, rules=r)
         items.append(it)
         if p is None:
             it.problems.append("not a legacy name (date or time invalid)")
             continue
-        anc = ancestor_ids(d)
+        anc = ancestor_ids(d, r)
         it.ancestry = anc
         src_id, user_id, subj_id, anc_date = anc.source, anc.user, anc.subject, anc.date
         if p.system is None:
@@ -421,7 +429,7 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
         if not (src_id and user_id):
             it.problems.append("no <source>-<user> ancestor; pass --prefix")
         p.parts.update(sourceId=src_id or "", userId=user_id or "",
-                       subjectId=subject or subj_id or DEFAULTS["subjectId"])
+                       subjectId=subject or subj_id or r.defaults.get("subjectId", "000000"))
         if anc_date and anc_date != p.parts["date"]:
             it.warnings.append(f"date {p.parts['date']} differs from the folder's {anc_date}")
         if p.confidence < min_confidence:
@@ -485,13 +493,15 @@ def plan_date_folders(items: list[Item]) -> tuple[list[FolderFix], list[str]]:
     date: (fixes, notes on folders left alone because their sessions
     disagree among themselves or the target exists)."""
     by_dir = defaultdict(set)
+    rules_of = {}
     for it in items:
         anc = it.ancestry
         if it.parsed is not None and anc is not None and anc.date_dir is not None:
             by_dir[anc.date_dir].add(it.parsed.parts["date"])
+            rules_of[anc.date_dir] = it.rules or load_rules()
     fixes, notes = [], []
     for d, dates in sorted(by_dir.items()):
-        m = _ANCESTOR_RE.match(d.name)
+        m = rules_of[d].ancestor_name.match(d.name)
         folder_date = m.group("date")
         if dates == {folder_date}:
             continue
@@ -500,7 +510,7 @@ def plan_date_folders(items: list[Item]) -> tuple[list[FolderFix], list[str]]:
             continue
         (date,) = dates
         new = d.with_name(f"{m.group('src')}-{m.group('user')}-{m.group('subj')}-{date}"
-                          f"{m.group('suffix') or ''}")
+                          f"{m.groupdict().get('suffix') or ''}")
         try:
             datetime.strptime(folder_date, "%Y%m%d")
             why = f"its sessions are from {date}"
@@ -691,6 +701,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--yaml-only", action="store_true",
                     help="no renames: write / fill the YAML of directories already "
                          "named by the schema")
+    ap.add_argument("--rules", type=Path, metavar="FILE",
+                    help="rules file for every directory under --root (default: the "
+                         f"nearest {RULES_FILENAME} above each, else the built-in rules)")
+    ap.add_argument("--write-rules", type=Path, metavar="DEST",
+                    help="write the built-in rules (commented) to DEST, a file or a "
+                         f"folder (-> DEST/{RULES_FILENAME}), to edit for a dataset")
     ap.add_argument("--log", type=Path, help="append applied renames to this TSV")
     ap.add_argument("--undo", type=Path, metavar="LOG", help="reverse an applied log")
     ap.add_argument("-q", "--quiet", action="store_true", help="only problems and totals")
@@ -717,6 +733,15 @@ def _yaml_only(root: Path, apply_: bool, out) -> int:
 def main(argv=None) -> int:
     a = parse_args(argv)
     out = print
+    if a.write_rules:
+        try:
+            dest = write_rules(a.write_rules)
+        except OSError as exc:
+            out(f"rename-sessions: {exc}")
+            return 2
+        out(f"wrote {dest}\n  edit it, then keep it as {RULES_FILENAME} in the folder whose "
+            "sessions it is for, or pass --rules")
+        return 0
     if a.undo:
         failed = undo(a.undo, dry_run=not a.apply, out=out)
         if not a.apply:
@@ -725,9 +750,22 @@ def main(argv=None) -> int:
     root = a.root.resolve()
     if a.yaml_only:
         return _yaml_only(root, a.apply, out)
-    items = plan(root, prefix=a.prefix, subject=a.subject,
-                 min_confidence=a.min_confidence, number_missing=a.number_missing)
+    try:
+        forced = load_rules(a.rules) if a.rules else None
+        items = plan(root, prefix=a.prefix, subject=a.subject,
+                     min_confidence=a.min_confidence, number_missing=a.number_missing,
+                     rules=forced)
+    except RulesError as exc:
+        out(f"rename-sessions: rules: {exc}")
+        return 2
     n_ok = sum(it.ok for it in items)
+    used = defaultdict(int)
+    for it in items:
+        used[it.rules.label if it.rules else "built-in"] += 1
+    for label, n in used.items():
+        out(f"rules: {label} ({n} director{'y' if n == 1 else 'ies'})")
+    if used:
+        out("")
     for it in items:
         if a.quiet and it.ok and not it.warnings:
             continue
