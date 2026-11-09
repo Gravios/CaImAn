@@ -329,8 +329,8 @@ def fill_nulls(doc: dict, source: dict) -> list[Path_]:
 
 def sync_from_name(doc: dict, session_name: str) -> list[Path_]:
     """Overwrite the YAML fields derived from the session name; return changed paths."""
-    from utilities.stack_sessions import _parse_session_name
-    dn = _parse_session_name(session_name)
+    from utilities.session_name import parse_session_name
+    dn = parse_session_name(session_name)
     updates: list[tuple[Path_, object]] = []
     if dn.get("experiment_datetime"):
         updates.append((("experiment", "datetime"),
