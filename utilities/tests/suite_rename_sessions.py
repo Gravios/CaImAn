@@ -115,6 +115,17 @@ try:
     assert rs.parse_legacy("140231_tl1_12-00-00") is None, "not a calendar date"
     assert rs.parse_legacy("140225_tl1_25-00-00") is None, "not a clock time"
     assert rs.parse_legacy("notes") is None and not rs.is_legacy("strohA-ia-000000")
+    # trials never exceed MAX_TRIAL: glued digits split off, ambiguity refused
+    for name, tl, left in [("140219_tl1200_visstim_13-00-00", "TL001", ["200"]),
+                           ("140408_tl120hzvistim_15-17-23", "TL001", ["20hz"]),
+                           ("140408_tl220hzvistim_15-28-22", "TL002", ["20hz"])]:
+        p = rs.parse_legacy(name)
+        assert (p.parts["trialId"], p.parts["experimentId"], p.unparsed, p.doubts) == \
+            (tl, "vstim", left, []), (name, p)
+    p = rs.parse_legacy("150302_tl25_11-52-17")
+    assert p.parts["trialId"] == "TL025" and p.remarks == ["trial 25 > 20"] and not p.doubts
+    assert rs.parse_legacy("150101_tl1150_spont_10-00-00").doubts, "1+150 or 11+50"
+    assert rs.parse_legacy("151031_tl3p1_25_d99_14-53-03").laser_power == 1.25
     ok(f"legacy names parsed ({len(cases)} cases): YYMMDD/YYYYMMDD, HH-MM-SS, tl<N>→TL<NNN>, "
        "25x/25xspont/vs25x, LP5 / LP1_65 / p1_50, FA<N>, 104um / depth116 / z90, "
        "paradigm words; 2014: glued tl<N>…, p<N>, favg<N>, z<N><word>, 3Dscan<N> / zstack<N>, "
@@ -263,6 +274,7 @@ try:
     f = t2 / "150301_tl1_spont_08-00-00"; f.mkdir()
     (t2 / "lab-xy-M17-20150301-TL001_080000-00x-spont").mkdir()    # f's target exists
     g = t2 / "150301_tl3_spont_12-00-00"; g.mkdir()
+    h = t2 / "150301_tl1150_spont_13-00-00"; h.mkdir()               # 1+150 or 11+50
     (g / "g_pipeline.json").write_text("{}")
     items = {it.src.name: it for it in rs.plan(t2.parent)}
     assert not items[a.name].ok and not items[b.name].ok
@@ -270,6 +282,7 @@ try:
     assert "target exists" in items[f.name].problems[0]
     assert items[c.name].dst.name == "lab-xy-M17-20150301-TL000_090000-00x-vstim"
     assert any("pipeline file" in w for w in items[g.name].warnings)
+    assert not items[h.name].ok and "ambiguous tl1150" in items[h.name].problems[0]
     num = {it.src.name: it for it in rs.plan(t2.parent, number_missing=True)}
     assert num[c.name].dst.name.split("-")[4].startswith("TL004_"), num[c.name].dst.name
     assert num[e.name].dst.name.split("-")[4].startswith("TL005_"), "next free, by time"
@@ -284,7 +297,7 @@ try:
     assert a.exists() and b.exists() and f.exists(), "refused ones untouched"
     assert (t2 / "lab-xy-M17-20150301-TL000_090000-00x-vstim").exists()
     ok("refused: shared or existing targets, low confidence, no prefix (until --prefix / "
-       "--subject); --number-missing numbers by time skipping used TLs; pipeline files flagged")
+       "--subject), ambiguous glued trial; --number-missing numbers by time skipping used TLs; pipeline files flagged")
 
     # ── 7. --yaml-only for already named sessions ────────────────────────────
     rc, out = run("--root", str(done.parent), "--yaml-only")

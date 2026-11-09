@@ -110,12 +110,15 @@ _LEGACY_RE = re.compile(
 
 # Token rules, tried in order on each token (separators: - _ . space).  A
 # rule may hand back the rest of a glued token (tl1fpstim → tl1 + fpstim).
-_LP_FRAC_RE = re.compile(r"(?<![A-Za-z0-9])(lp|p)(\d+)_(\d+)(?![A-Za-z0-9])", re.I)
+# (may follow a glued trial number: tl3p1_25)
+_LP_FRAC_RE = re.compile(r"(?<![A-Za-z])(lp|p)(\d+)_(\d+)(?![A-Za-z0-9])", re.I)
 # frame rate, also across a separator: 15_4Hz, 30.4Hz, 30Hz (not inside a word:
 # 10pulses3Hz stays a protocol)
 _RATE_RE    = re.compile(r"(?<![A-Za-z0-9])(\d+)(?:[_.](\d+))?hz(?![A-Za-z0-9])", re.I)
 _SYS_RE     = re.compile(r"sys(?:tem)?(\d+)$", re.I)              # sys3
 _TRIAL_RE   = re.compile(r"tl(\d+)(.*)$", re.I)                  # tl5, tl1fpstim, TL1new
+MAX_TRIAL   = 20                     # trials never go above this; larger = glued digits
+_HZ_GLUED_RE = re.compile(r"(\d+hz)([A-Za-z].*)$", re.I)          # 20hzvistim
 _LP_RE      = re.compile(r"(?:lp|p)(\d+)(sb)?$", re.I)           # LP5, p10, p25sb
 _FA_RE      = re.compile(r"(?:fa|favg)(\d+)$", re.I)             # FA1, favg2
 _GAIN_RE    = re.compile(r"gain(\d+)$", re.I)                    # gain61
@@ -130,7 +133,7 @@ _PROTOCOL_RE = re.compile(r"puls|pules|\d+(?:ms|hz)|alle\d", re.I)  # 10pulses3H
 # paradigm, and the rest becomes the YAML protocol.
 PARADIGMS = {
     "spont": "spont", "spontact": "spont", "spontaneous": "spont", "spontan": "spont",
-    "vs": "vstim", "vstim": "vstim", "visstim": "vstim", "stim": "stim",
+    "vs": "vstim", "vstim": "vstim", "visstim": "vstim", "vistim": "vstim", "stim": "stim",
     "fpstim": "fpstim", "stimfp": "stimfp", "pawstim": "pawstim",
     "fiberstim": "fiberstim", "astim": "astim", "chrimson": "chrimson",
     "opo": "opo", "tisa": "tisa", "3d": "3dscan", "3dscan": "3dscan",
@@ -171,6 +174,8 @@ class Parsed:
     protocol: list = field(default_factory=list)     # stimulation protocol words
     found: set = field(default_factory=set)          # SCORED fields actually read
     unparsed: list = field(default_factory=list)     # kept verbatim as YAML notes
+    doubts: list = field(default_factory=list)       # refuse: can't be read safely
+    remarks: list = field(default_factory=list)      # shown, not refused
 
     @property
     def confidence(self) -> int:
@@ -198,6 +203,33 @@ def _paradigm(word: str):
         if w.startswith(k):
             return PARADIGMS[k], word[len(k):]
     return None
+
+
+def _split_trial(digits: str, rest: str, p: "Parsed") -> tuple:
+    """Trial number and the rest of a ``tl<digits><rest>`` token.
+
+    Trials never exceed MAX_TRIAL, so ``tl1200`` / ``tl120hz`` / ``tl220hz``
+    carry a glued value: split after the 1–2 digit trial so that the rest
+    does not start with 0 (tl1200 → 1 + 200, tl120hz → 1 + 20hz,
+    tl220hz → 2 + 20hz).  Only a value of ≥ 2 digits or one followed by a
+    unit / word counts (tl25 stays trial 25, flagged).  Two possible splits
+    (tl1150 = 1 + 150 or 11 + 50) make the name a doubt (refused)."""
+    n = int(digits)
+    if n <= MAX_TRIAL:
+        return n, rest
+    cands = [(digits[:k], digits[k:]) for k in (1, 2) if k < len(digits)
+             and 1 <= int(digits[:k]) <= MAX_TRIAL and digits[k] != "0"
+             and (len(digits) - k >= 2 or rest)]
+    if len(cands) == 1:
+        a, b = cands[0]
+        p.remarks.append(f"tl{digits} read as trial {int(a)} + {b}{rest}")
+        return int(a), b + rest
+    if len(cands) > 1:
+        p.doubts.append(f"tl{digits}{rest}: trial " + " or ".join(
+            f"{int(a)} + {b}" for a, b in cands))
+    else:
+        p.remarks.append(f"trial {n} > {MAX_TRIAL}")
+    return n, rest
 
 
 def parse_legacy(name: str) -> Optional[Parsed]:
@@ -231,10 +263,14 @@ def parse_legacy(name: str) -> Optional[Parsed]:
     while todo:
         w = todo.pop(0)
         if (mm := _TRIAL_RE.fullmatch(w)) and "trialId" not in p.found:
-            p.parts["trialId"] = f"TL{int(mm.group(1)):03d}"
+            trial, rest = _split_trial(mm.group(1), mm.group(2), p)
+            p.parts["trialId"] = f"TL{trial:03d}"
             p.found.add("trialId")
-            if mm.group(2):
-                todo.insert(0, mm.group(2))
+            if rest:
+                todo.insert(0, rest)
+        elif (mm := _HZ_GLUED_RE.fullmatch(w)):
+            p.unparsed.append(mm.group(1))       # meaning of a glued Hz not settled
+            todo.insert(0, mm.group(2))
         elif (mm := _LP_RE.fullmatch(w)) and p.laser_power is None:
             p.laser_power = float(mm.group(1))
             if mm.group(2):
@@ -390,6 +426,8 @@ def plan(root: Path, *, prefix: Optional[str] = None, subject: Optional[str] = N
             it.warnings.append(f"date {p.parts['date']} differs from the folder's {anc_date}")
         if p.confidence < min_confidence:
             it.problems.append(f"confidence {p.confidence} < {min_confidence}")
+        it.warnings += p.remarks
+        it.problems += [f"ambiguous {d}" for d in p.doubts]
         if p.unparsed:
             it.warnings.append("kept as YAML notes: " + " ".join(p.unparsed))
 
