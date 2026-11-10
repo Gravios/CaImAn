@@ -104,6 +104,7 @@ setup(
         'rename-stem         = utilities.rename_stem:main',
         'rename-sessions     = utilities.rename_sessions:main',
         'batch-preview       = utilities.batch_preview:main',
+        'group-compare       = utilities.group_compare:main',
         'tiff-viewer         = utilities.tiff_viewer:main',
         'stack-viewer        = utilities.stack_viewer:main',
     ] },
